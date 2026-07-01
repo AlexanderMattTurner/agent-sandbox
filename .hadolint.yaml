@@ -1,0 +1,9 @@
+# hadolint config for the firewall image (sandbox/Dockerfile). Each ignored rule
+# is a deliberate, justified exception; tighten as the Dockerfile changes.
+ignored:
+  # DL3008: "Pin versions in apt-get install." Off — and not because drift is fine:
+  # this is a CI-rebuilt firewall test image, and the Debian index purges old package
+  # versions, so an apt version pin breaks the build on upstream housekeeping rather
+  # than catching a real problem. Reproducibility for a given commit comes from the
+  # digest-pinned base image, not per-package apt pins.
+  - DL3008
