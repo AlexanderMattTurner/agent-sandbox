@@ -1,0 +1,93 @@
+# Run with: `pre-commit run --all-files` (or install with `pre-commit install`).
+# CI runs this via `.github/workflows/pre-commit.yaml` regardless of whether
+# contributors have pre-commit installed locally. The existing `.hooks/pre-commit`
+# handles staged-file formatting via lint-staged on every commit; this config
+# adds wider hygiene checks (shellcheck, large-file detection, JSON/YAML
+# validity, etc.) that aren't covered there.
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: ^pnpm-lock\.yaml$
+      - id: end-of-file-fixer
+        exclude: ^pnpm-lock\.yaml$
+      - id: check-yaml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=500]
+      - id: check-executables-have-shebangs
+      - id: check-shebang-scripts-are-executable
+      - id: check-case-conflict
+      - id: check-symlinks
+      - id: mixed-line-ending
+        args: [--fix=lf]
+
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.11.0.1
+    hooks:
+      - id: shellcheck
+        # Enable one optional check beyond the defaults: require [[ ]] over
+        # [ ] in bash/ksh.
+        args: [-x, -P, .claude/hooks, -o, require-double-brackets]
+
+  - repo: https://github.com/scop/pre-commit-shfmt
+    rev: v3.12.0-2
+    hooks:
+      - id: shfmt
+        args: [-i, "2", -w]
+
+  # Lints workflow/action correctness and runs shellcheck on inline `run:`
+  # blocks that the standalone shellcheck hook can't see. Python-wrapped so it
+  # needs no Go toolchain in the Python-only pre-commit CI job.
+  - repo: https://github.com/Mateusz-Grzelinski/actionlint-py
+    rev: v1.7.12.24
+    hooks:
+      - id: actionlint
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.5
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  # Honesty + identity CI lints: catch a green check that hides a failed
+  # command (pipefail/|| true/2>/dev/null), a path-filtered required check that
+  # hangs forever, or a mutable base-image/download pin. Tier 2 adds the
+  # required-check-shape lints this template's workflows already follow
+  # (classified always() reporters, explicit concurrency, externalized run
+  # blocks). check-claude-model enforces an explicit --model on the
+  # claude-code-action steps this template ships.
+  - repo: https://github.com/alexander-turner/ci-truth-serum
+    rev: 55b3c2af0b83f77f15eba92aac743bdf8ff254be # newest (no tag cut yet)
+    hooks:
+      - id: check-tier1
+      - id: check-tier2
+      - id: check-claude-model
+
+  - repo: local
+    hooks:
+      - id: zizmor
+        name: zizmor (GitHub Actions security audit)
+        entry: zizmor
+        language: python
+        additional_dependencies: ["zizmor==1.25.2"]
+        pass_filenames: false
+        args: [".github/"]
+        files: ^\.github/
+
+      - id: validate-config
+        name: validate Claude hook configuration
+        entry: bash .github/scripts/validate-config.sh
+        language: system
+        pass_filenames: false
+        files: ^(\.claude/|\.hooks/|\.github/workflows/)
+
+      - id: lint-skills
+        name: lint Claude SKILL.md files
+        entry: bash .hooks/lint-skills.sh
+        language: system
+        files: ^\.claude/skills/.*\.md$
