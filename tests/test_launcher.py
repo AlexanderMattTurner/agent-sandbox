@@ -2,9 +2,11 @@
 
 Drives the launch sequence's fail-closed validation + orchestration with a fake docker
 on PATH (no daemon) and CONTAINER_RUNTIME=runc so the backend needs no runtime probe.
-A valid workload gets past validation, selects a runtime, allocates a subnet, and then
-stops at the compose seam (the firewall+workload stack is a later extraction) — proving
-every earlier step ran; malformed records are refused before anything is launched.
+A valid workload gets past validation, selects a runtime, allocates a subnet, and
+enters the compose bring-up — where the silent fake docker yields no workload
+container, so the launch fails CLOSED (proving every earlier step ran and that a
+stack that didn't come up never runs a workload); malformed records are refused
+before anything is launched.
 """
 
 import json
@@ -35,6 +37,7 @@ def _run(tmp_path, workload_obj, *, argv=None):
         "NO_COLOR": "1",
         "SANDBOX_NET_RESERVE_DIR": str(tmp_path / "reserve"),
         "XDG_RUNTIME_DIR": str(tmp_path / "xdg"),
+        "AGENT_SANDBOX_STATE_DIR": str(tmp_path / "state"),
     }
     cmd = argv if argv is not None else ["run", str(wl)]
     return subprocess.run(
@@ -50,13 +53,44 @@ VALID = {
 }
 
 
-def test_valid_workload_selects_runtime_and_subnet_then_stops_at_compose(tmp_path):
+def test_valid_workload_selects_runtime_and_subnet_then_fails_closed_at_bring_up(
+    tmp_path,
+):
     r = _run(tmp_path, VALID)
-    # runtime selected + subnet allocated (both announced), then the compose seam refuses.
+    # runtime selected + subnet allocated (both announced), then the bring-up fails
+    # closed: the silent fake docker produces no workload container, and a stack
+    # that didn't come up must never run a workload.
     assert "runtime=runc" in r.stderr, r.stderr
     assert "network:" in r.stderr and "172.30." in r.stderr, r.stderr
-    assert "compose" in r.stderr
-    assert r.returncode != 0  # refuses to run un-firewalled (compose stack not present)
+    assert "workload container did not start" in r.stderr, r.stderr
+    assert r.returncode != 0
+
+
+def test_object_allowlist_entries_pass_validation(tmp_path):
+    wl = {
+        **VALID,
+        "egress_allowlist": [
+            "pypi.org",
+            {"host": "files.pythonhosted.org", "access": "ro"},
+        ],
+    }
+    r = _run(tmp_path, wl)
+    # Validation accepted the tiered entries: the launch reached bring-up.
+    assert "workload container did not start" in r.stderr, r.stderr
+
+
+def test_ip_inside_object_entry_is_rejected(tmp_path):
+    bad = {**VALID, "egress_allowlist": [{"host": "1.2.3.4"}]}
+    r = _run(tmp_path, bad)
+    assert r.returncode != 0
+    assert "HOSTNAMES, not IPs" in r.stderr
+
+
+def test_invalid_access_tier_is_rejected(tmp_path):
+    bad = {**VALID, "egress_allowlist": [{"host": "pypi.org", "access": "write"}]}
+    r = _run(tmp_path, bad)
+    assert r.returncode != 0
+    assert "egress_allowlist entry" in r.stderr
 
 
 def test_missing_file_is_rejected(tmp_path):

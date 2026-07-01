@@ -7,7 +7,7 @@ the de-claude transform renames. A single re-introduced token (a future copy tha
 skips the rename) fails here instead of silently shipping claude-flavoured code.
 
 Scope is the SHIPPED library surface only (bin/, sandbox/, schema/, workloads/,
-config/) — NOT tests/ or docs/PROVENANCE.md, which legitimately name claude-guard
+config/, profiles/) — NOT tests/ or docs/PROVENANCE.md, which legitimately name claude-guard
 to document the lineage.
 """
 
@@ -30,7 +30,7 @@ RESIDUE = {
 }
 
 # Directories whose files are part of the shipped library (not test/doc prose).
-SHIPPED_DIRS = ["bin", "sandbox", "schema", "workloads", "config"]
+SHIPPED_DIRS = ["bin", "sandbox", "schema", "workloads", "config", "profiles"]
 
 
 _SHIPPED_SUFFIXES = {".bash", ".sh", ".json"}

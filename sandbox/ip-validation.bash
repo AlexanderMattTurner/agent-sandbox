@@ -12,7 +12,7 @@ valid_ipv4() {
 # hyphen, at least one dot, no leading/trailing dot or hyphen. Rejects URLs, ports,
 # IPs-as-domains, whitespace, and shell metacharacters. Vets a domain before it
 # reaches DOMAIN_ACCESS, dnsmasq, or the squid dstdomain ACL — so an unvalidated
-# value from the workspace's per-project config can't seed a junk entry there.
+# value from an untrusted workload record can't seed a junk entry there.
 valid_domain_name() {
   local name="$1" label
   # Length bounds (RFC 1035: name <= 253, label <= 63). The shape regex alone is
@@ -45,43 +45,42 @@ valid_domain_name() {
 # punycode_or_non_ascii NAME — true when NAME carries an `xn--` punycode label or
 # any non-ASCII byte: the shapes a homoglyph/IDN lookalike hides behind (e.g.
 # `xn--ppl-…` rendering as a near-twin of an allowlisted host). valid_domain_name
-# already rejects the raw non-ASCII case, so on the per-project path this fires on
+# already rejects the raw non-ASCII case, so on the workload-record path this fires on
 # punycode; the predicate keeps both arms to mirror the host-side challenge in
 # the host-side allowlist-widen path and stay correct for any caller that admits non-ASCII.
 punycode_or_non_ascii() {
   [[ "$1" == *xn--* || "$1" == *[^a-zA-Z0-9._-]* ]]
 }
 
-# add_project_domains ACCESS — read newline-separated domains on stdin and record
+# add_workload_domains ACCESS — read newline-separated domains on stdin and record
 # each, at tier ACCESS (ro|rw), into the caller's DOMAIN_ACCESS map. The launcher
-# feeds the workspace's per-project allowlist (sandbox.network.allowedDomains[ReadWrite])
-# here; each name is shape-checked (valid_domain_name) before it can seed a dnsmasq
-# address= record or a squid dstdomain ACL. A malformed entry is skipped with a
-# warning, not fatal: a junk value in the workspace's per-project config must not
-# brick the launch, and skipping it can only ever NARROW egress, never widen it.
+# feeds the Workload record's egress_allowlist here, partitioned by tier; each name
+# is shape-checked (valid_domain_name) before it can seed a dnsmasq address= record
+# or a squid dstdomain ACL. A malformed entry is skipped with a warning, not fatal:
+# a junk value in a workload record must not brick the launch, and skipping it can
+# only ever NARROW egress, never widen it.
 # Call ro first then rw so an explicit rw escalation wins when a domain is in both.
-add_project_domains() {
+add_workload_domains() {
   local access="$1" domain
   while IFS= read -r domain; do
     [[ -n "$domain" ]] || continue
     if ! valid_domain_name "$domain"; then
-      echo "WARNING: ignoring malformed per-project $access domain '$domain'" >&2
+      echo "WARNING: ignoring malformed workload $access domain '$domain'" >&2
       continue
     fi
-    # A punycode/non-ASCII entry is REJECTED by default: unlike the host-side
-    # widen path there is no human retype here, so an `xn--`
-    # lookalike from the workspace's per-project config would otherwise seed the
-    # firewall with a near-twin of an allowlisted host and no visible cue. The
-    # workspace settings file is attacker-influenceable, so we fail closed (dropping
-    # an entry only ever narrows egress). An operator who genuinely needs an IDN host
-    # opts in with AGENT_SANDBOX_ALLOW_PROJECT_IDN=1, which downgrades this to the
-    # prior warn-and-admit behaviour.
+    # A punycode/non-ASCII entry is REJECTED by default: there is no human retype
+    # on this path, so an `xn--` lookalike in a workload record would otherwise
+    # seed the firewall with a near-twin of an allowlisted host and no visible
+    # cue. A workload record may come from an untrusted repo, so we fail closed
+    # (dropping an entry only ever narrows egress). An operator who genuinely
+    # needs an IDN host opts in with AGENT_SANDBOX_ALLOW_WORKLOAD_IDN=1, which
+    # downgrades this to warn-and-admit.
     if punycode_or_non_ascii "$domain"; then
-      if [[ "${AGENT_SANDBOX_ALLOW_PROJECT_IDN:-0}" != "1" ]]; then
-        echo "WARNING: rejecting per-project $access domain '$domain' — it contains punycode (xn--) or non-ASCII characters, a classic lookalike-domain trick, and there is no host-side confirmation on this path. Set AGENT_SANDBOX_ALLOW_PROJECT_IDN=1 to admit IDN hosts from project settings." >&2
+      if [[ "${AGENT_SANDBOX_ALLOW_WORKLOAD_IDN:-0}" != "1" ]]; then
+        echo "WARNING: rejecting workload $access domain '$domain' — it contains punycode (xn--) or non-ASCII characters, a classic lookalike-domain trick, and there is no interactive confirmation on this path. Set AGENT_SANDBOX_ALLOW_WORKLOAD_IDN=1 to admit IDN hosts from workload records." >&2
         continue
       fi
-      echo "WARNING: admitting per-project $access domain '$domain' with punycode/non-ASCII (AGENT_SANDBOX_ALLOW_PROJECT_IDN=1) — a classic lookalike-domain trick. Verify it is the host you intend before trusting this allowlist." >&2
+      echo "WARNING: admitting workload $access domain '$domain' with punycode/non-ASCII (AGENT_SANDBOX_ALLOW_WORKLOAD_IDN=1) — a classic lookalike-domain trick. Verify it is the host you intend before trusting this allowlist." >&2
     fi
     # DOMAIN_ACCESS is the caller's global (declared in init-firewall.bash); we only
     # write it here, so shellcheck can't see the reads at the call site.
@@ -144,18 +143,18 @@ validate_access() {
   return 1
 }
 
-# essential_domains — the domains the workload cannot start without, one per line.
-# Derived from the LIVE DOMAIN_ACCESS map (the allowlist after the per-project
-# merge) rather than a hand-kept second list, so adding or removing a domain in
-# domain-allowlist.json flows through with no second edit: the rw tier IS the
-# essential set, because a domain earns rw only when the workload must POST to it
-# ("must reach to function"). init-firewall.bash resolves ONLY these synchronously
-# to reach "firewall ready", then the full allowlist in the background refresh
-# (minimal-ready boot).
+# essential_domains — the domains resolved synchronously at cold boot, one per
+# line: EVERY domain in the live DOMAIN_ACCESS map, all tiers. The tier is a
+# method policy (GET/HEAD vs all), not an importance ranking — a workload that
+# declared only ro hosts still cannot function until they resolve, so the whole
+# declared allowlist is the essential set. init-firewall.bash resolves these
+# synchronously to reach "firewall ready" and fails closed when a NON-EMPTY
+# allowlist resolves zero of them (broken DNS); an empty allowlist boots a valid
+# deny-all firewall with nothing to resolve.
 essential_domains() {
   local d
   for d in "${!DOMAIN_ACCESS[@]}"; do
-    [[ "${DOMAIN_ACCESS[$d]}" == "rw" ]] && printf '%s\n' "$d"
+    printf '%s\n' "$d"
   done
   return 0
 }
@@ -179,11 +178,10 @@ verify_probe_host() {
 # Uses bash's /dev/tcp pseudo-device (no external binary, no TLS, no HTTP) so
 # the probe is as lightweight as possible and tests exactly what the firewall
 # enforces: an iptables ACCEPT for the destination IP (via ipset) on port 443.
-# INVARIANT: callers must only pass DIRECT-EGRESS domains (the rw tier the
-# workload reaches directly). For squid-proxied ro domains a bare TCP
-# connect would false-pass — squid accepts the connection regardless of the domain
-# ACL — and L7 would be needed. verify_probe_host guarantees we never pick an ro
-# domain as the probe target, so L4 is correct for every host this receives.
+# Runs in the FIREWALL's netns, whose OUTPUT chain admits every resolved
+# allowlist IP (the ipset is tier-blind), so an L4 connect is a valid egress
+# assertion for a host of either tier — the ro/rw method split is squid's
+# concern and applies to the workload's proxied traffic, not to this netns.
 # Extracted as a named function so tests can redefine it rather than faking a
 # binary on PATH (bash's /dev/tcp is a builtin; PATH tricks can't intercept it).
 _probe_tcp() {

@@ -1,0 +1,36 @@
+name: Squid config render + parse
+
+# The config-equivalence pin referenced by sandbox/squid-config.bash: the same
+# generator functions init-firewall.bash calls render the live squid.conf, and
+# the squid binary in the shipped firewall image must load every shape of it.
+# Cheap (one image build + `squid -k parse`), so it always runs — no decide gate.
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  squid-parse:
+    name: squid -k parse on the rendered config
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Build firewall image
+        run: docker build -f sandbox/Dockerfile -t agent-sandbox-firewall:ci sandbox/
+
+      - name: Render with the real generators and parse with the real squid
+        run: |
+          docker run --rm \
+            -v "$PWD/.github/scripts/squid-parse-probe.sh:/probe.sh:ro" \
+            agent-sandbox-firewall:ci bash /probe.sh

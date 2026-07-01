@@ -1,5 +1,5 @@
 {
-  "image": "debian:stable-slim",
+  "image": "buildpack-deps:stable-scm",
   "entrypoint": [
     "bash",
     "-lc",
