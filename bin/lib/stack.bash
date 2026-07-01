@@ -182,9 +182,16 @@ stack_run() {
 
   # Run the Workload's entrypoint. Its env rode in on the override, so a plain
   # docker exec sees it; -w /workspace so relative paths land in the seeded tree.
+  # Read the argv by index, not by splitting jq's newline-joined output: an
+  # entrypoint element may itself contain newlines (a multi-line `bash -c`
+  # script is the common case), which a line-delimited read would split into
+  # several argv words, silently truncating a `-c` body to its first line.
   local -a argv=()
-  local _arg
-  while IFS= read -r _arg; do argv+=("$_arg"); done < <(jq -r '.entrypoint[]' "$workload")
+  local _n _i
+  _n="$(jq '.entrypoint | length' "$workload")"
+  for ((_i = 0; _i < _n; _i++)); do
+    argv+=("$(jq -r ".entrypoint[$_i]" "$workload")")
+  done
   local workload_rc=0
   docker exec -u "$WORKLOAD_USER" -w /workspace "$cid" "${argv[@]}" || workload_rc=$?
   if [[ "$workload_rc" -ne 0 ]]; then
