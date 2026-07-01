@@ -6,8 +6,8 @@
 #
 # The launcher reads the Workload record (schema/workload.schema.json), selects a
 # runtime via the backend ladder (fail-closed), allocates a subnet, then brings up the
-# firewall + workload stack and execs the workload's entrypoint. No "claude" anywhere —
-# what runs is entirely the Workload's business.
+# firewall + workload stack and execs the workload's entrypoint. Nothing here assumes
+# what the workload is — what runs is entirely the Workload's business.
 set -Eeuo pipefail
 
 _AS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
