@@ -2,18 +2,12 @@ name: hadolint
 
 # Lints the firewall Dockerfile. Not a required check (the Docker e2e in
 # firewall-e2e.yaml is the behavioural gate); this catches Dockerfile smells early.
+# No paths filter (the job is a few seconds), matching gitleaks/zizmor — a paths
+# filter on pull_request would strand the check at "Expected — Waiting".
 on:
   push:
     branches: ["main"]
-    paths:
-      - "sandbox/Dockerfile*"
-      - ".hadolint.yaml"
-      - ".github/workflows/hadolint.yaml"
   pull_request:
-    paths:
-      - "sandbox/Dockerfile*"
-      - ".hadolint.yaml"
-      - ".github/workflows/hadolint.yaml"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
