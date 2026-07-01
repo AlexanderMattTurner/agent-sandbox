@@ -1,0 +1,36 @@
+name: Firewall egress e2e
+
+# NOT a required check: this is a Docker end-to-end that boots the real squid +
+# dnsmasq to observe block/allow behaviour and the tamper-evident log. It runs on
+# the GitHub runner's Docker daemon (which this repo's dev sandbox lacks). No
+# paths filter so it is easy to reason about; the build is cheap.
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  egress-floor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Build firewall image
+        run: docker build -f sandbox/Dockerfile -t agent-sandbox-firewall:ci sandbox/
+
+      # The probe stands up real squid + dnsmasq via the extracted generators and a
+      # loopback origin, then asserts a blocked host is denied at the proxy AND
+      # logged, and an allowed host splices through AND is logged. Root is required
+      # (dnsmasq binds :53, squid drops privileges itself) — do NOT --cap-drop.
+      - name: Egress-floor probe (block denied+logged; allow spliced+logged)
+        run: bash .github/scripts/run-egress-floor-probe.sh
