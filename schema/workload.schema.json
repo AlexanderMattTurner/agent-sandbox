@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://github.com/alexandermattturner/agent-sandbox/schema/workload.schema.json",
   "title": "agent-sandbox Workload",
-  "description": "The parameterization that replaces 'install claude'. A Workload record is handed to `agent-sandbox run`: the launcher selects a runtime via the backend, allocates a subnet, brings up the name-level-allowlist firewall, waits for its health, then execs the workload's entrypoint. No workload-specific logic lives in the library.",
+  "description": "The parameterization that replaces a workload-specific bootstrap (e.g. installing an agent). A Workload record is handed to `agent-sandbox run`: the launcher selects a runtime via the backend, allocates a subnet, brings up the name-level-allowlist firewall, waits for its health, then execs the workload's entrypoint. No workload-specific logic lives in the library.",
   "type": "object",
   "additionalProperties": false,
   "required": ["image", "entrypoint", "egress_allowlist", "ephemeral"],
@@ -16,7 +16,7 @@
       "type": "array",
       "items": { "type": "string" },
       "minItems": 1,
-      "description": "argv the sandbox execs once the firewall is healthy. NO 'install claude' here — the workload brings its own command."
+      "description": "argv the sandbox execs once the firewall is healthy. NO bootstrap/install here — the workload brings its own command."
     },
     "env": {
       "type": "object",

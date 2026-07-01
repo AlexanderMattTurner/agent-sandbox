@@ -3,13 +3,13 @@
 #
 # launch-trace.bash — optional wall-clock instrumentation of the launch path, for
 # measuring the user-perceived "time from agent-sandbox invocation to can-type-in-the-
-# prompt" (the handover instant, where the wrapper execs claude). Off unless the
+# prompt" (the handover instant, where the launcher execs the workload). Off unless the
 # operator points AGENT_SANDBOX_LAUNCH_TRACE at a file; then bin/agent-sandbox stamps a
 # handful of milestones into it (start, image_resolved, compose_up_start,
 # containers_ready, guardrails_verified, handover) and bin/bench-launch-host.py turns it
 # per-stage breakdown + total. Sourced once, early, by bin/agent-sandbox — and also
-# in-container (the same file copied beside them) by .devcontainer/init-firewall.bash
-# (fw_* marks), .devcontainer/entrypoint.bash (entrypoint_started + hard_* marks), and the app service's
+# in-container (the same file copied beside them) by sandbox/init-firewall.bash
+# (fw_* marks), sandbox/entrypoint.bash (entrypoint_started + hard_* marks), and the workload service's
 # keep-alive command (app_* marks), each appending into the host file bind-mounted over
 # AGENT_SANDBOX_LAUNCH_TRACE (docker-compose.yml) so the analyzer reads them inline with
 # the host marks and splits the image_resolved->containers_ready leg into real sub-legs.
@@ -19,11 +19,11 @@
 # MARK_* variable per mark, so producers stamp `launch_trace_mark "$MARK_START"` rather
 # than re-typing the literal. Sourcing it tolerates its absence (a stripped image, a direct
 # test invocation) so this file never aborts a strict-mode caller. That tolerance is for the
-# producers that stamp only prefix-family literals (init-firewall.bash's fw_*, the app
+# producers that stamp only prefix-family literals (init-firewall.bash's fw_*, the workload
 # keep-alive's app_*) — they reference no MARK_* and run fine without it. The host producer
 # bin/agent-sandbox DOES reference $MARK_* under `set -u`, so it hard-requires this file — but
 # launch-marks.bash is committed beside it in bin/lib/, so it is always present there.
-# (.devcontainer/entrypoint.bash's lone $MARK_ uses a `:-` default for its absent-lib branch.)
+# (sandbox/entrypoint.bash's lone $MARK_ uses a `:-` default for its absent-lib branch.)
 # shellcheck source=launch-marks.bash disable=SC1091
 [[ -f "${BASH_SOURCE[0]%/*}/launch-marks.bash" ]] &&
   source "${BASH_SOURCE[0]%/*}/launch-marks.bash"
@@ -35,7 +35,7 @@
 # these calls onto the launch path costs nothing and risks nothing.
 # launch_trace_init — host-side one-shot, called by bin/agent-sandbox before the first
 # mark: when tracing is on, ensure the trace file exists and is world-writable (0666).
-# The app container appends its app_* marks as the unprivileged `node` user (uid 1000),
+# The workload container appends its app_* marks as the unprivileged `node` user (uid 1000),
 # but the file is created with the HOST user's ownership; on a host whose uid differs
 # from 1000 (CI runners at uid ~1001, many Linux/macOS checkouts) the app's owner-only
 # file would deny those appends and its marks would be silently lost (launch_trace_mark

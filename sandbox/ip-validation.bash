@@ -12,11 +12,11 @@ valid_ipv4() {
 # hyphen, at least one dot, no leading/trailing dot or hyphen. Rejects URLs, ports,
 # IPs-as-domains, whitespace, and shell metacharacters. Vets a domain before it
 # reaches DOMAIN_ACCESS, dnsmasq, or the squid dstdomain ACL — so an unvalidated
-# value from a workspace's .claude/settings.json can't seed a junk entry there.
+# value from the workspace's per-project config can't seed a junk entry there.
 valid_domain_name() {
   local name="$1" label
   # Length bounds (RFC 1035: name <= 253, label <= 63). The shape regex alone is
-  # unbounded, so an attacker-influenceable workspace .claude/settings.json could
+  # unbounded, so an attacker-influenceable workspace config could
   # otherwise seed a multi-KB dnsmasq `address=`/squid `dstdomain` line that fails
   # the config reload and bricks the launch.
   [[ "${#name}" -le 253 ]] || return 1
@@ -47,7 +47,7 @@ valid_domain_name() {
 # `xn--ppl-…` rendering as a near-twin of an allowlisted host). valid_domain_name
 # already rejects the raw non-ASCII case, so on the per-project path this fires on
 # punycode; the predicate keeps both arms to mirror the host-side challenge in
-# bin/claude-loosen-firewall and stay correct for any caller that admits non-ASCII.
+# the host-side allowlist-widen path and stay correct for any caller that admits non-ASCII.
 punycode_or_non_ascii() {
   [[ "$1" == *xn--* || "$1" == *[^a-zA-Z0-9._-]* ]]
 }
@@ -57,7 +57,7 @@ punycode_or_non_ascii() {
 # feeds the workspace's per-project allowlist (sandbox.network.allowedDomains[ReadWrite])
 # here; each name is shape-checked (valid_domain_name) before it can seed a dnsmasq
 # address= record or a squid dstdomain ACL. A malformed entry is skipped with a
-# warning, not fatal: a junk value in a workspace's .claude/settings.json must not
+# warning, not fatal: a junk value in the workspace's per-project config must not
 # brick the launch, and skipping it can only ever NARROW egress, never widen it.
 # Call ro first then rw so an explicit rw escalation wins when a domain is in both.
 add_project_domains() {
@@ -69,8 +69,8 @@ add_project_domains() {
       continue
     fi
     # A punycode/non-ASCII entry is REJECTED by default: unlike the host-side
-    # claude-loosen-firewall path there is no human retype here, so an `xn--`
-    # lookalike from a workspace's .claude/settings.json would otherwise seed the
+    # widen path there is no human retype here, so an `xn--`
+    # lookalike from the workspace's per-project config would otherwise seed the
     # firewall with a near-twin of an allowlisted host and no visible cue. The
     # workspace settings file is attacker-influenceable, so we fail closed (dropping
     # an entry only ever narrows egress). An operator who genuinely needs an IDN host
@@ -100,7 +100,7 @@ add_project_domains() {
 # of truth, consumed by both the resolve-time filter (is_public_ipv4) and the
 # packet-layer egress DROP rules in init-firewall.bash, so the two cannot drift.
 # The per-session sandbox subnets (172.30.x.0/24) fall inside 172.16/12, so a
-# rebind onto the monitor sidecar or squid is covered.
+# rebind onto a sandbox-network service is covered.
 BOGON_CIDRS=(
   0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16
   172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4

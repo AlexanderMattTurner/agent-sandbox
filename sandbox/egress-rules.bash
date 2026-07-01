@@ -8,9 +8,8 @@
 
 # install_egress_output_rules — append the egress OUTPUT chain in its
 # load-bearing order. Reads from the caller's environment: SANDBOX_SUBNET,
-# BOGON_CIDRS (array), MONITOR_NTFY_HOST, MONITOR_UID (optional), EGRESS_QUOTA_MB
-# (optional). The `allowed-domains` ipset must already exist (and `monitor-ntfy`
-# when MONITOR_NTFY_HOST is set).
+# BOGON_CIDRS (array), EGRESS_QUOTA_MB (optional). The `allowed-domains` ipset
+# must already exist.
 install_egress_output_rules() {
   # BOGON_CIDRS is the packet-layer metadata/RFC1918 backstop; an empty or unset
   # array would install the OUTPUT chain WITHOUT it (a silent security hole), and a
@@ -25,7 +24,7 @@ install_egress_output_rules() {
   # NOT pass through is_public_ipv4: the carried-forward GitHub-meta CIDRs and any
   # hand-edited static CIDR. The two legitimate non-public destinations are carved
   # out FIRST — loopback (the firewall's own dnsmasq/squid) and the sandbox subnet
-  # (squid<->app responses, monitor port) — then every BOGON_CIDRS range is dropped.
+  # (squid<->workload responses) — then every BOGON_CIDRS range is dropped.
   # Placed before the allowed-domains ACCEPT so a bogon can't fall through to it;
   # allowed-domains only ever hold public IPs, so this never shadows the quota rule.
   iptables -A OUTPUT -d 127.0.0.0/8 -j ACCEPT
@@ -33,27 +32,6 @@ install_egress_output_rules() {
   for _bogon in "${BOGON_CIDRS[@]}"; do
     iptables -A OUTPUT -d "$_bogon" -j DROP
   done
-
-  # Monitor-only push-alert egress: HTTPS to the user's ntfy server, matched on
-  # BOTH the destination ipset and the monitor sidecar's pinned uid (uids are
-  # kernel-global across the shared netns, and the agent is pinned to uid 1000
-  # by cap_drop+no-new-privileges, so nothing the agent runs can ever match).
-  # After the bogon DROPs — a private-range ntfy server is not supported — and
-  # before the quota rule, whose budget bounds agent exfil, not monitor alerts.
-  # Validate the uid: a malformed env value must fail the launch loudly, not
-  # install a rule scoped to garbage.
-  if [[ -n "$MONITOR_NTFY_HOST" ]]; then
-    MONITOR_UID="${MONITOR_UID:-999}"
-    if [[ ! "$MONITOR_UID" =~ ^[0-9]+$ ]]; then
-      echo "ERROR: MONITOR_UID must be numeric, got '$MONITOR_UID'" >&2
-      # return, not exit: this lib is sourced (init-firewall aborts under set -e on
-      # the non-zero return just the same), but an `exit` here would also kill a
-      # test harness or any other consumer that sources it. Match the BOGON path.
-      return 1
-    fi
-    iptables -A OUTPUT -m owner --uid-owner "$MONITOR_UID" \
-      -m set --match-set monitor-ntfy dst -p tcp --dport 443 -j ACCEPT
-  fi
 
   # Egress byte budget (opt-in): a hard ceiling on outbound bytes to allowed
   # domains, bounding worst-case exfiltration. OFF by default — when the cap is
@@ -78,8 +56,8 @@ install_egress_output_rules() {
     iptables -A OUTPUT -m set --match-set allowed-domains dst -j ACCEPT
   fi
 
-  # Return traffic to NON-allowed-domain destinations (intra-sandbox responses,
-  # monitor port replies). Allowed-domain traffic is already decided above.
+  # Return traffic to NON-allowed-domain destinations (intra-sandbox responses).
+  # Allowed-domain traffic is already decided above.
   iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
 
   iptables -A OUTPUT -j REJECT --reject-with icmp-admin-prohibited

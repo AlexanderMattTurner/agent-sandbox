@@ -15,7 +15,7 @@
 # that exits 0 does NOT prove the value took (the kernel can clamp it, or the key
 # can be absent), and the prior `2>/dev/null || true` hid a TOTAL miss: the operator
 # would believe the table is bounded when it is not. So treat the READ-BACK as the
-# post-condition (CLAUDE.md: success = the post-condition holds, not exit 0) and
+# post-condition (success means the post-condition holds, not exit 0) and
 # warn on any mismatch — covering both a denied write and a clamped one.
 ensure_conntrack_sysctl() {
   local key="$1" want="$2" got=""
