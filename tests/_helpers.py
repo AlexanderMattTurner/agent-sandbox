@@ -6,10 +6,36 @@ without manipulating `sys.path` or relying on the conftest plugin loader.
 
 import os
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+_EXEC_BITS = stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+
+
+def run_capture(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+    """`subprocess.run` with the capture_output/text/check defaults every test
+    uses. `kwargs` (env, cwd, input, ...) are forwarded verbatim."""
+    return subprocess.run(args, capture_output=True, text=True, check=False, **kwargs)
+
+
+def write_exe(path: Path, body: str) -> Path:
+    """Write `body` to `path`, mark it executable, and return it.
+
+    Writes a temp sibling then atomically renames it onto `path`: opening `path`
+    for write directly truncates it, which fails with ETXTBSY ("Text file busy")
+    when a prior exec of the same stub path is still draining — a real race when
+    a test reruns a stub it just invoked (xdist amplifies it). Rename over the
+    busy inode is never blocked, so the rewrite is race-free."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(body)
+    tmp.chmod(tmp.stat().st_mode | _EXEC_BITS)
+    os.replace(tmp, path)
+    return path
+
 
 GIT_IDENTITY_ENV = {
     "GIT_AUTHOR_NAME": "t",
