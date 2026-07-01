@@ -1,0 +1,36 @@
+name: Sandbox runtime smoke
+
+# NOT a required check: this is a Docker smoke that installs gVisor/runsc on the
+# runner and proves the extracted runtime-detect ladder + backend seam SELECT a
+# runtime AND that Docker can actually RUN a container under it (registration in
+# `docker info` is not enough — a listed-but-broken runtime dies deep in a launch).
+# It uses the runner's Docker daemon (which this repo's dev sandbox lacks). No paths
+# filter so it always fires and is easy to reason about. gVisor unavailability
+# degrades to a runc-only smoke rather than failing the job.
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  runtime-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # Installs+registers runsc (checksum-verified, degrading to runc-only if it
+      # can't install), then runs the ladder smoke: backend_select_runtime picks a
+      # runtime that runs a throwaway container, and a bogus CONTAINER_RUNTIME is
+      # refused fail-closed.
+      - name: Runtime ladder install + smoke (runc always; gVisor if installable)
+        run: bash .github/scripts/run-sandbox-runtime-smoke.sh
