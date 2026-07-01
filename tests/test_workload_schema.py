@@ -72,3 +72,43 @@ def test_seed_from_git_requires_review_branch():
     }
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(bad, SCHEMA)
+
+
+def _with_allowlist(entries):
+    return {
+        "image": "x",
+        "entrypoint": ["bash"],
+        "egress_allowlist": entries,
+        "ephemeral": True,
+    }
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        ["pypi.org"],
+        [{"host": "pypi.org"}],
+        [{"host": "pypi.org", "access": "ro"}],
+        [{"host": "pypi.org", "access": "rw"}],
+        ["a.example", {"host": "b.example", "access": "ro"}],
+        [],
+    ],
+    ids=["bare-string", "object-default", "object-ro", "object-rw", "mixed", "empty"],
+)
+def test_allowlist_accepts_string_and_tiered_object_entries(entries):
+    jsonschema.validate(_with_allowlist(entries), SCHEMA)
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        [{"host": "pypi.org", "access": "write"}],  # not a valid tier
+        [{"access": "ro"}],  # object form requires host
+        [{"host": "pypi.org", "port": 443}],  # no undeclared keys
+        [123],  # neither string nor object
+    ],
+    ids=["bad-tier", "missing-host", "extra-key", "non-string"],
+)
+def test_allowlist_rejects_malformed_entries(entries):
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(_with_allowlist(entries), SCHEMA)

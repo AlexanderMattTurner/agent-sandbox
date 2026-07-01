@@ -1,0 +1,148 @@
+# The firewall + workload stack — the sandbox's egress boundary as topology.
+#
+# THE TOPOLOGY INVARIANT (the crown jewel — do not degrade it to an IP allowlist):
+# the workload container sits on the `sandbox` network, which is `internal: true`
+# — Docker attaches NO gateway route off it. The firewall is the only dual-homed
+# service (sandbox + egress) and never enables forwarding or MASQUERADE (its
+# FORWARD policy is DROP), so the workload has NO L3 route to any external IP.
+# Its only egress is L7: squid at the firewall (${SANDBOX_IP}:3128), plus DNS at
+# the firewall's dnsmasq. Unsetting http_proxy inside the workload gains nothing
+# — there is no route at all — which is what makes squid's name-level allowlist
+# and per-method ro tier unbypassable, and its access log a complete egress log.
+#
+# The launcher (bin/agent-sandbox) parameterizes this file per session via env
+# vars (subnet, images, allowlist tiers) plus a generated override carrying the
+# Workload record's env/user/workspace binding. Compose-relative paths (seccomp)
+# resolve against THIS file's directory; anything that relocates the compose must
+# absolutize them.
+
+services:
+  firewall:
+    image: ${FIREWALL_IMAGE:-agent-sandbox-firewall:local}
+    # tini as PID 1: init-firewall backgrounds dnsmasq/squid/the DNS refresher;
+    # without a reaper their exits accumulate as zombies against pids_limit.
+    init: true
+    # Everything dropped, then only what the firewall's job needs:
+    #   NET_ADMIN/NET_RAW      — iptables/ip6tables/ipset (and the -m set match's
+    #                            SOCK_RAW socket on some kernels)
+    #   NET_BIND_SERVICE       — dnsmasq :53, squid :3128
+    #   CHOWN/DAC_OVERRIDE     — root-owned config files handed to proxy group
+    #   SETUID/SETGID/SETPCAP  — dnsmasq and squid drop their own privileges
+    #   KILL                   — the refresh loop drains dnsmasq (pkill) to rebind
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - NET_BIND_SERVICE
+      - CHOWN
+      - DAC_OVERRIDE
+      - SETUID
+      - SETGID
+      - SETPCAP
+      - KILL
+    security_opt:
+      - no-new-privileges:true
+      - seccomp:./seccomp-firewall.json
+    pids_limit: 64
+    environment:
+      SANDBOX_IP: ${SANDBOX_IP:-172.30.0.2}
+      SANDBOX_SUBNET: ${SANDBOX_SUBNET:-172.30.0.0/24}
+      WORKLOAD_ALLOWED_DOMAINS_RO: ${WORKLOAD_ALLOWED_DOMAINS_RO:-}
+      WORKLOAD_ALLOWED_DOMAINS_RW: ${WORKLOAD_ALLOWED_DOMAINS_RW:-}
+      AGENT_SANDBOX_FIREWALL_SKIP_VERIFY: ${AGENT_SANDBOX_FIREWALL_SKIP_VERIFY:-0}
+      AGENT_SANDBOX_DNS_CACHE: ${AGENT_SANDBOX_DNS_CACHE:-1}
+      AGENT_SANDBOX_TRACE: ${AGENT_SANDBOX_TRACE:-}
+      DANGEROUSLY_SKIP_FIREWALL: ${DANGEROUSLY_SKIP_FIREWALL:-}
+      EGRESS_QUOTA_MB: ${EGRESS_QUOTA_MB:-}
+    # The sentinel gates everything: init-firewall runs set -Eeuo pipefail and
+    # exits non-zero on any failure, so /tmp/firewall-ready never appears, the
+    # healthcheck never flips, and the workload (depends_on: service_healthy)
+    # never starts — fail closed by construction.
+    command:
+      - bash
+      - -c
+      - |
+        /usr/local/bin/init-firewall.bash \
+          && touch /tmp/firewall-ready \
+          && exec sleep infinity
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/firewall-ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 60s
+      start_interval: 250ms
+    networks:
+      sandbox:
+        ipv4_address: ${SANDBOX_IP:-172.30.0.2}
+      egress: {}
+    volumes:
+      # The tamper-evident egress log (squid access.log). A named volume so the
+      # workload cannot touch it (it is mounted nowhere else) and the launcher
+      # can export it before teardown.
+      - egress-log:/var/log/squid
+      # Cross-session DNS cache (firewall-only; see init-firewall.bash for why
+      # workload-unwritable placement is load-bearing).
+      - dns-cache:/var/cache/agent-sandbox
+
+  workload:
+    image: ${WORKLOAD_IMAGE:?the launcher must export WORKLOAD_IMAGE from the Workload record}
+    user: ${WORKLOAD_USER:-1000}
+    runtime: ${WORKLOAD_RUNTIME:-runc}
+    init: true
+    depends_on:
+      firewall:
+        condition: service_healthy
+    # The container idles; the launcher seeds /workspace, then execs the Workload's
+    # entrypoint argv, so the workload never runs against a half-seeded tree.
+    entrypoint: ["sleep", "infinity"]
+    cap_drop:
+      - ALL
+    # CHOWN is the one capability restored: the launcher's seed step execs as
+    # root to hand the fresh /workspace volume (root-owned by Docker) to the
+    # workload user. The workload process itself runs as an unprivileged uid
+    # with no-new-privileges, so it can never exercise it.
+    cap_add:
+      - CHOWN
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    pids_limit: 512
+    environment:
+      # All HTTP(S) tooling routes through squid at the firewall. This is
+      # convenience, not the boundary — the `internal` network is the boundary.
+      http_proxy: http://${SANDBOX_IP:-172.30.0.2}:3128
+      https_proxy: http://${SANDBOX_IP:-172.30.0.2}:3128
+      HTTP_PROXY: http://${SANDBOX_IP:-172.30.0.2}:3128
+      HTTPS_PROXY: http://${SANDBOX_IP:-172.30.0.2}:3128
+      no_proxy: localhost,127.0.0.1,${SANDBOX_IP:-172.30.0.2}
+      NO_PROXY: localhost,127.0.0.1,${SANDBOX_IP:-172.30.0.2}
+      # A writable HOME on the read-only rootfs: the workload user is an
+      # arbitrary uid with no passwd entry, and git (among others) needs one.
+      HOME: /tmp
+    dns:
+      - ${SANDBOX_IP:-172.30.0.2}
+    networks:
+      sandbox:
+        ipv4_address: ${WORKLOAD_IP:-172.30.0.3}
+    volumes:
+      - workspace:/workspace
+
+networks:
+  sandbox:
+    # `internal: true` is the load-bearing line: no gateway route off this
+    # network exists in the workload's netns.
+    internal: true
+    ipam:
+      config:
+        - subnet: ${SANDBOX_SUBNET:-172.30.0.0/24}
+  egress:
+    driver: bridge
+
+volumes:
+  egress-log:
+  dns-cache:
+  workspace:

@@ -17,6 +17,8 @@ source "$_AS_DIR/lib/msg.bash"
 source "$_AS_DIR/lib/backend.bash"
 # shellcheck source=lib/sandbox-net.bash disable=SC1091
 source "$_AS_DIR/lib/sandbox-net.bash"
+# shellcheck source=lib/stack.bash disable=SC1091
+source "$_AS_DIR/lib/stack.bash"
 
 usage() {
   cat >&2 <<'EOF'
@@ -76,9 +78,20 @@ cmd_run() {
     as_error "workload.ephemeral must be present (true/false)"
     return 1
   }
+  # Each entry is a hostname string (rw — full access) or {host, access: ro|rw}
+  # (the object form opts a host down to GET/HEAD-only).
+  jq -e '[.egress_allowlist[]? |
+    (type == "string")
+    or (type == "object" and (.host | type == "string")
+        and ((.access // "rw") == "ro" or (.access // "rw") == "rw"))
+  ] | all' "$workload" >/dev/null || {
+    as_error "each workload.egress_allowlist entry must be a hostname string or {host, access: \"ro\"|\"rw\"}"
+    return 1
+  }
   # Reject an IP in the allowlist: enforcement is NAME-level at the proxy, and an IP
   # entry would silently never match (or invite an iptables-allowlist mistake).
-  if jq -e '.egress_allowlist[]? | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$"))' "$workload" >/dev/null; then
+  if jq -e '[.egress_allowlist[]? | if type == "object" then .host else . end |
+    select(test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$"))] | length > 0' "$workload" >/dev/null; then
     as_error "workload.egress_allowlist must contain HOSTNAMES, not IPs — the allowlist is enforced by name at the forward proxy"
     return 1
   fi
@@ -95,16 +108,16 @@ cmd_run() {
   export_sandbox_subnet
   as_info "network: $SANDBOX_SUBNET (firewall $SANDBOX_IP)"
 
-  # 3. Bring up the firewall + workload stack and exec the entrypoint. The compose stack
-  #    (sandbox/docker-compose.yml + init-firewall) is the behavioural boundary; refuse
-  #    loudly if this build doesn't carry it rather than run the workload un-firewalled.
+  # 3. Bring up the firewall + workload stack, seed, exec the entrypoint, extract,
+  #    tear down (stack.bash). The compose stack (sandbox/docker-compose.yml +
+  #    init-firewall) is the behavioural boundary; refuse loudly if this build
+  #    doesn't carry it rather than run the workload un-firewalled.
   local compose="$_AS_DIR/../sandbox/docker-compose.yml"
   [[ -f "$compose" ]] || {
     as_error "the firewall+workload compose stack ($compose) is not present in this build — refusing to launch a workload without the egress boundary"
     return 1
   }
-  as_error "compose bring-up is not yet wired in this build (runtime selected, subnet allocated); see sandbox/docker-compose.yml"
-  return 1
+  stack_run "$workload" "$compose" "$runtime"
 }
 
 main() {

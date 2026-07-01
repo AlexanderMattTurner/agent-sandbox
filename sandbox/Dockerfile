@@ -4,6 +4,9 @@
 # runs against this image to prove block/allow decisions and the tamper-evident log.
 FROM debian:stable-slim@sha256:ee12ffb55625b99d62837a72f037d9b2f18fd0c787a89c2b9a4f09666c48776c
 
+# dnsutils (dig): the resolver + the DNS self-tests; iproute2 (ip): the host-gateway
+# probe; procps (sysctl, pkill/pgrep): conntrack hardening + the dnsmasq drain in the
+# refresh loop — all exercised by init-firewall.bash at every boot.
 RUN apt-get update && apt-get install -y --no-install-recommends \
   ca-certificates \
   curl \
@@ -13,6 +16,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   grepcidr \
   jq \
   dnsmasq \
+  dnsutils \
+  iproute2 \
+  procps \
   squid-openssl \
   ssl-cert \
   openssl \
@@ -44,4 +50,4 @@ RUN mkdir -p /var/log/squid && chmod 750 /var/log/squid && chown proxy:proxy /va
 # they must all land together on PATH.
 COPY firewall-lib.bash ip-validation.bash dns-resolver.bash squid-config.bash \
   egress-rules.bash conntrack.bash trace.bash trace-events.bash launch-trace.bash \
-  launch-marks.bash json.bash domain-allowlist.json /usr/local/bin/
+  launch-marks.bash json.bash init-firewall.bash /usr/local/bin/

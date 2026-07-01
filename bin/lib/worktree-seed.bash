@@ -87,6 +87,13 @@ _wt_run() {
   fi
 }
 
+# _wt_user — the uid (or name) the workload runs as inside the container. Every
+# in-container seed/extract exec runs as this user so the seeded tree and the
+# extract's commits carry the same ownership as the workload's own writes. The
+# launcher exports it from the Workload record's `user` field; 1000 matches the
+# record's schema default.
+_wt_user() { printf '%s' "${AGENT_SANDBOX_WORKLOAD_USER:-1000}"; }
+
 # _worktree_seed_paths <dir> — NUL-emit <dir>'s tracked paths that still exist in the
 # working tree, EXCLUDING submodule gitlinks. `git ls-files` also lists a tracked file the
 # user deleted on disk without `git rm`; tar can't stat such a path and aborts the whole
@@ -187,23 +194,23 @@ worktree_relocate_wip_outside_scratch() {
 }
 
 # worktree_seed_into_container <container_id> — read a seed tar on stdin and extract it
-# into <container_id>'s /workspace as node. A fresh named volume mounts root:root and the
-# app runs as node (uid 1000), so /workspace must be chowned first or the extract can't
+# into <container_id>'s /workspace as the workload user. A fresh named volume mounts
+# root:root and the workload runs unprivileged, so /workspace must be chowned first or the extract can't
 # even mkdir under it; this is safe precisely because a named volume has no host inode
 # (the reason the bind-mount path deliberately avoids chowning /workspace does not apply).
 # The extract carries NO -P, so absolute/.. members are refused — nothing lands outside
 # /workspace. Fail-loud: a chown or extract failure returns non-zero so the launch aborts
 # rather than hand the agent a half-seeded tree. The chown is non-recursive: the generic
 # spare's named volume is empty at seed time, so there is nothing under the mountpoint to
-# recurse over, and every file the extract writes is created by node (so already node-owned)
+# recurse over, and every file the extract writes is created by the workload user (so already correctly owned)
 # — only the mountpoint itself, created root:root by Docker, needs its ownership fixed.
 worktree_seed_into_container() {
   local container_id="$1"
-  if ! docker exec -u root "$container_id" chown node:node /workspace; then
+  if ! docker exec -u root "$container_id" chown "$(_wt_user):$(_wt_user)" /workspace; then
     as_error "worktree seed: could not take ownership of /workspace in $container_id"
     return 1
   fi
-  if ! docker exec -i -u node "$container_id" sh -c \
+  if ! docker exec -i -u "$(_wt_user)" "$container_id" sh -c \
     'cd /workspace && tar --warning=no-unknown-keyword -xf -'; then
     as_error "worktree seed: extracting the working tree into $container_id failed"
     return 1
@@ -222,13 +229,13 @@ worktree_seed_into_container() {
 # node_modules sub-volume (ro on the app, pre-built at prewarm — the warm spare's whole value) and
 # node_modules is a mountpoint that can't be unlinked, so it is excluded by name from
 # the wipe: node_modules is never carried by the tracked-only tar, and its
-# refreshed by the extract. Runs as node (which owns /workspace after the prewarm seed). NO -P, so
+# refreshed by the extract. Runs as the workload user (which owns /workspace after the prewarm seed). NO -P, so
 # absolute/.. members are refused (same containment as the first seed). Fail-loud: a wipe or extract
 # failure returns non-zero so the launch aborts rather than hand the agent a half-re-seeded tree.
 worktree_reseed_container() {
   local container_id="$1"
   # shellcheck disable=SC2016  # the script runs inside the container shell, not here.
-  if ! docker exec -i -u node "$container_id" sh -c '
+  if ! docker exec -i -u "$(_wt_user)" "$container_id" sh -c '
     cd /workspace || exit 1
     find . -mindepth 1 -maxdepth 1 ! -name node_modules -exec rm -rf {} + || exit 1
     tar --warning=no-unknown-keyword -xf -
@@ -242,14 +249,14 @@ worktree_reseed_container() {
 # in <container_id>'s seeded /workspace, capture the seeded tree as one WIP root commit on
 # <branch>, and PRINT that commit's SHA on stdout (the extract's base ref — the caller must
 # capture and persist it so teardown can extract exactly the agent's commits). The agent
-# commits on <branch> on top. Runs as node (owns /workspace after the seed chown).
+# commits on <branch> on top. Runs as the workload user (owns /workspace after the seed chown).
 # --no-verify: the in-container WIP commit is launch machinery, not a user commit, and the
 # project's commit hooks aren't provisioned here. --allow-empty fallback keeps a root commit
 # even for an empty tree, so the extract base always exists. Fail-loud.
 worktree_container_init_repo() {
   local container_id="$1" branch="$2"
   # shellcheck disable=SC2016  # $1/$2 expand inside the container shell, not here.
-  if ! docker exec -u node "$container_id" sh -c '
+  if ! docker exec -u "$(_wt_user)" "$container_id" sh -c '
     cd /workspace || exit 1
     git init -q || exit 1
     git config user.email "agent@agent-sandbox.local" || exit 1
@@ -269,7 +276,7 @@ worktree_container_init_repo() {
 # its HEAD commit plus its uncommitted tracked delta (git diff HEAD). A later adopting launch
 # reads these back (worktree_seed_fingerprint_matches) to decide whether the tree changed since,
 # and so whether it can reuse this repo as-is (warm stays fast) or must re-seed. Stored under
-# .git — untracked, travels with the spare's volume, gone when it is reaped. Runs as node (owns
+# .git — untracked, travels with the spare's volume, gone when it is reaped. Runs as the workload user (owns
 # /workspace after init). Fail-loud: a stamp failure aborts the prewarm rather than leave a spare
 # an adopter would wrongly trust as current.
 worktree_stamp_seed_fingerprint() {
@@ -279,7 +286,7 @@ worktree_stamp_seed_fingerprint() {
     return 1
   fi
   # shellcheck disable=SC2016  # $1 expands inside the container shell, not here.
-  if ! git -C "$repo_root" diff HEAD --binary | docker exec -i -u node "$container_id" sh -c '
+  if ! git -C "$repo_root" diff HEAD --binary | docker exec -i -u "$(_wt_user)" "$container_id" sh -c '
     printf "%s\n" "$1" >/workspace/.git/sandbox-seed-head || exit 1
     cat >/workspace/.git/sandbox-seed-wip
   ' sh "$head"; then
@@ -292,14 +299,14 @@ worktree_stamp_seed_fingerprint() {
 # tracked tree equals the one stamped in <container_id> at prewarm: same HEAD AND same uncommitted
 # tracked delta. A missing/unreadable stamp or any change returns non-zero, so adoption re-seeds
 # rather than serve a stale tree, keyed on (HEAD, git diff HEAD).
-# Runs as node.
+# Runs as the workload user.
 worktree_seed_fingerprint_matches() {
   local container_id="$1" repo_root="$2" cur_head stamped_head
   cur_head="$(git -C "$repo_root" rev-parse HEAD 2>/dev/null)" || return 1
-  stamped_head="$(docker exec -u node "$container_id" sh -c 'cat /workspace/.git/sandbox-seed-head 2>/dev/null')" || return 1
+  stamped_head="$(docker exec -u "$(_wt_user)" "$container_id" sh -c 'cat /workspace/.git/sandbox-seed-head 2>/dev/null')" || return 1
   [[ -n "$stamped_head" && "$stamped_head" == "$cur_head" ]] || return 1
   git -C "$repo_root" diff HEAD --binary |
-    docker exec -i -u node "$container_id" sh -c 'cmp -s - /workspace/.git/sandbox-seed-wip'
+    docker exec -i -u "$(_wt_user)" "$container_id" sh -c 'cmp -s - /workspace/.git/sandbox-seed-wip'
 }
 
 # worktree_container_seed_head <container_id> — print the HEAD commit of <container_id>'s
@@ -307,7 +314,7 @@ worktree_seed_fingerprint_matches() {
 # reuses this as the extract base when it adopts a prewarm repo whose tree is unchanged. Fail-loud.
 worktree_container_seed_head() {
   local container_id="$1"
-  if ! docker exec -u node "$container_id" sh -c 'cd /workspace && git rev-parse HEAD'; then
+  if ! docker exec -u "$(_wt_user)" "$container_id" sh -c 'cd /workspace && git rev-parse HEAD'; then
     as_error "worktree seed: could not read the pre-initialized seed repo HEAD in $container_id"
     return 1
   fi
@@ -336,7 +343,7 @@ worktree_container_seed_head() {
 worktree_container_extract() {
   local container_id="$1" base_ref="$2"
   # shellcheck disable=SC2016  # $1 expands inside the container shell, not here.
-  _wt_run docker exec -u node "$container_id" sh -c '
+  _wt_run docker exec -u "$(_wt_user)" "$container_id" sh -c '
     cd /workspace || exit 1
     git add -A || exit 1
     if ! git diff --cached --quiet; then
@@ -355,7 +362,7 @@ worktree_container_extract() {
 # prevent the add itself, so a lock hiccup can't turn into a lost branch.
 _worktree_add_locked() {
   local repo_root="$1" wt_dir="$2" branch="$3" base_commit="$4"
-  local lock="$repo_root/.git/cg-worktree-add.lock"
+  local lock="$repo_root/.git/as-worktree-add.lock"
   with_lock "$lock" _wt_run git -C "$repo_root" worktree add -q "$wt_dir" -b "$branch" "$base_commit"
 }
 

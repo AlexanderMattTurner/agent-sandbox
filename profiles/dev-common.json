@@ -1,5 +1,4 @@
 {
-  "inference_providers": [],
   "domains": {
     "github.com": "ro",
     "api.github.com": "ro",
