@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# agent-sandbox — run an untrusted Workload in a hardware-isolated,
+# name-level-allowlist-firewalled, ephemeral sandbox with a tamper-evident egress log.
+#
+# Usage: agent-sandbox run <workload.json>
+#
+# The launcher reads the Workload record (schema/workload.schema.json), selects a
+# runtime via the backend ladder (fail-closed), allocates a subnet, then brings up the
+# firewall + workload stack and execs the workload's entrypoint. No "claude" anywhere —
+# what runs is entirely the Workload's business.
+set -Eeuo pipefail
+
+_AS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/msg.bash disable=SC1091
+source "$_AS_DIR/lib/msg.bash"
+# shellcheck source=lib/backend.bash disable=SC1091
+source "$_AS_DIR/lib/backend.bash"
+# shellcheck source=lib/sandbox-net.bash disable=SC1091
+source "$_AS_DIR/lib/sandbox-net.bash"
+
+usage() {
+  cat >&2 <<'EOF'
+Usage: agent-sandbox run <workload.json>
+
+Run a Workload (see schema/workload.schema.json) in an isolated, egress-restricted,
+ephemeral sandbox. The launcher selects a runtime, allocates a subnet, brings up the
+name-level-allowlist firewall, waits for its health, then execs the workload.
+EOF
+}
+
+# require_field FILE JQ_FILTER NAME — read a required Workload field, failing loud when
+# absent/empty so a malformed record is rejected before anything is launched.
+require_field() {
+  local file="$1" filter="$2" name="$3" val
+  val="$(jq -r "$filter // empty" "$file")"
+  [[ -n "$val" ]] || {
+    as_error "workload is missing the required field '$name'"
+    return 1
+  }
+  printf '%s' "$val"
+}
+
+# cmd_run <workload.json> — the launch sequence. Each step fails closed: a malformed
+# record, an unusable runtime, or a missing firewall stack refuses the launch rather
+# than proceeding into a half-isolated state.
+cmd_run() {
+  local workload="${1:-}"
+  [[ -n "$workload" ]] || {
+    as_error "no workload file given"
+    usage
+    return 1
+  }
+  [[ -f "$workload" ]] || {
+    as_error "workload file not found: $workload"
+    return 1
+  }
+  jq -e . "$workload" >/dev/null 2>&1 || {
+    as_error "workload file is not valid JSON: $workload"
+    return 1
+  }
+
+  # Validate the required contract fields up front (image, entrypoint, egress_allowlist,
+  # ephemeral). egress_allowlist must be present (even if empty is a deliberate choice);
+  # entrypoint must be a non-empty argv.
+  local image
+  image="$(require_field "$workload" '.image' image)" || return 1
+  jq -e '.entrypoint | type == "array" and length > 0' "$workload" >/dev/null || {
+    as_error "workload.entrypoint must be a non-empty array (the argv to exec)"
+    return 1
+  }
+  jq -e 'has("egress_allowlist") and (.egress_allowlist | type == "array")' "$workload" >/dev/null || {
+    as_error "workload.egress_allowlist must be present (a list of hostnames; [] to allow none)"
+    return 1
+  }
+  jq -e 'has("ephemeral") and (.ephemeral | type == "boolean")' "$workload" >/dev/null || {
+    as_error "workload.ephemeral must be present (true/false)"
+    return 1
+  }
+  # Reject an IP in the allowlist: enforcement is NAME-level at the proxy, and an IP
+  # entry would silently never match (or invite an iptables-allowlist mistake).
+  if jq -e '.egress_allowlist[]? | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$"))' "$workload" >/dev/null; then
+    as_error "workload.egress_allowlist must contain HOSTNAMES, not IPs — the allowlist is enforced by name at the forward proxy"
+    return 1
+  fi
+
+  local backend
+  backend="$(jq -r '.backend // "local"' "$workload")"
+
+  # 1. Select the runtime via the backend ladder — fail-closed if it isn't usable.
+  local runtime
+  runtime="$(backend_select_runtime "$backend")" || return 1
+  as_info "sandbox: image=$image runtime=$runtime backend=$backend"
+
+  # 2. Allocate a per-session subnet (firewall .2, workload .3) under a file lock.
+  export_sandbox_subnet
+  as_info "network: $SANDBOX_SUBNET (firewall $SANDBOX_IP)"
+
+  # 3. Bring up the firewall + workload stack and exec the entrypoint. The compose stack
+  #    (sandbox/docker-compose.yml + init-firewall) is the behavioural boundary; refuse
+  #    loudly if this build doesn't carry it rather than run the workload un-firewalled.
+  local compose="$_AS_DIR/../sandbox/docker-compose.yml"
+  [[ -f "$compose" ]] || {
+    as_error "the firewall+workload compose stack ($compose) is not present in this build — refusing to launch a workload without the egress boundary"
+    return 1
+  }
+  as_error "compose bring-up is not yet wired in this build (runtime selected, subnet allocated); see sandbox/docker-compose.yml"
+  return 1
+}
+
+main() {
+  case "${1:-}" in
+  run)
+    shift
+    cmd_run "$@"
+    ;;
+  -h | --help | "")
+    usage
+    ;;
+  *)
+    as_error "unknown command: $1"
+    usage
+    return 1
+    ;;
+  esac
+}
+
+main "$@"
