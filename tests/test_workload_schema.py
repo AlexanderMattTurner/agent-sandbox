@@ -28,7 +28,12 @@ def test_shipped_workload_validates(path):
 
 
 def test_required_fields_are_enforced():
-    assert set(SCHEMA["required"]) == {"image", "entrypoint", "egress_allowlist", "ephemeral"}
+    assert set(SCHEMA["required"]) == {
+        "image",
+        "entrypoint",
+        "egress_allowlist",
+        "ephemeral",
+    }
 
 
 def test_backend_enum_is_local_or_hosted():
@@ -36,7 +41,11 @@ def test_backend_enum_is_local_or_hosted():
 
 
 def test_missing_required_field_is_rejected():
-    bad = {"entrypoint": ["bash"], "egress_allowlist": [], "ephemeral": True}  # no image
+    bad = {
+        "entrypoint": ["bash"],
+        "egress_allowlist": [],
+        "ephemeral": True,
+    }  # no image
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(bad, SCHEMA)
 

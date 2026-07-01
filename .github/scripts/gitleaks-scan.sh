@@ -12,7 +12,9 @@ tarball="gitleaks_${VERSION}_linux_x64.tar.gz"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
+# pin-exempt: sha256-verified against the release's checksums.txt via `sha256sum -c` below
 curl -fsSL "$base/$tarball" -o "$tmp/$tarball"
+# pin-exempt: the release-immutable checksum manifest — the trust root the tarball is verified against
 curl -fsSL "$base/gitleaks_${VERSION}_checksums.txt" -o "$tmp/checksums.txt"
 
 # Verify against the release's checksums file (grep the line for our asset, then -c).
