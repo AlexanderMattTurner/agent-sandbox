@@ -13,7 +13,7 @@ set -euo pipefail
 # Pin gVisor to a specific dated release, not "latest": a moving target means the
 # smoke suite silently starts testing a different runtime build on every run. Bump
 # this deliberately. The .sha512 fetched alongside each binary is the integrity gate.
-RUNSC_RELEASE="20250107.0"
+RUNSC_RELEASE="20250811.0"
 ARCH="$(uname -m)"
 BASE_URL="https://storage.googleapis.com/gvisor/releases/release/${RUNSC_RELEASE}/${ARCH}"
 
