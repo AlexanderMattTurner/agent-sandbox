@@ -44,11 +44,20 @@ _local_backend_select_runtime() {
   rt="$(detect_container_runtime)"
   if [[ "$rt" != runc ]]; then
     wait_for_docker_runtime "$rt" 5 ||
-      { as_error "container runtime '$rt' is not registered with Docker — refusing to launch (fail closed) rather than hang on healthchecks"; return 1; }
+      {
+        as_error "container runtime '$rt' is not registered with Docker — refusing to launch (fail closed) rather than hang on healthchecks"
+        return 1
+      }
     docker_runtime_works "$rt" ||
-      { as_error "Docker Desktop + '$rt' is known to hang workloads — refusing to launch"; return 1; }
+      {
+        as_error "Docker Desktop + '$rt' is known to hang workloads — refusing to launch"
+        return 1
+      }
     docker_runtime_executes "$rt" ||
-      { as_error "container runtime '$rt' is registered with Docker but its binary won't execute a container — refusing to launch"; return 1; }
+      {
+        as_error "container runtime '$rt' is registered with Docker but its binary won't execute a container — refusing to launch"
+        return 1
+      }
   fi
   printf '%s\n' "$rt"
 }

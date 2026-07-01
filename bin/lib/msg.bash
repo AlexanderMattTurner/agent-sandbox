@@ -306,7 +306,8 @@ as_choose() {
           sel=$i
           break
         }
-      done ;;
+      done
+      ;;
     esac
     # Rewind over the option rows AND the bottom rule, then repaint both (the top rule
     # and the prompt above them stay put). The rule never changes, but reprinting it
