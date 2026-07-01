@@ -1,0 +1,37 @@
+name: hadolint
+
+# Lints the firewall Dockerfile. Not a required check (the Docker e2e in
+# firewall-e2e.yaml is the behavioural gate); this catches Dockerfile smells early.
+# No paths filter (the job is a few seconds), matching gitleaks/zizmor — a paths
+# filter on pull_request would strand the check at "Expected — Waiting".
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  hadolint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      HADOLINT_VERSION: "2.12.0"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # hadolint-action takes a single file, not a glob; install the pinned binary
+      # and lint the firewall Dockerfile explicitly. --retry rides out a release-CDN 5xx.
+      - name: Lint firewall Dockerfile
+        run: |
+          curl -fsSL --retry 6 --retry-all-errors --retry-delay 15 --connect-timeout 30 \
+            -o hadolint "https://github.com/hadolint/hadolint/releases/download/v${HADOLINT_VERSION}/hadolint-Linux-x86_64"
+          chmod +x hadolint
+          ./hadolint --failure-threshold warning --config .hadolint.yaml sandbox/Dockerfile
