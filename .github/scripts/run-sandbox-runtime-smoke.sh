@@ -41,6 +41,7 @@ install_gvisor_runsc() {
   tmp="$(mktemp -d)"
   local url="${GVISOR_BASE}/${bin_arch}"
   log "downloading runsc + runsc.sha512 from ${url}"
+  # pin-exempt: runsc is sha512-verified against its published .sha512 sidecar below
   if ! curl -fsSL --connect-timeout 15 --max-time 180 "${url}/runsc" -o "$tmp/runsc" ||
     ! curl -fsSL --connect-timeout 15 --max-time 60 "${url}/runsc.sha512" -o "$tmp/runsc.sha512"; then
     log "could not download runsc from gVisor storage — skipping (runc-only smoke)"

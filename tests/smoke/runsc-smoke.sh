@@ -27,13 +27,15 @@ fail() {
 # unconfirmed/unreadable result means the property under test could NOT be verified,
 # which for a security smoke suite is a failure — "unmeasured" is never "pass".
 
-# Verify the container's /proc/version names gVisor — the suite's headline property.
-# A runc-fallback container (runtime dropped, install flickered out) has no "gvisor"
-# marker and every downstream isolation check passes under plain runc too, so a soft
-# warn here would certify zero gVisor isolation as green.
+# Verify the container's /proc/version is the gVisor Sentry, not a runc fallback (which
+# would report the real host kernel and pass every downstream isolation check under plain
+# runc too, certifying zero gVisor isolation as green). The Sentry reports one of two
+# markers: older builds embed "gVisor"; current builds spoof a FROZEN "Linux version 4.4.0
+# #1 SMP Sun Jan 10 15:06:54 PST 2016" — that fixed 2016 build stamp is gVisor's signature
+# and can only appear under the Sentry (a real runner kernel is 6.x, dated to now).
 check_gvisor_kernel() {
   local kernel="$1"
-  if echo "$kernel" | grep -qi "gvisor"; then
+  if echo "$kernel" | grep -qiE "gvisor|Sun Jan 10 15:06:54 PST 2016"; then
     pass "gVisor Sentry kernel active"
   else
     fail "could not confirm gVisor Sentry (got: ${kernel:0:100})"
