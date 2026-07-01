@@ -5,8 +5,8 @@
 # (env AGENT_SANDBOX_TRACE=off|info|debug, optional AGENT_SANDBOX_TRACE_FILE). as_trace
 # lets a defense layer announce that it ENGAGED, with an outcome, so a missing
 # announcement is loud at runtime, in dev, and in CI — the silent-non-engagement class
-# PR #899 fixed by hand. Mirrors the JS (.claude/hooks/lib-trace.mjs) and Python
-# (monitorlib/trace.py) producers: one JSON line per call, METADATA ONLY (never tool
+# PR #899 fixed by hand. Mirrors the JS and Python trace producers: one JSON line
+# per call, METADATA ONLY (never tool
 # input, secrets, or redaction internals — the channel is not redaction-aware). Like
 # launch-trace.bash it is best-effort: a sink it can't write never fails the caller, so
 # dropping a as_trace onto a launch path costs nothing and risks nothing.

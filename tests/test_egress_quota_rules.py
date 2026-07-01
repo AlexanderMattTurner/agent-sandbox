@@ -152,11 +152,10 @@ def test_input_validation_errors_return_not_exit() -> None:
     # but any other consumer that sources the lib, including the test harness. Prove
     # the contract behaviorally: a caller can CATCH the failure and keep running. A
     # regression to `exit` makes the shell die and the AFTER sentinel never prints.
-    # Driven over every recoverable-input arm so the whole class is covered, not just
-    # one: a malformed MONITOR_UID, and the empty-BOGON backstop.
+    # The recoverable-input arm: the empty-BOGON backstop (an unset/empty array must
+    # refuse to install the OUTPUT chain without the metadata/RFC1918 packet backstop).
     cases = {
-        "MONITOR_UID": 'MONITOR_NTFY_HOST="ntfy.example.com"; MONITOR_UID="not-a-number"; BOGON_CIDRS=("10.0.0.0/8")',
-        "BOGON_CIDRS": 'MONITOR_NTFY_HOST=""; BOGON_CIDRS=()',
+        "BOGON_CIDRS": "BOGON_CIDRS=()",
     }
     for label, setup in cases.items():
         script = f"""

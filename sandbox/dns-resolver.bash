@@ -375,7 +375,7 @@ build_refreshed_addresses() {
 # large answer sets the truncated bit and dig retries over TCP, so a UDP-only window
 # would silently fail to resolve big CDN record sets. Opened immediately before a
 # batch resolve and closed immediately after — never left standing — so it is the
-# firewall sidecar's only post-lockdown outbound-DNS path. Best-effort (`|| true`):
+# firewall container's only post-lockdown outbound-DNS path. Best-effort (`|| true`):
 # a duplicate insert or an already-absent rule on close must not abort a caller
 # mid-resolution. Shared by the refresh loop AND live expansion so the two open an
 # IDENTICAL window (same servers, same UDP+TCP, same scoping) instead of drifting in

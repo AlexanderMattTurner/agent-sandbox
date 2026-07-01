@@ -338,7 +338,7 @@ SQUID
 
 # write_squid_error_page ERRORS_DIR — write the agent-facing squid error bodies into
 # ERRORS_DIR. Two pages, both read by the AGENT, so both state the block is by design
-# and must NOT coach widening the firewall (no claude-loosen-firewall command); %U
+# and must NOT coach widening the firewall (no allowlist-widen command); %U
 # expands to the blocked URL so the reason is concrete:
 #   ERR_AGENT_SANDBOX_READONLY — write to a read-only allowlisted domain (deny_info, see
 #     write_squid_conf), e.g. wandb.init / HuggingFace push_to_hub.
