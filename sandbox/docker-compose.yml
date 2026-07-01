@@ -99,6 +99,12 @@ services:
     entrypoint: ["sleep", "infinity"]
     cap_drop:
       - ALL
+    # CHOWN is the one capability restored: the launcher's seed step execs as
+    # root to hand the fresh /workspace volume (root-owned by Docker) to the
+    # workload user. The workload process itself runs as an unprivileged uid
+    # with no-new-privileges, so it can never exercise it.
+    cap_add:
+      - CHOWN
     security_opt:
       - no-new-privileges:true
     read_only: true
