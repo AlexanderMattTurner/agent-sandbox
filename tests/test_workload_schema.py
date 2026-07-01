@@ -6,6 +6,8 @@ loosening of the contract fails here.
 """
 
 import json
+import shutil
+import subprocess
 from pathlib import Path
 
 import jsonschema
@@ -16,6 +18,8 @@ while not (REPO / ".git").exists():
     REPO = REPO.parent
 SCHEMA = json.loads((REPO / "schema" / "workload.schema.json").read_text())
 WORKLOADS = sorted((REPO / "workloads").glob("*.json"))
+OVERMOUNTS_LIB = REPO / "bin" / "lib" / "overmounts.bash"
+BASH = shutil.which("bash") or "/bin/bash"
 
 
 def test_schema_is_well_formed():
@@ -97,6 +101,46 @@ def _with_allowlist(entries):
 )
 def test_allowlist_accepts_string_and_tiered_object_entries(entries):
     jsonschema.validate(_with_allowlist(entries), SCHEMA)
+
+
+def _overmount_paths_schema() -> dict:
+    return SCHEMA["properties"]["overmount_paths"]
+
+
+def test_overmount_paths_default_is_pinned():
+    assert _overmount_paths_schema()["default"] == [".git/hooks", "node_modules"]
+
+
+def test_overmount_paths_default_matches_bash_ssot(tmp_path):
+    """The schema default and bin/lib/overmounts.bash must not drift: a Workload with no
+    overmount_paths gets exactly the schema's declared default. Invoke the function rather
+    than re-reading a constant, so the actual runtime behavior is what's pinned."""
+    wl = tmp_path / "wl.json"
+    wl.write_text(json.dumps(_with_allowlist([])))  # no overmount_paths field
+    harness = f"source {OVERMOUNTS_LIB}\novermount_paths_for {wl}\n"
+    out = subprocess.run(
+        [BASH, "-c", harness], capture_output=True, text=True, check=True
+    ).stdout
+    assert out.split() == _overmount_paths_schema()["default"]
+
+
+@pytest.mark.parametrize(
+    "paths",
+    [[".git/hooks", "node_modules"], ["custom/dir"], []],
+    ids=["default-like", "single", "empty"],
+)
+def test_overmount_paths_accepts_string_lists(paths):
+    jsonschema.validate({**_with_allowlist([]), "overmount_paths": paths}, SCHEMA)
+
+
+@pytest.mark.parametrize(
+    "paths",
+    [[123], [""], "node_modules"],
+    ids=["non-string-entry", "empty-string-entry", "not-an-array"],
+)
+def test_overmount_paths_rejects_malformed(paths):
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({**_with_allowlist([]), "overmount_paths": paths}, SCHEMA)
 
 
 @pytest.mark.parametrize(

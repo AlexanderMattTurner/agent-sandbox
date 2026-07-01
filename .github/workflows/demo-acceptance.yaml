@@ -1,11 +1,14 @@
 name: Demo workload acceptance (e2e)
 
-# NOT a required check: a Docker end-to-end that runs the real launcher against
-# the shipped demo workload on the runner's daemon (this repo's dev sandbox has
-# no Docker). The acceptance: a non-claude workload boots, is egress-restricted
-# to exactly its declared allowlist (denied at the proxy AND in the egress log;
-# allowed host splices through AND is logged), its writes land on a review
-# branch, and the ephemeral teardown leaves nothing behind.
+# NOT a required check: Docker end-to-ends that run the real launcher against the
+# shipped demo workloads on the runner's daemon (this repo's dev sandbox has no
+# Docker). demo-acceptance (seed mode): a non-claude workload boots, is
+# egress-restricted to exactly its declared allowlist (denied at the proxy AND in
+# the egress log; allowed host splices through AND is logged), its writes land on a
+# review branch, and the ephemeral teardown leaves nothing behind. bind-acceptance
+# (bind mode): the workload's declared overmount_paths are kernel-enforced read-only
+# from inside the sandbox (asserted by the workload AND the launcher's fail-closed
+# probe) while the rest of /workspace stays writable and lands on the host bind.
 on:
   push:
     branches: ["main"]
@@ -30,3 +33,15 @@ jobs:
 
       - name: Run the demo workload end-to-end and assert the acceptance
         run: bash .github/scripts/run-demo-acceptance.sh
+
+  bind-acceptance:
+    name: agent-sandbox run demo-bind (read-only overmount guardrail acceptance)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Run the bind-mode workload end-to-end and assert the guardrails are read-only
+        run: bash .github/scripts/run-bind-acceptance.sh

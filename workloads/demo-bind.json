@@ -1,0 +1,13 @@
+{
+  "image": "buildpack-deps:stable-scm",
+  "entrypoint": [
+    "bash",
+    "-lc",
+    "set -uo pipefail; cd /workspace; if echo evil > .git/hooks/pre-commit 2>/dev/null; then echo 'FAIL: .git/hooks is WRITABLE from the workload' >&2; exit 1; else echo 'RO-BLOCKED .git/hooks'; fi; if echo evil > node_modules/tampered 2>/dev/null; then echo 'FAIL: node_modules is WRITABLE from the workload' >&2; exit 1; else echo 'RO-BLOCKED node_modules'; fi; printf 'bind demo wrote at %s\\n' \"$(date -u +%FT%TZ)\" > bind-output.txt && echo 'WRITE-OK bind-output.txt'"
+  ],
+  "user": "1000",
+  "workspace_mount": "/tmp/agent-sandbox-bind-demo",
+  "egress_allowlist": [],
+  "ephemeral": true,
+  "backend": "local"
+}

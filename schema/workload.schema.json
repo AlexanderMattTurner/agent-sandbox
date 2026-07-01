@@ -32,6 +32,12 @@
       "type": "string",
       "description": "Host path bound to the container's /workspace. Omitted when seed_from_git is set (the workspace is seeded from git into a volume instead of bound)."
     },
+    "overmount_paths": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "default": [".git/hooks", "node_modules"],
+      "description": "Workspace-relative paths mounted READ-ONLY on top of the /workspace bind, so the workload can read but never write them. A read-only bind is kernel-enforced (even in-container root can't write it). This is a BIND-MODE guard: in seed mode /workspace is a named volume and the workload's writes are already gated by the review-branch extract, so it has no effect there. `.git/hooks` is a container->host code-execution guard — in bind mode the host checkout is mounted read-write at /workspace, so without this a compromised workload could plant /workspace/.git/hooks/pre-commit that runs ON THE HOST the next time the user invokes git in that checkout, a breakout that outlives the session and never shows in `git diff`. `node_modules` locks the tooling the workload imports so it can't tamper with it. The default applies only when this field is ABSENT; an explicit [] means 'no overmounts'."
+    },
     "egress_allowlist": {
       "type": "array",
       "items": {

@@ -13,13 +13,17 @@ _STACK_LIB_DIR="$(cd "${BASH_SOURCE[0]%/*}" && pwd)"
 source "$_STACK_LIB_DIR/msg.bash"
 # shellcheck source=worktree-seed.bash disable=SC1091
 source "$_STACK_LIB_DIR/worktree-seed.bash"
+# shellcheck source=overmounts.bash disable=SC1091
+source "$_STACK_LIB_DIR/overmounts.bash"
 
-# _stack_compose PROJECT COMPOSE OVERRIDE CMD... — every compose call goes through
-# here so the project name and file set can never drift between up/exec/down.
+# _stack_compose PROJECT COMPOSE OVERRIDE OVERMOUNTS CMD... — every compose call goes
+# through here so the project name and file set can never drift between up/exec/down. The
+# overmount override is ALWAYS in the set (a no-op `{"services":{}}` in seed mode), so no
+# call site can accidentally boot the stack without the read-only guardrails.
 _stack_compose() {
-  local project="$1" compose="$2" override="$3"
-  shift 3
-  docker compose -p "$project" -f "$compose" -f "$override" "$@"
+  local project="$1" compose="$2" override="$3" overmounts="$4"
+  shift 4
+  docker compose -p "$project" -f "$compose" -f "$override" -f "$overmounts" "$@"
 }
 
 # stack_partition_allowlist WORKLOAD_JSON — export the Workload's egress_allowlist
@@ -73,13 +77,13 @@ _stack_write_override() {
   }' "$workload" >"$out"
 }
 
-# _stack_export_egress_log PROJECT COMPOSE OVERRIDE STATE_DIR — copy squid's
+# _stack_export_egress_log PROJECT COMPOSE OVERRIDE OVERMOUNTS STATE_DIR — copy squid's
 # access.log (the tamper-evident egress log) out of the firewall container before
 # teardown destroys its volume. Warn-loud on failure (the session's audit record
 # is lost) but don't block teardown on it.
 _stack_export_egress_log() {
-  local project="$1" compose="$2" override="$3" state="$4" fw_cid
-  fw_cid="$(_stack_compose "$project" "$compose" "$override" ps -q firewall)"
+  local project="$1" compose="$2" override="$3" overmounts="$4" state="$5" fw_cid
+  fw_cid="$(_stack_compose "$project" "$compose" "$override" "$overmounts" ps -q firewall)"
   if [[ -z "$fw_cid" ]] || ! docker cp "$fw_cid:/var/log/squid/access.log" "$state/egress.log" >/dev/null 2>&1; then
     as_warn "could not export the egress log from the firewall container — this session has no audit record on the host"
     return 1
@@ -87,12 +91,12 @@ _stack_export_egress_log() {
   as_info "egress log: $state/egress.log"
 }
 
-# _stack_down_ephemeral PROJECT COMPOSE OVERRIDE — remove containers, networks AND
+# _stack_down_ephemeral PROJECT COMPOSE OVERRIDE OVERMOUNTS — remove containers, networks AND
 # volumes, then verify no volume survived. The guarantee is verified, not assumed:
 # any survivor fails loud so "ephemeral" can never silently mean "persistent".
 _stack_down_ephemeral() {
-  local project="$1" compose="$2" override="$3" leftovers
-  _stack_compose "$project" "$compose" "$override" down --volumes --timeout 30 || {
+  local project="$1" compose="$2" override="$3" overmounts="$4" leftovers
+  _stack_compose "$project" "$compose" "$override" "$overmounts" down --volumes --timeout 30 || {
     as_error "ephemeral teardown failed (compose project $project) — session containers/volumes may survive"
     return 1
   }
@@ -130,23 +134,52 @@ stack_run() {
     as_error "could not generate the per-session compose override"
     return 1
   }
+  # The read-only guardrail overmounts ride in on their own always-present override
+  # (a no-op in seed mode). Generating it is fail-closed: a workload that declares
+  # traversal-shaped overmount paths is refused before anything comes up.
+  local overmounts="$state/overmount-override.json"
+  write_overmount_compose "$workload" "$overmounts" || {
+    as_error "could not generate the read-only guardrail overmount override"
+    return 1
+  }
 
   local ephemeral
   ephemeral="$(jq -r '.ephemeral' "$workload")"
 
   as_info "compose: bringing up firewall + workload (project $project)"
-  if ! _stack_compose "$project" "$compose" "$override" up -d --wait --wait-timeout 240; then
+  if ! _stack_compose "$project" "$compose" "$override" "$overmounts" up -d --wait --wait-timeout 240; then
     as_error "the firewall+workload compose stack did not come up healthy — firewall logs follow"
-    _stack_compose "$project" "$compose" "$override" logs firewall >&2 || true           # allow-exit-suppress: best-effort diagnostics on an already-failed launch
-    _stack_compose "$project" "$compose" "$override" down --volumes --timeout 30 || true # allow-exit-suppress: best-effort cleanup of a stack that never came up healthy; the launch already failed loudly
+    _stack_compose "$project" "$compose" "$override" "$overmounts" logs firewall >&2 || true           # allow-exit-suppress: best-effort diagnostics on an already-failed launch
+    _stack_compose "$project" "$compose" "$override" "$overmounts" down --volumes --timeout 30 || true # allow-exit-suppress: best-effort cleanup of a stack that never came up healthy; the launch already failed loudly
     return 1
   fi
   local cid
-  cid="$(_stack_compose "$project" "$compose" "$override" ps -q workload)"
+  cid="$(_stack_compose "$project" "$compose" "$override" "$overmounts" ps -q workload)"
   if [[ -z "$cid" ]]; then
     as_error "the workload container did not start (compose project $project)"
-    _stack_compose "$project" "$compose" "$override" down --volumes --timeout 30 || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
+    _stack_compose "$project" "$compose" "$override" "$overmounts" down --volumes --timeout 30 || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
     return 1
+  fi
+
+  # Fail-closed guardrail verify (BIND MODE only): the read-only overmounts are a security
+  # control, so prove the workload user truly cannot write them before handing over. Seed
+  # mode has no host ro-binds (workspace is a named volume) and its writes are gated by the
+  # review-branch extract, so it is not probed. Run before seeding/exec so a guardrail that
+  # isn't actually read-only never gets a chance to be bypassed.
+  if jq -e '.workspace_mount' "$workload" >/dev/null 2>&1; then
+    local -a _cpaths=()
+    local _rel
+    while IFS= read -r _rel; do
+      [[ -n "$_rel" ]] && _cpaths+=("/workspace/$_rel")
+    done < <(overmount_applicable_paths "$workload")
+    if ((${#_cpaths[@]})); then
+      if ! verify_guardrails_readonly "$cid" "$WORKLOAD_USER" "${_cpaths[@]}"; then
+        as_error "a read-only guardrail is writable or unverifiable — refusing to hand over the sandbox"
+        _stack_compose "$project" "$compose" "$override" "$overmounts" down --volumes --timeout 30 || true # allow-exit-suppress: best-effort cleanup of a stack refused at the guardrail gate; the launch already failed loudly
+        return 1
+      fi
+      as_info "overmounts verified read-only (${#_cpaths[@]} paths)"
+    fi
   fi
 
   # Seed the workspace from git BEFORE the entrypoint runs, so the workload never
@@ -159,12 +192,12 @@ stack_run() {
     review_branch="$(jq -r '.seed_from_git.review_branch' "$workload")"
     if [[ "$ref" != "HEAD" ]]; then
       as_error "seed_from_git.ref: only HEAD (the current checkout's tracked tree + uncommitted delta) is supported by this build"
-      _stack_down_ephemeral "$project" "$compose" "$override" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
+      _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
       return 1
     fi
     if ! repo_root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
       as_error "seed_from_git needs to run from inside a git checkout (no repo at $PWD)"
-      _stack_down_ephemeral "$project" "$compose" "$override" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
+      _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
       return 1
     fi
     base_commit="$(git -C "$repo_root" rev-parse HEAD)"
@@ -173,7 +206,7 @@ stack_run() {
       ! worktree_seed_tar "$repo_root" | worktree_seed_into_container "$cid" ||
       ! base_ref="$(worktree_container_init_repo "$cid" "$review_branch")"; then
       as_error "could not seed the workspace into the sandbox"
-      _stack_down_ephemeral "$project" "$compose" "$override" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
+      _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
       return 1
     fi
     seeded=1
@@ -214,12 +247,12 @@ stack_run() {
     worktree_print_merge_hint "$review_branch"
   fi
 
-  _stack_export_egress_log "$project" "$compose" "$override" "$state" || true # allow-exit-suppress: the export already warned loudly; a lost audit copy must not block teardown of an otherwise-complete session
+  _stack_export_egress_log "$project" "$compose" "$override" "$overmounts" "$state" || true # allow-exit-suppress: the export already warned loudly; a lost audit copy must not block teardown of an otherwise-complete session
 
   if [[ "$ephemeral" == "true" ]]; then
-    _stack_down_ephemeral "$project" "$compose" "$override" || return 1
+    _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || return 1
   else
-    _stack_compose "$project" "$compose" "$override" down --timeout 30 || {
+    _stack_compose "$project" "$compose" "$override" "$overmounts" down --timeout 30 || {
       as_error "teardown failed (compose project $project)"
       return 1
     }
