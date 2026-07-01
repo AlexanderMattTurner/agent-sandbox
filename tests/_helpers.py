@@ -6,10 +6,53 @@ without manipulating `sys.path` or relying on the conftest plugin loader.
 
 import os
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+_EXEC_BITS = stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+
+
+def run_capture(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+    """`subprocess.run` with the capture_output/text/check defaults every test
+    uses. `kwargs` (env, cwd, input, ...) are forwarded verbatim."""
+    return subprocess.run(args, capture_output=True, text=True, check=False, **kwargs)
+
+
+def write_exe(path: Path, body: str) -> Path:
+    """Write `body` to `path`, mark it executable, and return it.
+
+    Writes a temp sibling then atomically renames it onto `path`: opening `path`
+    for write directly truncates it, which fails with ETXTBSY ("Text file busy")
+    when a prior exec of the same stub path is still draining — a real race when
+    a test reruns a stub it just invoked (xdist amplifies it). Rename over the
+    busy inode is never blocked, so the rewrite is race-free."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(body)
+    tmp.chmod(tmp.stat().st_mode | _EXEC_BITS)
+    os.replace(tmp, path)
+    return path
+
+
+def slice_bash_function(script: Path, name: str) -> str:
+    """Extract a top-level shell function from `script` as text. Handles both the
+    multi-line form (`name() {` … through the first column-0 `}`) and the
+    single-line form (`name() { …; }`, returned as that one line). Lets a test
+    source one function in isolation without running the whole script and without
+    needing `awk` on the child's PATH — so a function built from bash builtins can
+    be exercised under a deliberately empty PATH."""
+    lines = script.read_text().splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.startswith(f"{name}()"))
+    # A one-liner closes on its own signature line; a multi-line body closes on
+    # the first column-0 `}` below it.
+    if lines[start].rstrip().endswith("}"):
+        return lines[start]
+    end = next(i for i in range(start + 1, len(lines)) if lines[i] == "}")
+    return "\n".join(lines[start : end + 1])
+
 
 GIT_IDENTITY_ENV = {
     "GIT_AUTHOR_NAME": "t",

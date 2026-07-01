@@ -1,0 +1,16 @@
+{
+  "image": "debian:stable-slim",
+  "entrypoint": [
+    "bash",
+    "-lc",
+    "set -euo pipefail; echo 'demo workload: verifying egress + seed round-trip'; curl -fsS --max-time 10 https://pypi.org/simple/ >/dev/null && echo 'ALLOWED host reached (pypi.org)'; if curl -fsS --max-time 10 https://example.com/ >/dev/null 2>&1; then echo 'UNEXPECTED: blocked host reached' >&2; exit 1; else echo 'BLOCKED host denied at proxy (example.com)'; fi; cd /workspace; printf 'written by the sandboxed workload at %s\\n' \"$(date -u +%FT%TZ)\" > demo-output.txt; git add demo-output.txt; git -c user.name=workload -c user.email=agent@agent-sandbox.local commit -m 'demo: workload write lands on review branch' >/dev/null; echo 'committed workload write for extraction'"
+  ],
+  "user": "1000",
+  "egress_allowlist": ["pypi.org", "files.pythonhosted.org"],
+  "ephemeral": true,
+  "seed_from_git": {
+    "ref": "HEAD",
+    "review_branch": "sandbox/demo-review"
+  },
+  "backend": "local"
+}

@@ -1,0 +1,67 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/alexandermattturner/agent-sandbox/schema/workload.schema.json",
+  "title": "agent-sandbox Workload",
+  "description": "The parameterization that replaces 'install claude'. A Workload record is handed to `agent-sandbox run`: the launcher selects a runtime via the backend, allocates a subnet, brings up the name-level-allowlist firewall, waits for its health, then execs the workload's entrypoint. No workload-specific logic lives in the library.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["image", "entrypoint", "egress_allowlist", "ephemeral"],
+  "properties": {
+    "image": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Container image the workload runs (the workload payload, e.g. an agent). Distinct from the firewall image, which the library owns."
+    },
+    "entrypoint": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 1,
+      "description": "argv the sandbox execs once the firewall is healthy. NO 'install claude' here — the workload brings its own command."
+    },
+    "env": {
+      "type": "object",
+      "description": "name -> value map exported into the workload container.",
+      "additionalProperties": { "type": "string" }
+    },
+    "user": {
+      "type": "string",
+      "description": "uid or name the workload runs as. Must be unprivileged; the workload container drops ALL capabilities and runs read-only.",
+      "default": "1000"
+    },
+    "workspace_mount": {
+      "type": "string",
+      "description": "Host path bound to the container's /workspace. Omitted when seed_from_git is set (the workspace is seeded from git into a volume instead of bound)."
+    },
+    "egress_allowlist": {
+      "type": "array",
+      "items": { "type": "string", "format": "hostname" },
+      "description": "Allowed destinations as HOSTNAMES, never IPs. Enforced at the forward proxy (squid CONNECT host check) + a pinned static DNS resolver + an iptables ipset backstop — one mechanism. An IP allowlist is a security regression (CDN over/under-block, rotating IPs, resolver/DoH bypass) AND breaks the tamper-evident egress log."
+    },
+    "ephemeral": {
+      "type": "boolean",
+      "description": "When true, the workload's volumes are throwaway and torn down on exit; teardown fails loud on any survivor (the guarantee is verified, not assumed)."
+    },
+    "seed_from_git": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ref", "review_branch"],
+      "description": "worktree-seed: seed the workspace from a git ref inside the sandbox; the workload's writes are extracted onto review_branch on the host, never onto the host working tree.",
+      "properties": {
+        "ref": {
+          "type": "string",
+          "description": "The git ref (commit/branch/tag) the sandbox workspace is seeded from."
+        },
+        "review_branch": {
+          "type": "string",
+          "description": "The host branch the workload's committed writes land on for review."
+        }
+      }
+    },
+    "backend": {
+      "type": "string",
+      "enum": ["local", "hosted"],
+      "default": "local",
+      "description": "Runtime backend seam. 'local' runs the Kata->gVisor->runc auto-downgrade ladder on the local Docker engine. 'hosted' (a managed remote sandbox) is a documented interface stub. Every backend MUST enforce the allowlist at a forward proxy and keep the proxy log as the egress log."
+    }
+  }
+}
