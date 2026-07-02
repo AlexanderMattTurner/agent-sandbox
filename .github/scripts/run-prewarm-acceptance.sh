@@ -57,8 +57,9 @@ now_ms() { date +%s%3N; }
 mk_workload wl-prewarm.json 'echo prewarm-entrypoint-must-never-run; exit 97'
 mk_workload wl-run.json 'set -euo pipefail; cd /workspace; echo adopted >adopted.txt; git add adopted.txt; git commit -qm "feat: adopted work"; echo "ADOPTED RAN"'
 # A trivial cold-boot baseline on its own review branch so it can't collide with
-# the adopted leg. Timed below to show adoption actually beats a cold boot.
-mk_workload wl-cold.json 'cd /workspace; echo cold >/dev/null' sandbox/cold-timing
+# the adopted leg. It commits a file (like the adopted leg) so the extract has real
+# work, not an empty diff. Timed below to show adoption actually beats a cold boot.
+mk_workload wl-cold.json 'set -euo pipefail; cd /workspace; echo cold >cold.txt; git add cold.txt; git commit -qm "feat: cold baseline"' sandbox/cold-timing
 
 # ---- leg 0: cold-boot timing baseline (no spare exists yet) ----
 # The warm-start design was gated on measured numbers; prove adoption is faster than
