@@ -1,0 +1,41 @@
+name: Packet-layer egress e2e
+
+# NOT a required check: this is a Docker end-to-end that boots the real firewall
+# image (the repo's dev sandbox lacks a Docker daemon). It proves the PACKET-LAYER
+# default-deny egress boundary — the iptables OUTPUT chain that backstops
+# squid/dnsmasq — by driving the SAME install_egress_output_rules production
+# installs and asserting per-destination packet counters: a cloud-metadata bogon is
+# DROPped, a non-allowlisted public address hits the catch-all REJECT, and an
+# allowlisted public address is ACCEPTed. Complements egress-quota-e2e.yaml (byte
+# cap) and firewall-e2e.yaml (proxy block/allow). No external network. See
+# tests/smoke/packet-egress-probe.sh.
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  packet-egress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Build firewall image
+        run: docker build -f sandbox/Dockerfile -t agent-sandbox-firewall:ci sandbox/
+
+      # The probe installs the real OUTPUT chain (no quota) and drives packets at a
+      # bogon, a non-allowlisted public ip, and an allowlisted public ip, asserting
+      # each hits DROP / REJECT / ACCEPT respectively via the kernel counters. Root
+      # is required (dummy interface + ipset rules) — do NOT --cap-drop.
+      - name: Packet-layer egress probe (bogon DROP; unlisted REJECT; allowed ACCEPT)
+        run: bash .github/scripts/run-firewall-probe.sh packet-egress-probe.sh
