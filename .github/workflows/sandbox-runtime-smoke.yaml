@@ -1,6 +1,6 @@
 name: Sandbox runtime smoke
 
-# NOT a required check: this is a Docker smoke that installs gVisor/runsc on the
+# A Docker smoke that installs gVisor/runsc on the
 # runner and proves the extracted runtime-detect ladder + backend seam SELECT a
 # runtime AND that Docker can actually RUN a container under it (registration in
 # `docker info` is not enough — a listed-but-broken runtime dies deep in a launch).

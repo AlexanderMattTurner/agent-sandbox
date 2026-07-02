@@ -1,6 +1,6 @@
 name: gVisor isolation smoke
 
-# NOT a required check: this is a Docker end-to-end that installs the real runsc
+# A Docker end-to-end that installs the real runsc
 # (gVisor) runtime and asserts a runsc-launched container enforces process, device,
 # network, filesystem, and capability isolation. It runs on the GitHub runner's
 # Docker daemon (which this repo's dev sandbox lacks). No paths filter so it always

@@ -1,7 +1,7 @@
 name: hadolint
 
-# Lints the firewall Dockerfile. Not a required check (the Docker e2e in
-# firewall-e2e.yaml is the behavioural gate); this catches Dockerfile smells early.
+# Lints the firewall Dockerfile — catches Dockerfile smells early (the Docker e2e
+# in firewall-e2e.yaml is the behavioural gate).
 # No paths filter (the job is a few seconds), matching gitleaks/zizmor — a paths
 # filter on pull_request would strand the check at "Expected — Waiting".
 on:

@@ -1,6 +1,6 @@
 name: Demo workload acceptance (e2e)
 
-# NOT a required check: Docker end-to-ends that run the real launcher against the
+# Docker end-to-ends that run the real launcher against the
 # shipped demo workloads on the runner's daemon (this repo's dev sandbox has no
 # Docker). demo-acceptance (seed mode): a non-claude workload boots, is
 # egress-restricted to exactly its declared allowlist (denied at the proxy AND in

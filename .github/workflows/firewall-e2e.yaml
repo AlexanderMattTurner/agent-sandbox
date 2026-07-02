@@ -1,6 +1,6 @@
 name: Firewall egress e2e
 
-# NOT a required check: this is a Docker end-to-end that boots the real squid +
+# A Docker end-to-end that boots the real squid +
 # dnsmasq to observe block/allow behaviour and the tamper-evident log. It runs on
 # the GitHub runner's Docker daemon (which this repo's dev sandbox lacks). No
 # paths filter so it is easy to reason about; the build is cheap.
