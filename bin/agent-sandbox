@@ -80,18 +80,15 @@ cmd_run() {
   }
   # Each entry is a hostname string (rw — full access) or {host, access: ro|rw}
   # (the object form opts a host down to GET/HEAD-only).
-  jq -e '[.egress_allowlist[]? |
-    (type == "string")
-    or (type == "object" and (.host | type == "string")
-        and ((.access // "rw") == "ro" or (.access // "rw") == "rw"))
-  ] | all' "$workload" >/dev/null || {
+  # One physical line per jq: kcov's DEBUG trap only marks a command's starting line, so a
+  # multi-line jq leaves its continuation lines forever "uncovered" though the command ran.
+  jq -e '[.egress_allowlist[]? | (type == "string") or (type == "object" and (.host | type == "string") and ((.access // "rw") == "ro" or (.access // "rw") == "rw"))] | all' "$workload" >/dev/null || {
     as_error "each workload.egress_allowlist entry must be a hostname string or {host, access: \"ro\"|\"rw\"}"
     return 1
   }
   # Reject an IP in the allowlist: enforcement is NAME-level at the proxy, and an IP
   # entry would silently never match (or invite an iptables-allowlist mistake).
-  if jq -e '[.egress_allowlist[]? | if type == "object" then .host else . end |
-    select(test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$"))] | length > 0' "$workload" >/dev/null; then
+  if jq -e '[.egress_allowlist[]? | if type == "object" then .host else . end | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$"))] | length > 0' "$workload" >/dev/null; then
     as_error "workload.egress_allowlist must contain HOSTNAMES, not IPs — the allowlist is enforced by name at the forward proxy"
     return 1
   fi
@@ -112,7 +109,9 @@ cmd_run() {
   #    tear down (stack.bash). The compose stack (sandbox/docker-compose.yml +
   #    init-firewall) is the behavioural boundary; refuse loudly if this build
   #    doesn't carry it rather than run the workload un-firewalled.
-  local compose="$_AS_DIR/../sandbox/docker-compose.yml"
+  # AGENT_SANDBOX_COMPOSE overrides the shipped path (an operator pointing at an
+  # alternate stack; the tests use it to exercise this fail-closed branch).
+  local compose="${AGENT_SANDBOX_COMPOSE:-$_AS_DIR/../sandbox/docker-compose.yml}"
   [[ -f "$compose" ]] || {
     as_error "the firewall+workload compose stack ($compose) is not present in this build — refusing to launch a workload without the egress boundary"
     return 1
