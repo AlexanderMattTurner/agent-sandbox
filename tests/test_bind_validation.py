@@ -23,8 +23,6 @@ import os
 import subprocess
 from pathlib import Path
 
-import pytest
-
 from tests._helpers import REPO_ROOT, write_exe
 
 LAUNCHER = REPO_ROOT / "bin" / "agent-sandbox"
@@ -135,6 +133,19 @@ def test_symlinked_workspace_mount_is_refused(tmp_path):
     link = tmp_path / "ws-link"
     link.symlink_to(real)
     r, calls, _ = _run(tmp_path, {**VALID, "workspace_mount": str(link)})
+    assert r.returncode != 0
+    assert "is a symlink" in r.stderr, r.stderr
+    assert not _ups(calls)
+
+
+def test_symlinked_workspace_mount_with_trailing_slash_is_refused(tmp_path):
+    """`[[ -L "/path/link/" ]]` is false for a symlink written with a trailing
+    slash — the validator must normalize before the check, or the slash smuggles
+    a symlink source past the refusal."""
+    real = _bind_ws(tmp_path)
+    link = tmp_path / "ws-link"
+    link.symlink_to(real)
+    r, calls, _ = _run(tmp_path, {**VALID, "workspace_mount": f"{link}/"})
     assert r.returncode != 0
     assert "is a symlink" in r.stderr, r.stderr
     assert not _ups(calls)
@@ -274,14 +285,11 @@ def test_missing_default_paths_warn_and_proceed_with_marker(tmp_path):
     assert _ups(calls)
 
 
-@pytest.mark.parametrize("overmount_paths", [[]], ids=["explicit-empty"])
-def test_explicit_empty_overmounts_prints_marker_without_warns(
-    tmp_path, overmount_paths
-):
+def test_explicit_empty_overmounts_prints_marker_without_warns(tmp_path):
     """[] declares nothing, so nothing is missing (no warns, no refusal) — but the
     marker still states that nothing is held read-only."""
     ws = _bind_ws(tmp_path)
-    wl = {**VALID, "workspace_mount": str(ws), "overmount_paths": overmount_paths}
+    wl = {**VALID, "workspace_mount": str(ws), "overmount_paths": []}
     r, _, _ = _run(tmp_path, wl)
     assert r.returncode == 0, r.stderr
     assert "nothing under /workspace is mounted read-only" in r.stderr, r.stderr

@@ -69,6 +69,9 @@ _stack_state_dir() {
 stack_validate_workspace_mount() {
   local workload="$1" src resolved state_root
   src="$(jq -r '.workspace_mount // empty' "$workload")"
+  # Strip trailing slashes first: `[[ -L "/path/link/" ]]` is FALSE for a symlink
+  # written with a trailing slash, which would slip it past the refusal below.
+  while [[ "$src" == */ && "$src" != "/" ]]; do src="${src%/}"; done
   [[ "$src" == /* ]] || {
     as_error "workspace_mount must be an absolute host path (got '$src') — compose resolves a relative bind against the compose file's directory, not your working directory"
     return 1

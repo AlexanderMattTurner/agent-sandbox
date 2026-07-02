@@ -128,7 +128,7 @@ neg() { # <description> <workload-file> <expected-regex> [<forbidden-regex>]
     return
   fi
   if [[ -n "$forbid" ]] && grep -Eq "$forbid" neg.log; then
-    echo "FAIL: $desc — refused too late ('$forbid' appeared first)" >&2
+    echo "FAIL: $desc — refused too late ('$forbid' appeared)" >&2
     cat neg.log
     fail=1
     return
