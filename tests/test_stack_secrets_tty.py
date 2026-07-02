@@ -133,11 +133,11 @@ def _run(tmp_path, workload_obj, *, extra_env=None, stdin_tty=False):
 
 def test_env_delivered_via_0600_envfile_then_unlinked(tmp_path):
     cap = tmp_path / "captured.env"
-    wl = {**VALID, "env": {"API_TOKEN": "q9X2mN7pK4rT8wY1cV5bZ3dF6gH0jL2e"}}
+    wl = {**VALID, "env": {"API_TOKEN": "placeholder-token"}}
     r, calls, sess = _run(tmp_path, wl, extra_env={"ENV_CAPTURE": str(cap)})
     assert r.returncode == 0, r.stderr
     # The env-file existed with exactly the workload's env at `up`, mode 0600.
-    assert cap.read_text() == "API_TOKEN=q9X2mN7pK4rT8wY1cV5bZ3dF6gH0jL2e\n"
+    assert cap.read_text() == "API_TOKEN=placeholder-token\n"
     assert (tmp_path / "captured.env.mode").read_text().strip() == "600"
     # …and is gone afterwards (unlinked once the container was created).
     assert not (sess / "workload.env").exists()
@@ -145,7 +145,7 @@ def test_env_delivered_via_0600_envfile_then_unlinked(tmp_path):
 
 
 def test_env_override_rides_up_but_not_down(tmp_path):
-    wl = {**VALID, "env": {"API_TOKEN": "q9X2mN7pK4rT8wY1cV5bZ3dF6gH0jL2e"}}
+    wl = {**VALID, "env": {"API_TOKEN": "placeholder-token"}}
     r, calls, _ = _run(tmp_path, wl)
     assert r.returncode == 0, r.stderr
     up = [c for c in calls if " up " in f" {c} "]
@@ -174,7 +174,7 @@ def test_env_value_with_newline_is_refused_before_bringup(tmp_path):
 
 
 def test_envfile_removed_even_when_up_fails(tmp_path):
-    wl = {**VALID, "env": {"API_TOKEN": "q9X2mN7pK4rT8wY1cV5bZ3dF6gH0jL2e"}}
+    wl = {**VALID, "env": {"API_TOKEN": "placeholder-token"}}
     r, calls, sess = _run(tmp_path, wl, extra_env={"FAKE_UP_FAIL": "1"})
     assert r.returncode != 0
     assert "did not come up healthy" in r.stderr, r.stderr
@@ -182,7 +182,7 @@ def test_envfile_removed_even_when_up_fails(tmp_path):
 
 
 def test_envfile_removed_when_no_container_starts(tmp_path):
-    wl = {**VALID, "env": {"API_TOKEN": "q9X2mN7pK4rT8wY1cV5bZ3dF6gH0jL2e"}}
+    wl = {**VALID, "env": {"API_TOKEN": "placeholder-token"}}
     r, calls, sess = _run(tmp_path, wl, extra_env={"FAKE_NO_CID": "1"})
     assert r.returncode != 0
     assert "workload container did not start" in r.stderr, r.stderr
