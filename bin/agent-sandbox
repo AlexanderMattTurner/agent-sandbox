@@ -22,7 +22,8 @@ source "$_AS_DIR/lib/stack.bash"
 
 usage() {
   cat >&2 <<'EOF'
-Usage: agent-sandbox run [--extra-compose FILE]... [--reseed] <workload.json>
+Usage: agent-sandbox run [--extra-compose FILE]... [--reseed] [--prewarm-next] <workload.json>
+       agent-sandbox prewarm [--extra-compose FILE]... <workload.json>
        agent-sandbox expand <host>[:ro|rw] [--project NAME]
        agent-sandbox gc [--dry-run]
        agent-sandbox down <project>
@@ -37,6 +38,10 @@ name-level-allowlist firewall, waits for its health, then execs the workload.
   --reseed               When re-attaching to a stopped persistent session (workload
                          session_id + ephemeral:false), DISCARD its seeded workspace and
                          re-seed from the current checkout. Destructive, per-invocation.
+  --prewarm-next         After this session, boot a fresh spare of the same workload in
+                         the background (as if by `prewarm`) so the NEXT run can adopt it.
+                         The pool does not otherwise self-replenish. Refused for records
+                         `prewarm` refuses (workspace_mount / session_id / resume_from).
 
 A workload with `session_id` gets the deterministic compose project name
 agent-sandbox-<session_id>; running it again against its stopped stack re-attaches
@@ -44,18 +49,30 @@ agent-sandbox-<session_id>; running it again against its stopped stack re-attach
 workload with `resume_from` starts FRESH, seeded to reproduce where that prior
 session left off, with its exported audit log mounted read-only for continuity.
 
+`prewarm` runs the multi-second bring-up ahead of time and leaves the stack up as
+an adoptable spare (an empty, verified workspace behind a healthy firewall). A
+later `run` whose boot-shaping spec matches (image digests, runtime, allowlist,
+user/hardener/audit/backend, compose file set) adopts the spare — seeding into
+the already-running container and skipping the cold boot; any mismatch or hiccup
+falls back to a cold boot. Only seed-mode, ephemeral runs without
+session_id/resume_from adopt. Bind mode (workspace_mount) can't be prewarmed.
+
 `expand` widens a RUNNING session's egress allowlist by one host without resetting
 the firewall (default access ro = GET/HEAD only). The grant is session-scoped; make
 it permanent in the Workload record's egress_allowlist. With several sessions up,
 name one via --project (or AGENT_SANDBOX_PROJECT_NAME).
 
 gc prunes stale sandbox networks (no live containers), reclaiming dead sessions'
-subnets; --dry-run previews what a real run would remove. down tears down one
-session's stack by compose project name — containers, networks AND volumes — and
-fails loud if any volume survives.
+subnets, reaps prewarm spares older than AGENT_SANDBOX_PREWARM_MAX_AGE seconds
+(default 86400; spares whose spec no longer matches anything simply age out —
+adoption's hash equality already routes around them), and removes prewarm claims
+whose owning process died; --dry-run previews what a real run would remove. down
+tears down one session's stack by compose project name — containers, networks
+AND volumes — and fails loud if any volume survives.
 
 Environment: AGENT_SANDBOX_PROJECT_NAME pins the compose project name (default: a
 random per-session name) so consumer lifecycle tooling can find the stack by label.
+AGENT_SANDBOX_PREWARM_MAX_AGE tunes gc's spare reaping age (seconds).
 EOF
 }
 
@@ -79,11 +96,15 @@ cmd_run() {
   # doesn't name a readable file refuses the launch (a consumer overlay silently
   # dropped from the file set would boot the stack without its companion services).
   local -a extra_compose=()
-  local workload="" reseed=0
+  local workload="" reseed=0 prewarm_next=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
     --reseed)
       reseed=1
+      shift
+      ;;
+    --prewarm-next)
+      prewarm_next=1
       shift
       ;;
     --extra-compose)
@@ -118,6 +139,61 @@ cmd_run() {
     usage
     return 1
   }
+  _validate_workload_record "$workload" || return 1
+  # --prewarm-next spawns a background spare of THIS workload after the session, so the
+  # workload must itself be prewarmable — refuse it up front for the same records the
+  # prewarm verb refuses (a spare could never serve them).
+  [[ "$prewarm_next" == 0 ]] || _prewarm_refuse_unprewarmable "$workload" || return 1
+
+  local backend
+  backend="$(jq -r '.backend // "local"' "$workload")"
+
+  # 1. Select the runtime via the backend ladder — fail-closed if it isn't usable.
+  local runtime
+  runtime="$(backend_select_runtime "$backend")" || return 1
+  as_info "sandbox: image=$(jq -r '.image' "$workload") runtime=$runtime backend=$backend"
+
+  # 2. Allocate a per-session subnet (firewall .2, workload .3) under a file lock.
+  export_sandbox_subnet
+  as_info "network: $SANDBOX_SUBNET (firewall $SANDBOX_IP)"
+
+  # 3. Bring up the firewall + workload stack, seed, exec the entrypoint, extract,
+  #    tear down (stack.bash). The compose stack (sandbox/docker-compose.yml +
+  #    init-firewall) is the behavioural boundary; refuse loudly if this build
+  #    doesn't carry it rather than run the workload un-firewalled.
+  local compose
+  compose="$(_resolve_compose)" || return 1
+  # --reseed rides to stack_run's re-attach path as an exported per-invocation flag
+  # (stack_run's positional tail is the open-ended extra-compose list).
+  AGENT_SANDBOX_RESEED="$reseed"
+  export AGENT_SANDBOX_RESEED
+  local run_rc=0
+  stack_run "$workload" "$compose" "$runtime" ${extra_compose[@]+"${extra_compose[@]}"} || run_rc=$?
+  # --prewarm-next: after the session, replenish the pool by booting a fresh spare of
+  # this workload in the background (the pool does NOT self-replenish otherwise). The
+  # spawn never affects this run's exit status.
+  [[ "$prewarm_next" == 0 ]] || prewarm_spawn_next "$_AS_DIR/agent-sandbox" "$workload" ${extra_compose[@]+"${extra_compose[@]}"}
+  return "$run_rc"
+}
+
+# _resolve_compose — print the compose stack's path (AGENT_SANDBOX_COMPOSE points
+# an operator at an alternate stack), failing loud when it is absent: no compose
+# file means no egress boundary, so nothing may launch.
+_resolve_compose() {
+  local compose="${AGENT_SANDBOX_COMPOSE:-$_AS_DIR/../sandbox/docker-compose.yml}"
+  [[ -f "$compose" ]] || {
+    as_error "the firewall+workload compose stack ($compose) is not present in this build — refusing to launch a workload without the egress boundary"
+    return 1
+  }
+  printf '%s\n' "$compose"
+}
+
+# _validate_workload_record <workload.json> — the fail-closed Workload record gate
+# shared by `run` and `prewarm`: file/JSON validity, the required contract fields,
+# and every runtime mirror of the schema's shape constraints. Refuses before
+# anything is launched.
+_validate_workload_record() {
+  local workload="$1"
   [[ -f "$workload" ]] || {
     as_error "workload file not found: $workload"
     return 1
@@ -130,8 +206,7 @@ cmd_run() {
   # Validate the required contract fields up front (image, entrypoint, egress_allowlist,
   # ephemeral). egress_allowlist must be present (even if empty is a deliberate choice);
   # entrypoint must be a non-empty argv.
-  local image
-  image="$(require_field "$workload" '.image' image)" || return 1
+  require_field "$workload" '.image' image >/dev/null || return 1
   jq -e '.entrypoint | type == "array" and length > 0' "$workload" >/dev/null || {
     as_error "workload.entrypoint must be a non-empty array (the argv to exec)"
     return 1
@@ -223,35 +298,81 @@ cmd_run() {
       return 1
     }
   fi
+}
+
+# _prewarm_refuse_unprewarmable <workload.json> — refuse (loud, non-zero) a workload a
+# spare can never satisfy: workspace_mount (a bind source is baked at container create,
+# so a bind spare serves only that one path) or session_id/resume_from (deterministic
+# identity always cold-boots). Shared by the prewarm verb and run --prewarm-next.
+_prewarm_refuse_unprewarmable() {
+  local workload="$1"
+  if jq -e 'has("workspace_mount")' "$workload" >/dev/null; then
+    as_error "prewarm refuses workspace_mount — a bind source is baked at container create, so a bind-mode spare could only ever serve that one path; prewarm seed-shaped workloads instead"
+    return 1
+  fi
+  if jq -e 'has("session_id") or has("resume_from")' "$workload" >/dev/null; then
+    as_error "prewarm refuses session_id/resume_from — deterministic-identity sessions always cold-boot (their kept volumes and manifests assume a stack the serving launch created)"
+    return 1
+  fi
+}
+
+# cmd_prewarm <workload.json> — bring a stack up to just before the entrypoint
+# exec and leave it running as an adoptable spare (see stack_prewarm). Shares
+# cmd_run's record gate, then refuses the fields a spare can never satisfy:
+# workspace_mount (a bind source is baked at container create, so a bind spare is
+# never generically adoptable) and session_id/resume_from (deterministic-identity
+# sessions always cold-boot). env/secret_env are accepted but NOT baked — both
+# are delivered at adoption exec time.
+cmd_prewarm() {
+  local -a extra_compose=()
+  local workload=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --extra-compose)
+      [[ -n "${2:-}" ]] || {
+        as_error "--extra-compose needs a file argument"
+        return 1
+      }
+      [[ -f "$2" ]] || {
+        as_error "extra compose file not found: $2"
+        return 1
+      }
+      extra_compose+=("$2")
+      shift 2
+      ;;
+    -*)
+      as_error "unknown option for prewarm: $1"
+      usage
+      return 1
+      ;;
+    *)
+      if [[ -n "$workload" ]]; then
+        as_error "prewarm takes exactly one workload file (got '$workload' and '$1')"
+        return 1
+      fi
+      workload="$1"
+      shift
+      ;;
+    esac
+  done
+  [[ -n "$workload" ]] || {
+    as_error "no workload file given"
+    usage
+    return 1
+  }
+  _validate_workload_record "$workload" || return 1
+  _prewarm_refuse_unprewarmable "$workload" || return 1
 
   local backend
   backend="$(jq -r '.backend // "local"' "$workload")"
-
-  # 1. Select the runtime via the backend ladder — fail-closed if it isn't usable.
   local runtime
   runtime="$(backend_select_runtime "$backend")" || return 1
-  as_info "sandbox: image=$image runtime=$runtime backend=$backend"
-
-  # 2. Allocate a per-session subnet (firewall .2, workload .3) under a file lock.
+  as_info "prewarm: image=$(jq -r '.image' "$workload") runtime=$runtime backend=$backend"
   export_sandbox_subnet
   as_info "network: $SANDBOX_SUBNET (firewall $SANDBOX_IP)"
-
-  # 3. Bring up the firewall + workload stack, seed, exec the entrypoint, extract,
-  #    tear down (stack.bash). The compose stack (sandbox/docker-compose.yml +
-  #    init-firewall) is the behavioural boundary; refuse loudly if this build
-  #    doesn't carry it rather than run the workload un-firewalled.
-  # AGENT_SANDBOX_COMPOSE overrides the shipped path (an operator pointing at an
-  # alternate stack; the tests use it to exercise this fail-closed branch).
-  local compose="${AGENT_SANDBOX_COMPOSE:-$_AS_DIR/../sandbox/docker-compose.yml}"
-  [[ -f "$compose" ]] || {
-    as_error "the firewall+workload compose stack ($compose) is not present in this build — refusing to launch a workload without the egress boundary"
-    return 1
-  }
-  # --reseed rides to stack_run's re-attach path as an exported per-invocation flag
-  # (stack_run's positional tail is the open-ended extra-compose list).
-  AGENT_SANDBOX_RESEED="$reseed"
-  export AGENT_SANDBOX_RESEED
-  stack_run "$workload" "$compose" "$runtime" ${extra_compose[@]+"${extra_compose[@]}"}
+  local compose
+  compose="$(_resolve_compose)" || return 1
+  stack_prewarm "$workload" "$compose" "$runtime" ${extra_compose[@]+"${extra_compose[@]}"}
 }
 
 # cmd_expand HOST[:ro|rw] [--project NAME] — widen a running session's firewall
@@ -325,15 +446,18 @@ cmd_expand() {
   }
 }
 
-# cmd_gc [--dry-run] — prune stale sandbox networks (no live containers), reclaiming
-# dead sessions' subnets. --dry-run previews what a real run would remove.
+# cmd_gc [--dry-run] — prune stale sandbox networks (no live containers), reap
+# over-age prewarm spares and dead prewarm claims (prewarm_gc). --dry-run
+# previews what a real run would remove.
 cmd_gc() {
   case "${1:-}" in
   --dry-run)
     GC_DRY_RUN=1 prune_stale_sandbox_networks
+    GC_DRY_RUN=1 prewarm_gc
     ;;
   "")
     prune_stale_sandbox_networks
+    prewarm_gc
     ;;
   *)
     as_error "unknown gc option: $1"
@@ -372,6 +496,10 @@ main() {
   run)
     shift
     cmd_run "$@"
+    ;;
+  prewarm)
+    shift
+    cmd_prewarm "$@"
     ;;
   expand)
     shift

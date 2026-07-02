@@ -88,7 +88,7 @@ def _discover_bash_files() -> list[str]:
 # file) never traces them. Each is line-gated instead by its own pytest suite, which
 # sources the individual functions (test_sandbox_runtime_fs_states.py, test_sandbox_net.py,
 # test_runtime_detect*.py, test_stack_entrypoint_argv.py, test_worktree_seed_host.py,
-# test_backend_gates.py, test_overmounts.py). stack.bash, worktree-seed.bash, and
+# test_backend_gates.py, test_overmounts.py, test_prewarm.py). stack.bash, worktree-seed.bash, and
 # overmounts.bash additionally run seed/exec/probe bodies through `docker exec`, which
 # kcov's DEBUG trap cannot follow into, so they could not reach 100% standalone regardless.
 KCOV_EXCLUDED: list[str] = [
@@ -96,6 +96,7 @@ KCOV_EXCLUDED: list[str] = [
     "bin/lib/flock.bash",
     "bin/lib/msg.bash",
     "bin/lib/overmounts.bash",
+    "bin/lib/prewarm.bash",
     "bin/lib/runtime-detect.bash",
     "bin/lib/sandbox-net.bash",
     "bin/lib/sandbox-runtime.bash",
@@ -132,6 +133,8 @@ KCOV_TEST_FILES = [
     "tests/test_launcher.py",
     "tests/test_lifecycle_verbs.py",
     "tests/test_persistent_sessions.py",
+    "tests/test_prewarm_cli.py",
+    "tests/test_stack_bringup_split.py",
     "tests/test_stack_seams.py",
     "tests/test_stack_secrets_tty.py",
 ]

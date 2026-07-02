@@ -2,13 +2,15 @@
 
 A recording fake docker on PATH logs every argv line it receives, so the tests
 assert what the verb actually asked docker to do: `gc` prunes stale sandbox
-networks (and its --dry-run records NO `network rm`); `down` tears down a compose
-project with --volumes and fails loud on a surviving volume, a missing project
-argument, or a project with nothing to tear down.
+networks, reaps over-age prewarm spares and dead prewarm claims (and its
+--dry-run records NO `network rm`/`down`); `down` tears down a compose project
+with --volumes and fails loud on a surviving volume, a missing project argument,
+or a project with nothing to tear down.
 """
 
 import os
 import subprocess
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve()
@@ -30,6 +32,15 @@ case "$*" in
     ;;
   "ps -aq --filter label=com.docker.compose.project="*)
     [[ -n "${FAKE_CONTAINERS:-}" ]] && echo cid1
+    ;;
+  "ps -q --filter label=agent-sandbox.prewarm=ready")
+    [[ -n "${FAKE_SPARE_CID:-}" ]] && echo "$FAKE_SPARE_CID"
+    ;;
+  "inspect -f "*"com.docker.compose.project"*)
+    echo "${FAKE_SPARE_PROJECT:-}"
+    ;;
+  "inspect -f "*"prewarm-created"*)
+    echo "${FAKE_SPARE_CREATED:-}"
     ;;
   "volume ls -q --filter label=com.docker.compose.project="*)
     if [[ "${FAKE_VOLUMES:-}" == "always" ]]; then
@@ -61,6 +72,8 @@ def _run(tmp_path, argv, extra_env=None):
         "FAKE_DOCKER_LOG": str(log),
         "SANDBOX_NET_RESERVE_DIR": str(tmp_path / "reserve"),
         "XDG_RUNTIME_DIR": str(tmp_path / "xdg"),
+        "AGENT_SANDBOX_STATE_DIR": str(tmp_path / "state"),
+        "AGENT_SANDBOX_PREWARM_CLAIM_DIR": str(tmp_path / "claims"),
         **(extra_env or {}),
     }
     r = subprocess.run([str(LAUNCHER), *argv], capture_output=True, text=True, env=env)
@@ -90,6 +103,118 @@ def test_gc_unknown_option_is_rejected(tmp_path):
     assert "unknown gc option: --frobnicate" in r.stderr
     assert "Usage: agent-sandbox" in r.stderr
     assert "network" not in log  # refused before touching docker
+
+
+# --- gc: prewarm spare reaping + dead-claim removal ---
+
+SPARE_PROJECT = "agent-sandbox-prewarm-00c0ffee"
+
+
+def _spare_env(created):
+    return {
+        "FAKE_SPARE_CID": "sparecid",
+        "FAKE_SPARE_PROJECT": SPARE_PROJECT,
+        "FAKE_SPARE_CREATED": str(created),
+    }
+
+
+def test_gc_reaps_an_over_age_spare_with_volumes_verified(tmp_path):
+    r, log = _run(tmp_path, ["gc"], _spare_env(created=1))
+    assert r.returncode == 0, r.stderr
+    assert f"compose -p {SPARE_PROJECT} down --volumes --timeout 30" in log
+    # The reap's claim was released again afterwards.
+    assert not (tmp_path / "claims" / SPARE_PROJECT).exists()
+
+
+def test_gc_keeps_a_fresh_spare(tmp_path):
+    r, log = _run(tmp_path, ["gc"], _spare_env(created=int(time.time())))
+    assert r.returncode == 0, r.stderr
+    assert " down " not in f" {log} "
+
+
+def test_gc_never_downs_a_non_prewarm_project_carrying_the_ready_label(tmp_path):
+    """The project-name guard is what keeps gc's `down --volumes` away from a
+    non-prewarm stack that (maliciously or accidentally) carries the ready
+    label — an over-age candidate with a foreign project name must be skipped."""
+    r, log = _run(
+        tmp_path,
+        ["gc"],
+        {**_spare_env(created=1), "FAKE_SPARE_PROJECT": "my-production-stack"},
+    )
+    assert r.returncode == 0, r.stderr
+    assert " down " not in f" {log} "
+
+
+def test_gc_age_threshold_is_env_tunable(tmp_path):
+    recent = int(time.time()) - 5
+    r, log = _run(
+        tmp_path,
+        ["gc"],
+        {**_spare_env(created=recent), "AGENT_SANDBOX_PREWARM_MAX_AGE": "0"},
+    )
+    assert r.returncode == 0, r.stderr
+    assert f"compose -p {SPARE_PROJECT} down --volumes --timeout 30" in log
+
+
+def test_gc_rejects_a_non_numeric_max_age(tmp_path):
+    r, _ = _run(
+        tmp_path,
+        ["gc"],
+        {**_spare_env(created=1), "AGENT_SANDBOX_PREWARM_MAX_AGE": "a day"},
+    )
+    assert r.returncode != 0
+    assert "AGENT_SANDBOX_PREWARM_MAX_AGE must be a whole number" in r.stderr
+
+
+def test_gc_dry_run_reports_the_spare_without_downing_it(tmp_path):
+    r, log = _run(tmp_path, ["gc", "--dry-run"], _spare_env(created=1))
+    assert r.returncode == 0, r.stderr
+    assert " down " not in f" {log} "
+    assert "Would remove: 1 over-age prewarm spare(s)" in r.stdout
+
+
+def test_gc_skips_an_adopted_stack_despite_its_ready_label(tmp_path):
+    """Adoption can't remove the immutable ready label; the adopted marker in the
+    spare's state dir is what keeps gc off a live (or kept-for-rescue) session."""
+    state = tmp_path / "state" / "sessions" / SPARE_PROJECT
+    state.mkdir(parents=True)
+    (state / "prewarm-adopted").touch()
+    r, log = _run(tmp_path, ["gc"], _spare_env(created=1))
+    assert r.returncode == 0, r.stderr
+    assert " down " not in f" {log} "
+
+
+def test_gc_skips_a_spare_claimed_by_a_live_process(tmp_path):
+    claim = tmp_path / "claims" / SPARE_PROJECT
+    claim.mkdir(parents=True)
+    (claim / "pid").write_text(f"{os.getpid()}\n")
+    r, log = _run(tmp_path, ["gc"], _spare_env(created=1))
+    assert r.returncode == 0, r.stderr
+    assert " down " not in f" {log} "
+    assert (claim / "pid").exists()  # the live claim is untouched
+
+
+def test_gc_removes_a_dead_pid_claim(tmp_path):
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    claim = tmp_path / "claims" / "agent-sandbox-prewarm-deadbeef"
+    claim.mkdir(parents=True)
+    (claim / "pid").write_text(f"{dead.pid}\n")
+    r, _ = _run(tmp_path, ["gc"])
+    assert r.returncode == 0, r.stderr
+    assert not claim.exists()
+
+
+def test_gc_dry_run_reports_a_dead_claim_without_removing_it(tmp_path):
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    claim = tmp_path / "claims" / "agent-sandbox-prewarm-deadbeef"
+    claim.mkdir(parents=True)
+    (claim / "pid").write_text(f"{dead.pid}\n")
+    r, _ = _run(tmp_path, ["gc", "--dry-run"])
+    assert r.returncode == 0, r.stderr
+    assert "Would remove: 1 stale prewarm claim(s)" in r.stdout
+    assert claim.exists()
 
 
 def test_down_removes_project_with_volumes(tmp_path):
