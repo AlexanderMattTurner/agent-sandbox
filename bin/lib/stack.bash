@@ -552,7 +552,9 @@ stack_bring_up() {
       return 1
     fi
     if [[ ",${COMPOSE_PROFILES}," == *,audit,* ]]; then
-      if [[ -s "$prior_state/audit.jsonl" ]]; then
+      # -f, not -s: a quiet prior session legitimately exported an EMPTY chain,
+      # and continuity means mounting whatever record exists.
+      if [[ -f "$prior_state/audit.jsonl" ]]; then
         local audit_prior_override="$state/audit-prior-override.json"
         _stack_write_audit_prior_override "$prior_state/audit.jsonl" "$audit_prior_override" || {
           as_error "could not generate the prior-audit-log compose override"
@@ -781,6 +783,15 @@ stack_serve_workload() {
           ! worktree_seed_fingerprint_matches "$cid" "$repo_root"; then
           as_warn "the re-attached workspace was seeded from an older state of $repo_root — continuing with the session's tree as-is; pass --reseed to discard it and re-seed from your current checkout"
         fi
+        # The extract below assumes the prior legs' work is already on the host
+        # review branch; if the user deleted it (e.g. after merging), a rebuilt
+        # branch would start from leg 1's launch state and this leg's patches
+        # would misapply — refuse with the remedy instead.
+        if ! git -C "$repo_root" show-ref --verify --quiet "refs/heads/$review_branch"; then
+          as_error "re-attach: review branch '$review_branch' no longer exists in $repo_root (deleted after a merge?) — the session's prior work cannot extract onto it; pass --reseed to discard the in-container tree and start this session fresh"
+          _stack_compose "$project" "$compose" "$override" "$overmounts" down --timeout 30 || true # allow-exit-suppress: best-effort stop of a stack refused at re-attach; volumes are deliberately kept
+          return 1
+        fi
         # This leg extracts only ITS OWN commits: the extract base is the container's
         # current HEAD — the prior legs' work is already on the review branch.
         if ! base_ref="$(worktree_container_seed_head "$cid")"; then
@@ -920,7 +931,7 @@ stack_serve_workload() {
     # surface. A failed remove is loud but non-fatal (the branch already exists).
     git -C "$repo_root" worktree remove "$wt_dir" 2>/dev/null ||
       as_warn "could not remove the scratch worktree $wt_dir (branch $review_branch is intact)"
-    worktree_print_merge_hint "$review_branch"
+    worktree_print_merge_hint "$review_branch" "$([[ "$ephemeral" == "true" ]] && echo 0 || echo 1)"
   fi
 
   _stack_export_egress_log "$project" "$compose" "$override" "$overmounts" "$state" || true # allow-exit-suppress: the export already warned loudly; a lost audit copy must not block teardown of an otherwise-complete session

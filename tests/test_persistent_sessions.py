@@ -251,6 +251,8 @@ def _reattach_fixture(tmp_path, **manifest_overrides):
         repo_root=str(repo),
         **manifest_overrides,
     )
+    # Leg 1's extract left the review branch on the host; re-attach depends on it.
+    subprocess.run(["git", "branch", "sandbox/rb1", head], cwd=repo, check=True)
     return repo, head
 
 
@@ -366,7 +368,9 @@ def _resume_fixture(tmp_path, *, tip_is_wip_fold):
         review_branch="sandbox/old-rb",
         repo_root=str(repo),
     )
-    (state / "audit.jsonl").write_text('{"rec":1}\n')
+    # Deliberately EMPTY: a quiet prior session exports an empty chain, and the
+    # resume mount must key on existence, not size (the -s regression class).
+    (state / "audit.jsonl").write_text("")
     return repo, base, tip
 
 
@@ -576,3 +580,53 @@ def test_read_manifest_field_fails_on_missing_field(tmp_path):
     r, _ = _source_stack(tmp_path, snippet, str(state))
     assert r.returncode != 0
     assert r.stdout.strip() == ""
+
+
+def test_reattach_with_deleted_review_branch_is_refused(tmp_path):
+    """The re-attach extract lands this leg's commits on the existing review
+    branch; if the user deleted it (the merge hint's `git branch -d`), a rebuilt
+    branch would misapply the new patches — refuse with the --reseed remedy."""
+    repo, head = _reattach_fixture(tmp_path)
+    subprocess.run(
+        ["git", "branch", "-D", "sandbox/rb1"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    r, log = _run(
+        tmp_path,
+        _seeded(session_id="sid1", ephemeral=False, review_branch="sandbox/rb1"),
+        extra_env={
+            "FAKE_VOLUMES": "1",
+            "FAKE_WORKLOAD_CID": "1",
+            "FAKE_SEED_HEAD": head,
+        },
+        cwd=repo,
+    )
+    assert r.returncode != 0
+    assert "no longer exists" in r.stderr and "--reseed" in r.stderr
+    # The workload's entrypoint never ran.
+    assert "bash -lc echo hi" not in log
+
+
+def test_merge_hint_keeps_the_branch_for_persistent_sessions(tmp_path):
+    """A persistent session's next leg extracts onto the same review branch, so
+    its hint must not instruct `git branch -d`; an ephemeral session's hint does."""
+    repo, _head = _repo(tmp_path)
+    r, _ = _run(
+        tmp_path,
+        _seeded(session_id="sid1", ephemeral=False, review_branch="sandbox/rb1"),
+        extra_env={"FAKE_WORKLOAD_CID": "1"},
+        cwd=repo,
+    )
+    assert r.returncode == 0, r.stderr
+    hint = r.stdout + r.stderr
+    assert "keep the branch" in hint and "git branch -d" not in hint
+    r2, _ = _run(
+        tmp_path,
+        _seeded(review_branch="sandbox/rb2"),
+        extra_env={"FAKE_WORKLOAD_CID": "1"},
+        cwd=repo,
+    )
+    assert r2.returncode == 0, r2.stderr
+    assert "git branch -d sandbox/rb2" in r2.stdout + r2.stderr

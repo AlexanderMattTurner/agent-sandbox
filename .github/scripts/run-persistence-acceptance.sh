@@ -96,7 +96,9 @@ git show sandbox/persist-review:leg2.txt >/dev/null || {
 echo "PASS: both legs' commits are on sandbox/persist-review"
 
 # ---- leg 3: resume into a fresh session, audit continuity ----
-if [[ ! -s "$state1/audit.jsonl" || ! -s "$state1/audit.secret" ]]; then
+# -f for the log (a session with no audit events exports an EMPTY chain — still a
+# valid, verifiable record); -s for the secret (a minted secret is never empty).
+if [[ ! -f "$state1/audit.jsonl" || ! -s "$state1/audit.secret" ]]; then
   echo "FAIL: leg 2 did not export the prior session's audit log + secret" >&2
   exit 1
 fi

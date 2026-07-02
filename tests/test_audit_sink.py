@@ -270,3 +270,18 @@ def test_trace_is_silent_when_channel_off(tmp_path, monkeypatch, capsys):
 def test_trace_threshold_mapping(monkeypatch, level, threshold):
     monkeypatch.setenv("AGENT_SANDBOX_TRACE", level)
     assert audit_sink._trace_threshold() == threshold
+
+
+def test_main_creates_empty_log_at_startup(tmp_path, monkeypatch):
+    """A session with zero audit events still has a chain (an empty one): main()
+    must create the log file up front so the launcher's pre-teardown docker cp
+    export always finds it — a quiet session must not lose its host copy."""
+    log_path = tmp_path / "log" / "audit.jsonl"
+    secret_path = tmp_path / "secret" / "secret"
+    monkeypatch.setenv("AUDIT_LOG", str(log_path))
+    monkeypatch.setenv("AUDIT_SECRET_PATH", str(secret_path))
+    served = {}
+    monkeypatch.setattr(audit_sink, "serve", lambda *a, **kw: served.update(kw))
+    audit_sink.main()
+    assert log_path.exists() and log_path.stat().st_size == 0
+    assert served["audit_log"] == str(log_path)

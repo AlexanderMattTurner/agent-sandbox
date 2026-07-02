@@ -271,6 +271,12 @@ def main() -> None:
     bind_host = os.environ.get("AUDIT_BIND", "0.0.0.0")  # noqa: S104 — the sandbox net is internal
     port = int(os.environ.get("AUDIT_SINK_PORT", "9198"))
     os.makedirs(os.path.dirname(audit_log), exist_ok=True)
+    # Create the (possibly empty) log at startup: a session with zero audit events
+    # still has a chain — an empty one — and the launcher's pre-teardown export
+    # (docker cp) must always find a file, or a quiet session leaves no host copy
+    # for a later resume to mount.
+    with open(audit_log, "a", encoding="utf-8"):
+        pass
     bootstrap_secret(os.path.dirname(secret_path))
     serve(bind_host, port, audit_log=audit_log, secret_path=secret_path)
 

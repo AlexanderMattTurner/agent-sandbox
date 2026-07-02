@@ -517,16 +517,27 @@ seed_branch_name() {
   printf 'sandbox/%s\n' "${1#ephemeral-}"
 }
 
-# worktree_print_merge_hint <branch> — at seed-mode teardown, tell the user where the workload's
-# work landed and the commands to bring it into their checkout. Reports only: never prompts,
-# never touches the host branch (the user reviews and merges on their own terms).
+# worktree_print_merge_hint <branch> [keep] — at seed-mode teardown, tell the user where the
+# workload's work landed and the commands to bring it into their checkout. Reports only: never
+# prompts, never touches the host branch (the user reviews and merges on their own terms).
+# keep=1 (a persistent session): the next re-attach leg extracts onto this same branch, so the
+# hint must NOT instruct deletion — a followed `git branch -d` would strand that extract base.
 worktree_print_merge_hint() {
   # Set the hint off with terminal-width top/bottom rules and centered content rather
   # than a full box: a box's side borders get dragged into the selection when the user
   # copies the command out. as_rule_frame (msg.bash) is the shared renderer the doctor
   # verdict mirrors.
+  local branch="$1" keep="${2:-0}"
+  if [[ "$keep" == 1 ]]; then
+    as_rule_frame \
+      "The workload's changes are on branch $branch." \
+      "Bring them into your checkout with:" \
+      "git merge $branch" \
+      "(keep the branch — re-attaching this session extracts onto it again)"
+    return 0
+  fi
   as_rule_frame \
-    "The workload's changes are on branch $1." \
+    "The workload's changes are on branch $branch." \
     "Bring them into your checkout with:" \
-    "git merge $1 && git branch -d $1"
+    "git merge $branch && git branch -d $branch"
 }
