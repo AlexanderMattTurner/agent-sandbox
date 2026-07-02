@@ -21,3 +21,14 @@ the prose from the release's commits.
   project name — containers, networks and volumes — failing loud on a missing
   project argument, on a project with nothing to tear down, and on any volume
   that survives the teardown.
+- Two default library-owned compose services with generic contracts, opt-out via
+  the Workload record (`hardener: false` / `audit: false`, compose profiles):
+  - `hardener` — a transient root init service that executes every executable in
+    the read-only `/run/hardener-hooks.d` mount (empty by default = no-op
+    success) to write hardened config into a volume the workload mounts
+    read-only at `/run/hardened-config`; any hook failure aborts the launch
+    before the workload starts (`service_completed_successfully` gate).
+  - `audit` — a tamper-evident append-only audit sink (`sandbox/audit_sink.py`):
+    a per-session HMAC secret minted on its own volume chains every appended
+    record, so edits, reordering, or interior drops are detectable; the workload
+    mounts neither the log nor the secret.

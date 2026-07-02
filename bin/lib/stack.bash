@@ -19,11 +19,20 @@ source "$_STACK_LIB_DIR/overmounts.bash"
 # _stack_compose PROJECT COMPOSE OVERRIDE OVERMOUNTS CMD... — every compose call goes
 # through here so the project name and file set can never drift between up/exec/down. The
 # overmount override is ALWAYS in the set (a no-op `{"services":{}}` in seed mode), so no
-# call site can accidentally boot the stack without the read-only guardrails.
+# call site can accidentally boot the stack without the read-only guardrails. Consumer
+# overlays (stack_run's extra compose files) ride in via _STACK_EXTRA_COMPOSE, LAST in
+# the -f order so a consumer's service extensions merge on top of the library's stack —
+# through the same choke point, so no call site can see a different file set than `up` did.
+_STACK_EXTRA_COMPOSE=()
 _stack_compose() {
   local project="$1" compose="$2" override="$3" overmounts="$4"
   shift 4
-  docker compose -p "$project" -f "$compose" -f "$override" -f "$overmounts" "$@"
+  local -a files=(-f "$compose" -f "$override" -f "$overmounts")
+  local extra
+  for extra in ${_STACK_EXTRA_COMPOSE[@]+"${_STACK_EXTRA_COMPOSE[@]}"}; do
+    files+=(-f "$extra")
+  done
+  docker compose -p "$project" "${files[@]}" "$@"
 }
 
 # stack_partition_allowlist WORKLOAD_JSON — export the Workload's egress_allowlist
@@ -114,15 +123,21 @@ _stack_down_ephemeral() {
   stack_verify_no_volumes "$project"
 }
 
-# stack_run WORKLOAD_JSON COMPOSE RUNTIME — the whole session: up → seed → exec →
-# extract → export egress log → down. Returns the workload's exit status when the
-# session machinery succeeded; machinery failures return non-zero themselves.
-# Reads SANDBOX_IP/SANDBOX_SUBNET from the caller (export_sandbox_subnet).
+# stack_run WORKLOAD_JSON COMPOSE RUNTIME [EXTRA_COMPOSE...] — the whole session:
+# up → seed → exec → extract → export egress log → down. Returns the workload's exit
+# status when the session machinery succeeded; machinery failures return non-zero
+# themselves. Reads SANDBOX_IP/SANDBOX_SUBNET from the caller (export_sandbox_subnet).
+# EXTRA_COMPOSE files are consumer overlays merged after the library's file set on
+# EVERY compose invocation of this session (see _stack_compose). The compose project
+# name is randomized per session unless the consumer pins its own identity via
+# AGENT_SANDBOX_PROJECT_NAME (its lifecycle tooling finds the stack by that label).
 stack_run() {
   local workload="$1" compose="$2" runtime="$3"
+  shift 3
+  _STACK_EXTRA_COMPOSE=("$@")
   local sandbox_dir project state
   sandbox_dir="$(cd "$(dirname "$compose")" && pwd)"
-  project="agent-sandbox-$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n')"
+  project="${AGENT_SANDBOX_PROJECT_NAME:-agent-sandbox-$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n')}"
   state="$(_stack_state_dir "$project")"
   worktree_secure_mkdir "$state" || return 1
 
@@ -134,6 +149,19 @@ stack_run() {
   # The seed/extract execs must run as the same user the workload writes as.
   export AGENT_SANDBOX_WORKLOAD_USER="$WORKLOAD_USER"
   stack_partition_allowlist "$workload"
+  # The default library services (hardener, audit) are profile-gated in the
+  # compose: compose cannot REMOVE a service via an override, so a workload
+  # opt-out (hardener:false / audit:false) is expressed by not activating the
+  # profile. The workload's depends_on entries carry required:false, so a
+  # deactivated profile drops the gate instead of failing `up`.
+  local _profiles=()
+  jq -e '.hardener == false' "$workload" >/dev/null || _profiles+=("hardener")
+  jq -e '.audit == false' "$workload" >/dev/null || _profiles+=("audit")
+  COMPOSE_PROFILES="$(
+    IFS=,
+    printf '%s' "${_profiles[*]-}"
+  )"
+  export COMPOSE_PROFILES
   stack_ensure_firewall_image "$sandbox_dir" || return 1
 
   local override="$state/workload-override.json"

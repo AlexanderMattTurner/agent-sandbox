@@ -103,6 +103,25 @@ def test_allowlist_accepts_string_and_tiered_object_entries(entries):
     jsonschema.validate(_with_allowlist(entries), SCHEMA)
 
 
+@pytest.mark.parametrize("field", ["hardener", "audit"])
+def test_default_service_optouts_default_true(field):
+    assert SCHEMA["properties"][field]["type"] == "boolean"
+    assert SCHEMA["properties"][field]["default"] is True
+
+
+@pytest.mark.parametrize("field", ["hardener", "audit"])
+@pytest.mark.parametrize("value", [True, False])
+def test_default_service_optouts_accept_booleans(field, value):
+    jsonschema.validate({**_with_allowlist([]), field: value}, SCHEMA)
+
+
+@pytest.mark.parametrize("field", ["hardener", "audit"])
+@pytest.mark.parametrize("value", ["false", 0, None], ids=["string", "int", "null"])
+def test_default_service_optouts_reject_non_booleans(field, value):
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({**_with_allowlist([]), field: value}, SCHEMA)
+
+
 def _overmount_paths_schema() -> dict:
     return SCHEMA["properties"]["overmount_paths"]
 
