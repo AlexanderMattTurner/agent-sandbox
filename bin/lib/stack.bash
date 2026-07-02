@@ -109,17 +109,20 @@ _stack_deliver_secrets() {
   # $1 (name) and $2 (user) ride argv; the secret VALUE rides stdin only.
   # shellcheck disable=SC2016 # single quotes are the point: $1/$2 expand in the container's sh, never here
   local deliver='umask 377 && cat >"/run/secrets/$1" && chown -- "$2" "/run/secrets/$1"'
-  n="$(jq '(.secret_env // {}) | keys | length' "$workload")"
+  # Defense in depth below the launcher gate: stack_run is the documented library
+  # entry point, and an unshaped record must never become a zero-delivery success
+  # (a non-object dies in `keys`, leaving n="" and a 0-iteration loop) or a
+  # root-privileged write at a path of the record's choosing (an unshaped name —
+  # checked in jq, not bash, because command substitution strips the trailing
+  # newline a "NAME\n" key smuggles past a post-substitution [[ =~ ]] test).
+  jq -e '.secret_env | type == "object" and ([.[] | type == "string"] | all) and (keys | all(test("\\A[A-Za-z_][A-Za-z0-9_]*\\z")))' "$workload" >/dev/null || {
+    as_error "secret_env must be a name -> value object of string values with env-var-shaped names — refusing delivery"
+    return 1
+  }
+  n="$(jq '.secret_env | keys | length' "$workload")"
   for ((i = 0; i < n; i++)); do
     name="$(jq -r "(.secret_env | keys)[$i]" "$workload")"
-    # Defense in depth: the launcher validates name shapes before launch, but stack_run
-    # is the documented library entry point — an unshaped name must never choose the
-    # path of a root-privileged write inside the container.
-    [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || {
-      as_error "secret_env name '$name' is not env-var-shaped — refusing the delivery exec"
-      return 1
-    }
-    jq -j --arg k "$name" '.secret_env[$k]' "$workload" | docker exec -i -u root "$cid" sh -c "$deliver" _ "$name" "$user" || {
+    jq -je --arg k "$name" '.secret_env[$k]' "$workload" | docker exec -i -u root "$cid" sh -c "$deliver" _ "$name" "$user" || {
       as_error "could not deliver secret '$name' into the sandbox"
       return 1
     }

@@ -309,12 +309,18 @@ def test_unsafe_secret_name_is_refused_before_bringup(tmp_path, name):
     assert not any(" up " in f" {c} " for c in calls)
 
 
-def test_library_level_name_check_refuses_an_unshaped_name(tmp_path):
+@pytest.mark.parametrize(
+    "secret_env",
+    [{"bad/name": "v"}, {"OAUTH_TOKEN\n": "v"}, "OAUTH_TOKEN=v", {"N": 42}],
+    ids=["slash-name", "trailing-newline-name", "not-an-object", "non-string-value"],
+)
+def test_library_level_shape_gate_refuses_unshaped_secret_env(tmp_path, secret_env):
     """stack_run is the documented library entry point, so _stack_deliver_secrets
-    revalidates the name below the launcher gate — an unshaped name must never
-    choose the path of a root-privileged in-container write."""
+    revalidates the whole record shape below the launcher gate — an unshaped record
+    must never become a zero-delivery success or choose the path of a
+    root-privileged in-container write."""
     wl = tmp_path / "wl.json"
-    wl.write_text(json.dumps({"secret_env": {"bad/name": "v"}}))
+    wl.write_text(json.dumps({"secret_env": secret_env}))
     harness = (
         f"source {REPO / 'bin' / 'lib' / 'stack.bash'}\n"
         f"_stack_deliver_secrets {wl} cid_workload 1000\n"
@@ -326,7 +332,7 @@ def test_library_level_name_check_refuses_an_unshaped_name(tmp_path):
         env={**os.environ, "NO_COLOR": "1"},
     )
     assert r.returncode != 0
-    assert "not env-var-shaped" in r.stderr, r.stderr
+    assert "env-var-shaped" in r.stderr, r.stderr
 
 
 def test_non_string_secret_value_is_refused_before_bringup(tmp_path):
