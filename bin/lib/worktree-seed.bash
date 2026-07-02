@@ -252,7 +252,9 @@ worktree_reseed_container() {
 # commits on <branch> on top. Runs as the workload user (owns /workspace after the seed chown).
 # --no-verify: the in-container WIP commit is launch machinery, not a user commit, and the
 # project's commit hooks aren't provisioned here. --allow-empty fallback keeps a root commit
-# even for an empty tree, so the extract base always exists. Fail-loud.
+# even for an empty tree, so the extract base always exists; the first attempt is silenced
+# because on an empty tree `git commit -q` still prints its "nothing to commit" status to
+# STDOUT, which would ride into the captured SHA and corrupt the extract's base ref. Fail-loud.
 worktree_container_init_repo() {
   local container_id="$1" branch="$2"
   # shellcheck disable=SC2016  # $1/$2 expand inside the container shell, not here.
@@ -263,7 +265,7 @@ worktree_container_init_repo() {
     git config user.name "agent-sandbox agent" || exit 1
     git checkout -q -b "$1" || exit 1
     git add -A || exit 1
-    git commit -q --no-verify -m "$2" || git commit -q --no-verify --allow-empty -m "$2" || exit 1
+    git commit -q --no-verify -m "$2" >/dev/null 2>&1 || git commit -q --no-verify --allow-empty -m "$2" || exit 1
     git rev-parse HEAD
   ' sh "$branch" "chore: seed working tree at session start"; then
     as_error "worktree seed: could not initialize the in-sandbox git repo in $container_id"
