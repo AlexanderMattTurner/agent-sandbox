@@ -206,3 +206,41 @@ prewarm_gc() {
   [[ "${GC_DRY_RUN:-}" == "1" ]] && printf 'Would remove: %s stale prewarm claim(s)\n' "$would_release"
   return "$rc"
 }
+
+# prewarm_spawn_next SELF WORKLOAD [EXTRA_COMPOSE...] — replenish the pool after a
+# `run --prewarm-next`: launch `SELF prewarm WORKLOAD [--extra-compose EXTRA]...`
+# fully detached so a fresh spare is ready for the next launch. The pool does NOT
+# self-replenish otherwise (an opt-in flag, unlike a per-launch auto-replenish), so
+# each --prewarm-next spawns exactly one spare; extras age out via prewarm_gc. The
+# spawn is best-effort: a failure to detach must never fail the completed run.
+# AGENT_SANDBOX_PREWARM_CMD overrides the launched command (tests point it at a
+# recorder); AGENT_SANDBOX_NO_PREWARM=1 disables the spawn entirely.
+prewarm_spawn_next() {
+  local self="$1" workload="$2"
+  shift 2
+  [[ -z "${AGENT_SANDBOX_NO_PREWARM:-}" ]] || return 0
+  local -a cmd=()
+  if [[ -n "${AGENT_SANDBOX_PREWARM_CMD:-}" ]]; then
+    # A test-provided recorder command, word-split deliberately, then the workload.
+    # shellcheck disable=SC2206
+    cmd=(${AGENT_SANDBOX_PREWARM_CMD} "$workload")
+  else
+    cmd=("$self" prewarm)
+    local extra
+    for extra in "$@"; do
+      cmd+=(--extra-compose "$extra")
+    done
+    cmd+=("$workload")
+  fi
+  # Detach so the spare outlives this launcher and a Ctrl-C at the terminal can't
+  # cancel a multi-second boot: a new session via setsid where available (Linux),
+  # else a nohup background job (macOS has no setsid). stdio to /dev/null so the
+  # spawn neither blocks on nor spams the terminal.
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "${cmd[@]}" </dev/null >/dev/null 2>&1 &
+  else
+    nohup "${cmd[@]}" </dev/null >/dev/null 2>&1 &
+  fi
+  disown 2>/dev/null || true # allow-exit-suppress: disown is a shell builtin absent in some subshell contexts; the job is already detached by setsid/nohup
+  as_info "prewarm-next: spawned a background spare for the next run"
+}

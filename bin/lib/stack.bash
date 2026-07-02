@@ -1220,6 +1220,13 @@ stack_prewarm() {
   # The adoption manifest records the subnet/ip the spare's network came up under:
   # an adopting launch re-enters `up` with THESE (not its own fresh allocation) so
   # compose reconciles the running stack instead of recreating its network.
+  #
+  # This write is the spare's BAKE WITNESS, and it is deliberately the LAST thing
+  # stack_prewarm does: the `ready` label is stamped by compose at container CREATE
+  # (before the guardrail gate stack_bring_up holds), so the label alone can't prove
+  # a spare finished booting. Adoption reads prewarm.json for the subnet and abandons
+  # any candidate missing it — so a spare interrupted mid-boot (before this line) is
+  # never usefully claimed, even though it already carries the ready label.
   if ! (umask 077 && jq -n --arg project "$project" --arg spec "$spec_hash" --arg subnet "$SANDBOX_SUBNET" --argjson created "$created" '{project: $project, spec: $spec, subnet: $subnet, created: $created}' >"$state/prewarm.json"); then
     as_error "could not write the prewarm manifest $state/prewarm.json — tearing the unusable spare down"
     _stack_down_ephemeral "$project" "$compose" "$_STACK_OVERRIDE" "$_STACK_OVERMOUNTS" || true # allow-exit-suppress: best-effort cleanup of a spare refused at manifest write; the prewarm already failed loudly

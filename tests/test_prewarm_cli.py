@@ -11,6 +11,7 @@ import json
 import os
 import re
 import subprocess
+import time
 
 from tests._helpers import (
     REPO_ROOT,
@@ -180,6 +181,69 @@ def test_prewarm_refuses_resume_from(tmp_path):
     assert "compose" not in log
 
 
+def test_run_prewarm_next_refuses_an_unprewarmable_workload(tmp_path):
+    """--prewarm-next spawns a spare of THIS workload, so it is refused up front for
+    the records `prewarm` itself refuses (a spare could never serve them)."""
+    r, log = _run(
+        tmp_path, "run", {**SEEDED, "session_id": "sid1"}, argv_tail=("--prewarm-next",)
+    )
+    assert r.returncode != 0
+    assert "prewarm refuses session_id/resume_from" in r.stderr
+    assert "compose" not in log
+
+
+def test_run_prewarm_next_spawns_a_background_spare(tmp_path):
+    """An eligible run with --prewarm-next replenishes the pool: after the session it
+    launches a detached prewarm of the same workload (recorded via the CMD override)."""
+    repo = _repo(tmp_path)
+    recorder = tmp_path / "record-spawn"
+    write_exe(recorder, '#!/usr/bin/env bash\nprintf "%s\\n" "$@" >>"$SPAWN_MARKER"\n')
+    marker = tmp_path / "spawned.txt"
+    r, _ = _run(
+        tmp_path,
+        "run",
+        SEEDED,
+        argv_tail=("--prewarm-next",),
+        cwd=repo,
+        extra_env={
+            "AGENT_SANDBOX_PREWARM_CMD": str(recorder),
+            "SPAWN_MARKER": str(marker),
+        },
+    )
+    assert r.returncode == 0, r.stderr
+    assert "prewarm-next: spawned a background spare" in r.stderr
+    # The detached recorder was handed the workload path (poll — it runs after the
+    # launcher exits).
+    deadline = time.time() + 5
+    while time.time() < deadline and not marker.exists():
+        time.sleep(0.05)
+    assert marker.exists(), "the detached prewarm command never ran"
+    assert marker.read_text().strip().endswith("workload.json")
+
+
+def test_run_prewarm_next_honors_the_no_prewarm_optout(tmp_path):
+    repo = _repo(tmp_path)
+    recorder = tmp_path / "record-spawn"
+    write_exe(recorder, '#!/usr/bin/env bash\nprintf "%s\\n" "$@" >>"$SPAWN_MARKER"\n')
+    marker = tmp_path / "spawned.txt"
+    r, _ = _run(
+        tmp_path,
+        "run",
+        SEEDED,
+        argv_tail=("--prewarm-next",),
+        cwd=repo,
+        extra_env={
+            "AGENT_SANDBOX_PREWARM_CMD": str(recorder),
+            "SPAWN_MARKER": str(marker),
+            "AGENT_SANDBOX_NO_PREWARM": "1",
+        },
+    )
+    assert r.returncode == 0, r.stderr
+    assert "prewarm-next: spawned" not in r.stderr
+    time.sleep(0.3)
+    assert not marker.exists()
+
+
 def test_prewarm_refuses_an_invalid_record_like_run_does(tmp_path):
     r, _ = _run(tmp_path, "prewarm", {"image": "debian:stable-slim"})
     assert r.returncode != 0
@@ -333,6 +397,22 @@ def test_run_adopts_a_matching_spare(tmp_path):
     # The adopted marker was written; the claim was released at teardown.
     assert (state / "prewarm-adopted").exists()
     assert not (tmp_path / "claims" / SPARE_PROJECT).exists()
+
+
+def test_run_abandons_a_candidate_missing_its_bake_witness(tmp_path):
+    """The ready label is stamped at container create, before the boot finishes, so a
+    spare whose prewarm.json (the bake witness, written last) is absent — a boot
+    interrupted mid-flight — must be abandoned, not adopted. The run cold-boots under
+    its own fresh project and the candidate's claim is released. (Bracketed with
+    test_run_adopts_a_matching_spare: same setup, only the witness differs.)"""
+    repo = _repo(tmp_path)
+    state = _stage_spare(tmp_path)
+    (state / "prewarm.json").unlink()  # ready label present, bake witness missing
+    r, log = _run(tmp_path, "run", SEEDED, extra_env=_spare_env(), cwd=repo)
+    assert r.returncode == 0, r.stderr
+    assert f"adopted prewarmed spare {SPARE_PROJECT}" not in r.stderr
+    assert SPARE_PROJECT not in _projects(log)  # cold boot, not the spare's project
+    assert not (tmp_path / "claims" / SPARE_PROJECT).exists()  # claim released
 
 
 def test_adopted_run_delivers_env_via_exec_env_file(tmp_path):

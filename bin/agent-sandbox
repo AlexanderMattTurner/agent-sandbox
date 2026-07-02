@@ -22,7 +22,7 @@ source "$_AS_DIR/lib/stack.bash"
 
 usage() {
   cat >&2 <<'EOF'
-Usage: agent-sandbox run [--extra-compose FILE]... [--reseed] <workload.json>
+Usage: agent-sandbox run [--extra-compose FILE]... [--reseed] [--prewarm-next] <workload.json>
        agent-sandbox prewarm [--extra-compose FILE]... <workload.json>
        agent-sandbox expand <host>[:ro|rw] [--project NAME]
        agent-sandbox gc [--dry-run]
@@ -38,6 +38,10 @@ name-level-allowlist firewall, waits for its health, then execs the workload.
   --reseed               When re-attaching to a stopped persistent session (workload
                          session_id + ephemeral:false), DISCARD its seeded workspace and
                          re-seed from the current checkout. Destructive, per-invocation.
+  --prewarm-next         After this session, boot a fresh spare of the same workload in
+                         the background (as if by `prewarm`) so the NEXT run can adopt it.
+                         The pool does not otherwise self-replenish. Refused for records
+                         `prewarm` refuses (workspace_mount / session_id / resume_from).
 
 A workload with `session_id` gets the deterministic compose project name
 agent-sandbox-<session_id>; running it again against its stopped stack re-attaches
@@ -92,11 +96,15 @@ cmd_run() {
   # doesn't name a readable file refuses the launch (a consumer overlay silently
   # dropped from the file set would boot the stack without its companion services).
   local -a extra_compose=()
-  local workload="" reseed=0
+  local workload="" reseed=0 prewarm_next=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
     --reseed)
       reseed=1
+      shift
+      ;;
+    --prewarm-next)
+      prewarm_next=1
       shift
       ;;
     --extra-compose)
@@ -132,6 +140,10 @@ cmd_run() {
     return 1
   }
   _validate_workload_record "$workload" || return 1
+  # --prewarm-next spawns a background spare of THIS workload after the session, so the
+  # workload must itself be prewarmable — refuse it up front for the same records the
+  # prewarm verb refuses (a spare could never serve them).
+  [[ "$prewarm_next" == 0 ]] || _prewarm_refuse_unprewarmable "$workload" || return 1
 
   local backend
   backend="$(jq -r '.backend // "local"' "$workload")"
@@ -155,7 +167,13 @@ cmd_run() {
   # (stack_run's positional tail is the open-ended extra-compose list).
   AGENT_SANDBOX_RESEED="$reseed"
   export AGENT_SANDBOX_RESEED
-  stack_run "$workload" "$compose" "$runtime" ${extra_compose[@]+"${extra_compose[@]}"}
+  local run_rc=0
+  stack_run "$workload" "$compose" "$runtime" ${extra_compose[@]+"${extra_compose[@]}"} || run_rc=$?
+  # --prewarm-next: after the session, replenish the pool by booting a fresh spare of
+  # this workload in the background (the pool does NOT self-replenish otherwise). The
+  # spawn never affects this run's exit status.
+  [[ "$prewarm_next" == 0 ]] || prewarm_spawn_next "$_AS_DIR/agent-sandbox" "$workload" ${extra_compose[@]+"${extra_compose[@]}"}
+  return "$run_rc"
 }
 
 # _resolve_compose — print the compose stack's path (AGENT_SANDBOX_COMPOSE points
@@ -282,6 +300,22 @@ _validate_workload_record() {
   fi
 }
 
+# _prewarm_refuse_unprewarmable <workload.json> — refuse (loud, non-zero) a workload a
+# spare can never satisfy: workspace_mount (a bind source is baked at container create,
+# so a bind spare serves only that one path) or session_id/resume_from (deterministic
+# identity always cold-boots). Shared by the prewarm verb and run --prewarm-next.
+_prewarm_refuse_unprewarmable() {
+  local workload="$1"
+  if jq -e 'has("workspace_mount")' "$workload" >/dev/null; then
+    as_error "prewarm refuses workspace_mount — a bind source is baked at container create, so a bind-mode spare could only ever serve that one path; prewarm seed-shaped workloads instead"
+    return 1
+  fi
+  if jq -e 'has("session_id") or has("resume_from")' "$workload" >/dev/null; then
+    as_error "prewarm refuses session_id/resume_from — deterministic-identity sessions always cold-boot (their kept volumes and manifests assume a stack the serving launch created)"
+    return 1
+  fi
+}
+
 # cmd_prewarm <workload.json> — bring a stack up to just before the entrypoint
 # exec and leave it running as an adoptable spare (see stack_prewarm). Shares
 # cmd_run's record gate, then refuses the fields a spare can never satisfy:
@@ -327,14 +361,7 @@ cmd_prewarm() {
     return 1
   }
   _validate_workload_record "$workload" || return 1
-  if jq -e 'has("workspace_mount")' "$workload" >/dev/null; then
-    as_error "prewarm refuses workspace_mount — a bind source is baked at container create, so a bind-mode spare could only ever serve that one path; prewarm seed-shaped workloads instead"
-    return 1
-  fi
-  if jq -e 'has("session_id") or has("resume_from")' "$workload" >/dev/null; then
-    as_error "prewarm refuses session_id/resume_from — deterministic-identity sessions always cold-boot (their kept volumes and manifests assume a stack the serving launch created)"
-    return 1
-  fi
+  _prewarm_refuse_unprewarmable "$workload" || return 1
 
   local backend
   backend="$(jq -r '.backend // "local"' "$workload")"

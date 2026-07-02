@@ -12,6 +12,7 @@ move) — a member dropped from either side is a real adoption-gate change.
 import json
 import os
 import subprocess
+import time
 
 import pytest
 
@@ -330,3 +331,47 @@ def test_spec_hash_fails_closed_when_an_image_is_not_inspectable(tmp_path):
     )
     assert r.returncode != 0
     assert r.stdout.strip() == ""
+
+
+# ── prewarm_spawn_next (run --prewarm-next replenishment) ───────────
+
+
+def test_spawn_next_launches_prewarm_with_extra_compose_and_workload(tmp_path):
+    """The default (no CMD override) builds `<self> prewarm --extra-compose <f>...
+    <workload>` and detaches it. A recorder stands in for the launcher self-path."""
+    recorder = tmp_path / "self"
+    write_exe(recorder, '#!/usr/bin/env bash\nprintf "%s\\n" "$@" >>"$SPAWN_MARKER"\n')
+    marker = tmp_path / "spawned.txt"
+    _bash(
+        tmp_path,
+        'as_info() { :; }; prewarm_spawn_next "$@"',
+        str(recorder),
+        "/wl.json",
+        "/overlay.yml",
+        extra_env={"SPAWN_MARKER": str(marker)},
+    )
+    deadline = time.time() + 5
+    while time.time() < deadline and not marker.exists():
+        time.sleep(0.05)
+    assert marker.exists(), "the detached command never ran"
+    assert marker.read_text().splitlines() == [
+        "prewarm",
+        "--extra-compose",
+        "/overlay.yml",
+        "/wl.json",
+    ]
+
+
+def test_spawn_next_is_a_noop_under_no_prewarm(tmp_path):
+    recorder = tmp_path / "self"
+    write_exe(recorder, '#!/usr/bin/env bash\ntouch "$SPAWN_MARKER"\n')
+    marker = tmp_path / "spawned.txt"
+    _bash(
+        tmp_path,
+        'as_info() { :; }; prewarm_spawn_next "$@"',
+        str(recorder),
+        "/wl.json",
+        extra_env={"SPAWN_MARKER": str(marker), "AGENT_SANDBOX_NO_PREWARM": "1"},
+    )
+    time.sleep(0.3)
+    assert not marker.exists()

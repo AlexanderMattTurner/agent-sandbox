@@ -380,6 +380,18 @@ The prewarm record's `entrypoint` never runs; `env`/`secret_env` are accepted bu
 create). Spares are reaped by `gc` once older than
 `AGENT_SANDBOX_PREWARM_MAX_AGE` seconds (default 86400).
 
+**The pool does not self-replenish.** A `run` adopts at most one spare and, once
+adopted, that spare is gone — the next `run` cold-boots unless something has staged
+a new one. `run --prewarm-next` is the opt-in that closes the loop: after the
+session, it boots a fresh spare of the same workload in the background (a detached
+`prewarm`, so a Ctrl-C can't cancel it), ready for the next launch. It is refused for
+the records `prewarm` itself refuses (`workspace_mount` / `session_id` /
+`resume_from`). Each `--prewarm-next` stages exactly one spare; repeated use just
+stages more, and the age limit reaps any surplus. Set `AGENT_SANDBOX_NO_PREWARM=1` to
+disable the spawn (e.g. in an environment that manages the pool itself). A consumer
+that wants a continuously warm pool runs `prewarm` from its own harness, or passes
+`--prewarm-next` on every launch.
+
 ### `expand` — widen a running session's allowlist
 
 ```bash

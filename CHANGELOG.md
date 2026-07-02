@@ -42,6 +42,14 @@ the prose from the release's commits.
     `AGENT_SANDBOX_PREWARM_MAX_AGE` seconds (default 86400) with volumes
     verified gone, and removes claim locks whose owning process died;
     `--dry-run` previews both.
+  - `run --prewarm-next` opts a launch into replenishing the pool: after the
+    session it boots a fresh spare of the same workload in the background (a
+    detached `prewarm`), so the next launch can adopt it — the pool does not
+    otherwise self-replenish. Refused for the records `prewarm` refuses;
+    `AGENT_SANDBOX_NO_PREWARM=1` disables the spawn.
+  - The spec hash also digests each seccomp profile the compose file
+    references (a profile edited in place would otherwise not move the hash
+    nor force a recreate at the adoption re-up).
 - Persistent sessions (issue #33): `ephemeral: false` is now a real lifecycle.
   - `session_id` Workload field: a stable identity making the compose project
     name the deterministic `agent-sandbox-<session_id>` (mutually exclusive with
