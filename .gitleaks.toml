@@ -1,0 +1,19 @@
+# gitleaks configuration for agent-sandbox.
+#
+# Extends the upstream default ruleset (all default rules stay active) and
+# allowlists exactly one value: the canonical test needle shared with the sibling
+# claude-guard repo. It is a PUBLISHED, non-secret test constant, not a credential.
+# It briefly appeared in this repo's history as an env-delivery test fixture before
+# being replaced with a benign placeholder; gitleaks scans commit history, so the
+# literal is allowlisted by value (not by a transient commit fingerprint) to keep the
+# scan green without weakening detection of any real secret.
+title = "agent-sandbox gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Canonical published test needle (a known non-secret test constant)."
+regexes = [
+  '''q9X2mN7pK4rT8wY1cV5bZ3dF6gH0jL2e''',
+]
