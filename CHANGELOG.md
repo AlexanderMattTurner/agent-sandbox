@@ -22,6 +22,31 @@ the prose from the release's commits.
 
 ### Added
 
+- Persistent sessions (issue #33): `ephemeral: false` is now a real lifecycle.
+  - `session_id` Workload field: a stable identity making the compose project
+    name the deterministic `agent-sandbox-<session_id>` (mutually exclusive with
+    the low-level `AGENT_SANDBOX_PROJECT_NAME` override). Running the same
+    `session_id` against its stopped stack **re-attaches** — same volumes,
+    seeding skipped, this leg's commits extracted onto the same review branch; a
+    still-running session is refused. A stale seed (the checkout moved since)
+    warns and continues; the new `run --reseed` flag is the loud, destructive
+    opt-in to discard and re-seed.
+  - `resume_from` Workload field: seed a FRESH session reproducing where a prior
+    session left off — the workspace is seeded from the prior session's recorded
+    base commit, its review branch's commits are replayed on top (an
+    uncommitted-changes fold is soft-reset back into an uncommitted overlay), and
+    the new work extracts onto a new review branch.
+  - Audit continuity: before teardown the launcher now exports the audit sink's
+    chained `audit.jsonl` and per-session HMAC `audit.secret` (owner-only) beside
+    the egress log; on resume the prior log is mounted read-only at
+    `/var/log/agent-sandbox/audit.prior.jsonl` in the new audit container, so the
+    prior chain stays verifiable while the new session mints a fresh secret.
+  - Seed-mode sessions record a session manifest
+    (`sessions/<project>/session.json`, owner-only) carrying identity and seed
+    provenance (base commit, extract base, review branch, repo root, outcome).
+- `seed_from_git.ref` now accepts any commit-ish (branch, tag, sha), seeding that
+  ref's committed tree (no WIP capture); `HEAD` keeps its tracked-tree +
+  uncommitted-delta behavior. An unresolvable ref refuses the launch.
 - `secret_env` Workload field: credentials delivered as files at
   `/run/secrets/<name>` (mode 0400, owned by the workload user) instead of
   environment variables. Values are streamed over an exec's stdin into a

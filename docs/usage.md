@@ -133,7 +133,26 @@ resolves and routes nothing.
 When `true`, the workload's volumes are throwaway and torn down on exit. The
 guarantee is **verified, not assumed**: teardown fails loud on any surviving volume.
 When `false`, volumes are kept after the session (the launcher prints the
-`docker volume ls` filter to find them).
+`docker volume ls` filter to find them) — pair it with `session_id` to make the
+kept session re-attachable (see [Persistent sessions](#persistent-sessions)).
+
+### `session_id` (string, `^[a-z0-9][a-z0-9_-]{0,40}$`)
+
+A stable session identity: the compose project name becomes the deterministic
+`agent-sandbox-<session_id>` instead of a random per-launch suffix. With
+`ephemeral: false`, running the same `session_id` again **re-attaches** to the
+stopped session's kept volumes. Mutually exclusive with the low-level
+`AGENT_SANDBOX_PROJECT_NAME` override — a session has exactly one identity.
+
+### `resume_from` (string, a prior `session_id`)
+
+Start a **fresh** session reproducing where the named prior session left off: the
+workspace is seeded from the prior session's recorded base commit
+(`seed_from_git.ref` is ignored), the prior review branch's commits are replayed on
+top, and the prior session's exported audit log is mounted read-only beside the new
+sink's at `audit.prior.jsonl`. Requires `seed_from_git`; must differ from
+`session_id`; `seed_from_git.review_branch` must differ from the prior session's.
+See [Persistent sessions](#persistent-sessions).
 
 ### `seed_from_git` (object: `ref` + `review_branch`)
 
@@ -148,10 +167,12 @@ working tree.
 }
 ```
 
-- `ref` — the git ref the sandbox workspace is seeded from. **This build supports
-  only `HEAD`** (the current checkout's tracked tree plus uncommitted delta); any
-  other ref is refused. `agent-sandbox run` must be invoked from inside a git
-  checkout.
+- `ref` — the git ref the sandbox workspace is seeded from. `HEAD` seeds the
+  current checkout's tracked tree **plus your uncommitted delta**. Any other
+  commit-ish (branch, tag, sha) seeds that ref's **committed tree only** — a pinned
+  ref names exact content, so there is no WIP capture — and must resolve to a
+  commit, or the launch is refused. `agent-sandbox run` must be invoked from inside
+  a git checkout either way.
 - `review_branch` — the host branch the workload's committed writes land on for
   review.
 
@@ -213,7 +234,7 @@ you assemble is validated against the schema at `run`.
 `agent-sandbox` has four verbs:
 
 ```
-agent-sandbox run [--extra-compose FILE]... <workload.json>
+agent-sandbox run [--extra-compose FILE]... [--reseed] <workload.json>
 agent-sandbox expand <host>[:ro|rw] [--project NAME]
 agent-sandbox gc [--dry-run]
 agent-sandbox down <project>
@@ -248,11 +269,43 @@ services).
 agent-sandbox run --extra-compose ./my-sidecar.compose.yml workloads/demo-bash.json
 ```
 
+#### `--reseed`
+
+Only meaningful when re-attaching to a stopped persistent session: **discard** its
+seeded workspace and re-seed from the current checkout (fresh in-container repo,
+manifest rewritten). Destructive and per-invocation — without it, a re-attach that
+detects a stale seed warns and continues with the session's tree as-is.
+
+<a id="persistent-sessions"></a>
+
+### Persistent sessions (`session_id` + `ephemeral: false`)
+
+A seed-mode workload with a `session_id` and `ephemeral: false` becomes a real
+lifecycle rather than a one-shot:
+
+1. **Cold run** — seeds `/workspace`, records a session manifest at
+   `$AGENT_SANDBOX_STATE_DIR/sessions/agent-sandbox-<session_id>/session.json`, and
+   keeps the volumes at teardown.
+2. **Re-attach** — running the same `session_id` again restarts the stack on the
+   kept volumes and **skips seeding**; the new leg's commits are extracted onto the
+   **same** `review_branch`. A session that is still **running** is refused (use
+   `expand`/`down` or wait). If your checkout moved since the seed, the launcher
+   warns and continues; `--reseed` is the loud, destructive opt-in to start the
+   workspace over.
+3. **Resume** — a workload naming the old session in `resume_from` starts a fresh
+   session (new project, new volumes, new review branch) seeded to reproduce the old
+   one's end state, including an uncommitted overlay if the old session left one.
+   The prior session's exported audit log rides read-only at
+   `/var/log/agent-sandbox/audit.prior.jsonl` in the new audit container; its chain
+   stays verifiable against the exported per-session HMAC secret
+   (`sessions/<project>/audit.secret`), while the new session mints its own.
+
 ### Environment variables
 
 - **`AGENT_SANDBOX_PROJECT_NAME`** — pins the compose project name (default: a random
   per-session name). Pin it so consumer lifecycle tooling can find the stack by
-  label (and so `expand`/`down` can target it by name).
+  label (and so `expand`/`down` can target it by name). Mutually exclusive with the
+  workload's `session_id`, which is the record-level way to pin the same identity.
 - **`AGENT_SANDBOX_STATE_DIR`** — the base directory for per-session host artifacts
   that outlive the containers. Session state lives at
   `$AGENT_SANDBOX_STATE_DIR/sessions/<project>/`. Default:
@@ -268,9 +321,12 @@ $AGENT_SANDBOX_STATE_DIR/sessions/<project>/egress.log
 ```
 
 If the export fails it warns loudly (the session then has no host-side audit record)
-but does not block teardown of an otherwise-complete session. The same session
-directory also holds the seed's WIP patch and the extracted worktree/mbox for seed
-runs.
+but does not block teardown of an otherwise-complete session. When the audit service
+is on, the launcher likewise exports the audit sink's chained `audit.jsonl` and its
+per-session HMAC `audit.secret` (owner-only) into the same directory — that pair is
+what a later `resume_from` mounts for audit continuity. The session directory also
+holds the seed's WIP patch, the session manifest (`session.json`), and the extracted
+worktree/mbox for seed runs.
 
 ### The review-branch flow (seed mode)
 
