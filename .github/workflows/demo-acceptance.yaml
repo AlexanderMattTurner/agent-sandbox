@@ -9,6 +9,12 @@ name: Demo workload acceptance (e2e)
 # (bind mode): the workload's declared overmount_paths are kernel-enforced read-only
 # from inside the sandbox (asserted by the workload AND the launcher's fail-closed
 # probe) while the rest of /workspace stays writable and lands on the host bind.
+# persistence-acceptance (persistent sessions): a session_id workload's volumes
+# survive teardown, a second run re-attaches without re-seeding onto the same review
+# branch, and a resume replays the prior work into a fresh session with the prior
+# audit log mounted read-only. prewarm-acceptance (warm-start pool): `prewarm`
+# leaves a running labeled spare, a matching `run` adopts it (work extracted, the
+# spare's stack torn down as the session's own), and `gc` reaps an over-age spare.
 on:
   push:
     branches: ["main"]
@@ -46,11 +52,35 @@ jobs:
       - name: Run the bind-mode workload end-to-end and assert the guardrails are read-only
         run: bash .github/scripts/run-bind-acceptance.sh
 
-  # Stable Required check: runs even when either acceptance job is cancelled/skipped,
+  persistence-acceptance:
+    name: agent-sandbox persistent sessions (re-attach + resume acceptance)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Run the persistent-session legs end-to-end (cold, re-attach, resume)
+        run: bash .github/scripts/run-persistence-acceptance.sh
+
+  prewarm-acceptance:
+    name: agent-sandbox prewarm + adopt (warm-start pool acceptance)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Prewarm a spare, adopt it with a run, reap the next one with gc
+        run: bash .github/scripts/run-prewarm-acceptance.sh
+
+  # Stable Required check: runs even when any acceptance job is cancelled/skipped,
   # so a protected branch never gets stuck on a check that never reports.
   demo-acceptance-passed: # required-check: true
     if: always()
-    needs: [demo-acceptance, bind-acceptance]
+    needs: [demo-acceptance, bind-acceptance, persistence-acceptance, prewarm-acceptance]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

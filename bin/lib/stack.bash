@@ -15,6 +15,8 @@ source "$_STACK_LIB_DIR/msg.bash"
 source "$_STACK_LIB_DIR/worktree-seed.bash"
 # shellcheck source=overmounts.bash disable=SC1091
 source "$_STACK_LIB_DIR/overmounts.bash"
+# shellcheck source=prewarm.bash disable=SC1091
+source "$_STACK_LIB_DIR/prewarm.bash"
 
 # _stack_compose PROJECT COMPOSE OVERRIDE OVERMOUNTS CMD... — every compose call goes
 # through here so the project name and file set can never drift between up/exec/down. The
@@ -213,8 +215,11 @@ stack_ensure_firewall_image() {
 # the secret_env VALUES (only the value-free tmpfs declaration does), so secrets never
 # persist in this on-disk override. JSON is valid YAML, so compose consumes it
 # directly. With neither field the workload object is `{}`, a valid no-op override.
+# WITH_TMPFS=0 (a prewarm bring-up) omits the secret_env tmpfs: every spare already
+# carries that mount via prewarm_write_override, and emitting it from two override
+# files at the same destination is daemon-reconciliation behavior we refuse to bet on.
 _stack_write_override() {
-  local workload="$1" out="$2"
+  local workload="$1" out="$2" with_tmpfs="${3:-1}"
   # `$` → `$$`: compose runs variable interpolation over every file it loads, so a
   # literal dollar in a mount path must be escaped or it would be expanded against
   # the LAUNCHER's environment.
@@ -223,11 +228,11 @@ _stack_write_override() {
       workload: ((if .workspace_mount
                   then {volumes: [{type: "bind", source: (.workspace_mount | gsub("\\$"; "$$")), target: "/workspace"}]}
                   else {} end)
-                 + (if ((.secret_env // {}) | length) > 0
+                 + (if $with_tmpfs == "1" and ((.secret_env // {}) | length) > 0
                     then {tmpfs: ["/run/secrets:mode=0755,size=1m"]}
                     else {} end))
     }
-  }' "$workload" >"$out"
+  }' --arg with_tmpfs "$with_tmpfs" "$workload" >"$out"
 }
 
 # _stack_deliver_secrets WORKLOAD_JSON CID USER — stream each secret_env value into
@@ -275,14 +280,23 @@ _stack_deliver_secrets() {
 # corrupt the file / split into bogus KEY lines) is refused loudly.
 _stack_write_env_delivery() {
   local workload="$1" envfile="$2" override="$3"
+  _stack_write_env_file "$workload" "$envfile" || return 1
+  jq -n --arg ef "$envfile" '{services: {workload: {env_file: [$ef]}}}' >"$override"
+}
+
+# _stack_write_env_file WORKLOAD_JSON ENVFILE — write the workload's env map as a
+# 0600 KEY=VALUE env-file: the shared value-shaping half of env delivery, consumed
+# by compose `env_file` at a cold up and by `docker exec --env-file` on an adopted
+# spare. env-file is line-based, so a value containing a newline (which would
+# corrupt the file / split into bogus KEY lines) is refused loudly. Values are
+# literal (neither consumer interpolates env-file content), so no `$` escaping.
+_stack_write_env_file() {
+  local workload="$1" envfile="$2"
   if jq -e '[(.env // {})[] | select(contains("\n"))] | length > 0' "$workload" >/dev/null; then
     as_error "workload.env values must be single-line (a value contains a newline); env is delivered via a line-based env-file"
     return 1
   fi
-  # env-file values are literal (compose does no interpolation over env_file), so —
-  # unlike the compose override above — no `$` escaping is applied.
   (umask 077 && jq -r '(.env // {}) | to_entries[] | "\(.key)=\(.value)"' "$workload" >"$envfile") || return 1
-  jq -n --arg ef "$envfile" '{services: {workload: {env_file: [$ef]}}}' >"$override"
 }
 
 # _stack_export_egress_log PROJECT COMPOSE OVERRIDE OVERMOUNTS STATE_DIR — copy squid's
@@ -297,6 +311,96 @@ _stack_export_egress_log() {
     return 1
   fi
   as_info "egress log: $state/egress.log"
+}
+
+# _stack_write_manifest STATE PROJECT SESSION_ID MODE SEED_REF BASE_COMMIT BASE_REF
+# REVIEW_BRANCH REPO_ROOT — record the session's identity and seed provenance in
+# $STATE/session.json (owner-only). This is what a later `run` re-attaches or resumes
+# FROM: the extract base (base_ref/base_commit), the review branch, and the repo the
+# branch lives in all outlive the launcher process here. An empty SESSION_ID is stored
+# as null (the session is only pinned by AGENT_SANDBOX_PROJECT_NAME).
+_stack_write_manifest() {
+  local state="$1" project="$2" session_id="$3" mode="$4" seed_ref="$5"
+  local base_commit="$6" base_ref="$7" review_branch="$8" repo_root="$9"
+  if ! (umask 077 && jq -n --arg project "$project" --arg session_id "$session_id" --arg mode "$mode" --arg seed_ref "$seed_ref" --arg base_commit "$base_commit" --arg base_ref "$base_ref" --arg review_branch "$review_branch" --arg repo_root "$repo_root" --arg created "$(date -u +%FT%TZ)" '{project: $project, session_id: (if $session_id == "" then null else $session_id end), mode: $mode, seed_ref: $seed_ref, base_commit: $base_commit, base_ref: $base_ref, review_branch: $review_branch, repo_root: $repo_root, created: $created}' >"$state/session.json"); then
+    as_error "could not write the session manifest $state/session.json"
+    return 1
+  fi
+}
+
+# _stack_read_manifest_field STATE FIELD — print one manifest field; non-zero when the
+# manifest or the field is absent, so callers fail loud instead of trusting "".
+_stack_read_manifest_field() {
+  local state="$1" field="$2"
+  jq -er --arg f "$field" '.[$f] // empty' "$state/session.json" 2>/dev/null
+}
+
+# _stack_update_manifest STATE LAST_EXIT EXTRACTED — record the session's outcome in the
+# manifest at teardown. Warn-loud, non-blocking bookkeeping: a failed update must never
+# mask the session's real status. No-op when no manifest exists (unseeded session).
+_stack_update_manifest() {
+  local state="$1" last_exit="$2" extracted="$3"
+  local tmp="$state/session.json.tmp"
+  [[ -f "$state/session.json" ]] || return 0
+  if ! (umask 077 && jq --argjson last_exit "$last_exit" --argjson extracted "$extracted" '. + {last_exit: $last_exit, extracted: $extracted}' "$state/session.json" >"$tmp") || ! mv "$tmp" "$state/session.json"; then
+    as_warn "could not update the session manifest $state/session.json"
+    return 1
+  fi
+}
+
+# _stack_export_audit_log PROJECT COMPOSE OVERRIDE OVERMOUNTS STATE_DIR — copy the audit
+# sink's chained log AND its per-session HMAC secret out of the audit container before
+# teardown (the _stack_export_egress_log twin): a later resume mounts the exported log
+# read-only beside the new sink's. Owner-only on the host (docker cp preserves the source
+# mode, so chmod is explicit). Warn-loud on failure but never block teardown.
+#
+# When THIS session resumed from another, an audit.prior.jsonl is mounted; we fold that
+# prior chain BEFORE the live one into the exported audit.jsonl, so the export — and thus
+# the NEXT resume's mounted prior — carries the full kill-chain across EVERY resume hop,
+# not just one back (a cumulative archive fold). The in-container live audit.jsonl is
+# never mutated; the export is a host-side cumulative VIEW.
+#
+# Note on the exported secret: it lets an offline reader re-check the LIVE tail's HMAC,
+# but a folded export concatenates chains signed by different per-session secrets and is
+# not itself one HMAC-verifiable chain — it is a monitoring/forensic view. Exporting the
+# secret at all means anyone holding the export can re-sign a rewritten live chain, so the
+# guarantee is in-session integrity, not tamper-evidence against later host tampering
+# (acceptable under the host-trusted threat model; each session's in-container live log
+# stays the pristine, independently verifiable record).
+_stack_export_audit_log() {
+  local project="$1" compose="$2" override="$3" overmounts="$4" state="$5" audit_cid
+  audit_cid="$(_stack_compose "$project" "$compose" "$override" "$overmounts" ps -q audit)"
+  local live="$state/.audit.live" prior="$state/.audit.prior"
+  if [[ -z "$audit_cid" ]] ||
+    ! docker cp "$audit_cid:/var/log/agent-sandbox/audit.jsonl" "$live" >/dev/null 2>&1 ||
+    ! docker cp "$audit_cid:/run/audit-secret/secret" "$state/audit.secret" >/dev/null 2>&1; then
+    rm -f "$live"
+    as_warn "could not export the audit log + HMAC secret from the audit container — this session's audit chain has no host copy (a later resume cannot mount it)"
+    return 1
+  fi
+  # The prior sibling exists only for a resumed session; its absence is the common case,
+  # not an error — a failed cp of a non-existent file just leaves no prior to fold.
+  docker cp "$audit_cid:/var/log/agent-sandbox/audit.prior.jsonl" "$prior" >/dev/null 2>&1 || rm -f "$prior"
+  if ! {
+    [[ -f "$prior" ]] && cat "$prior"
+    cat "$live"
+  } >"$state/audit.jsonl" 2>/dev/null ||
+    ! chmod 600 "$state/audit.jsonl" "$state/audit.secret" 2>/dev/null; then
+    rm -f "$live" "$prior"
+    as_warn "could not assemble the exported audit log on the host — a later resume cannot mount this session's chain"
+    return 1
+  fi
+  rm -f "$live" "$prior"
+  as_info "audit log: $state/audit.jsonl"
+}
+
+# _stack_write_audit_prior_override PRIOR_LOG OUT — generate the compose override that
+# binds a prior session's exported audit log read-only at audit.prior.jsonl inside the
+# NEW session's audit container, beside the fresh sink's own log. `$` → `$$` because
+# compose interpolates every file it loads (same escaping as _stack_write_override).
+_stack_write_audit_prior_override() {
+  local prior_log="$1" out="$2"
+  jq -n --arg src "$prior_log" '{services: {audit: {volumes: [{type: "bind", source: ($src | gsub("\\$"; "$$")), target: "/var/log/agent-sandbox/audit.prior.jsonl", read_only: true}]}}}' >"$out"
 }
 
 # stack_verify_no_volumes PROJECT — verify no compose-labeled volume survived a
@@ -322,24 +426,67 @@ _stack_down_ephemeral() {
   stack_verify_no_volumes "$project"
 }
 
-# stack_run WORKLOAD_JSON COMPOSE RUNTIME [EXTRA_COMPOSE...] — the whole session:
-# up → seed → exec → extract → export egress log → down. Returns the workload's exit
-# status when the session machinery succeeded; machinery failures return non-zero
-# themselves. Reads SANDBOX_IP/SANDBOX_SUBNET from the caller (export_sandbox_subnet).
-# EXTRA_COMPOSE files are consumer overlays merged after the library's file set on
-# EVERY compose invocation of this session (see _stack_compose). The compose project
-# name is randomized per session unless the consumer pins its own identity via
-# AGENT_SANDBOX_PROJECT_NAME (its lifecycle tooling finds the stack by that label).
-stack_run() {
-  local workload="$1" compose="$2" runtime="$3"
-  shift 3
-  _STACK_EXTRA_COMPOSE=("$@")
-  local sandbox_dir project state
-  sandbox_dir="$(cd "$(dirname "$compose")" && pwd)"
-  project="${AGENT_SANDBOX_PROJECT_NAME:-agent-sandbox-$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n')}"
-  state="$(_stack_state_dir "$project")"
-  worktree_secure_mkdir "$state" || return 1
+# Session-attach lock. A deterministic-identity run (session_id, or a pinned
+# AGENT_SANDBOX_PROJECT_NAME) probes an existing stack and then acts on it — so two
+# concurrent runs of the SAME identity could both see "stopped" and both `up`, exec, and
+# extract onto one stack. An atomic mkdir keyed by the compose project makes exactly one
+# win; the loser is refused. The claim lives under the RUNTIME dir, never the state dir —
+# it is an ephemeral cross-process mutex, correct to clear on reboot (the same reasoning
+# as the prewarm claim dir). No separate reaper runs, so a claim left by a crashed
+# launcher is detected here (dead holder pid) and stolen race-safely.
+_STACK_SESSION_CLAIM_DIR="${AGENT_SANDBOX_SESSION_CLAIM_DIR:-${XDG_RUNTIME_DIR:-/tmp/agent-sandbox-$(id -u)}/agent-sandbox/session-claims}"
 
+# _stack_session_claim PROJECT — win the exclusive claim on PROJECT or fail loud. mkdir is
+# the atomic test-and-set: exactly one racer creates the dir. An existing claim with a
+# LIVE holder pid is refused; a stale one (holder dead/missing) is stolen by renaming it
+# aside — rename(2) succeeds for exactly one racer, so no two callers ever both hold it.
+_stack_session_claim() {
+  local project="$1" dir
+  dir="$_STACK_SESSION_CLAIM_DIR/$project"
+  if ! mkdir -p "$_STACK_SESSION_CLAIM_DIR" 2>/dev/null || ! chmod 700 "$_STACK_SESSION_CLAIM_DIR" 2>/dev/null; then
+    as_error "could not create the session-claim dir $_STACK_SESSION_CLAIM_DIR"
+    return 1
+  fi
+  if mkdir "$dir" 2>/dev/null; then
+    printf '%s\n' "$$" >"$dir/pid"
+    return 0
+  fi
+  local holder=""
+  [[ -f "$dir/pid" ]] && holder="$(cat "$dir/pid" 2>/dev/null)"
+  if [[ -n "$holder" ]] && kill -0 "$holder" 2>/dev/null; then
+    as_error "session $project is already being launched by pid $holder — wait for it to finish, or take the stack down (agent-sandbox down $project)"
+    return 1
+  fi
+  # Stale: steal by renaming the dead claim aside (atomic, single-winner), then recreate
+  # the canonical claim. A fresh racer that mkdir's the freed path first wins instead and
+  # we are refused — fail-closed, never two holders.
+  local aside="$dir.stale.$$"
+  if mv "$dir" "$aside" 2>/dev/null; then
+    rm -rf "$aside" 2>/dev/null
+    if mkdir "$dir" 2>/dev/null; then
+      printf '%s\n' "$$" >"$dir/pid"
+      return 0
+    fi
+  fi
+  as_error "session $project had a stale claim from a crashed launcher and another run is reclaiming it — retry in a moment (or clear it: agent-sandbox down $project)"
+  return 1
+}
+
+# _stack_session_release PROJECT — drop this session's claim. Best-effort: a claim not
+# released (a crashed launcher) is self-healing, detected as stale on the next claim.
+_stack_session_release() {
+  # ${var:?} guards against a rm -rf / if the claim dir var is ever empty.
+  rm -rf "${_STACK_SESSION_CLAIM_DIR:?}/$1" 2>/dev/null || true # allow-exit-suppress: releasing a claim must never fail a completed session; a leftover is reclaimed as stale
+}
+
+# _stack_export_launch_env WORKLOAD_JSON RUNTIME — export everything compose
+# interpolates for this launch's `up` (and its later ps/logs/down): the workload
+# identity vars, the partitioned allowlist tiers, the validated control-plane
+# grants, and the profile activation. Reads SANDBOX_IP from the caller. Shared by
+# the cold bring-up and by spare adoption (which re-enters `up` under the same
+# env so compose reconciles instead of recreating).
+_stack_export_launch_env() {
+  local workload="$1" runtime="$2"
   WORKLOAD_IMAGE="$(jq -r '.image' "$workload")"
   WORKLOAD_USER="$(jq -r '.user // "1000"' "$workload")"
   WORKLOAD_RUNTIME="$runtime"
@@ -347,18 +494,6 @@ stack_run() {
   export WORKLOAD_IMAGE WORKLOAD_USER WORKLOAD_RUNTIME WORKLOAD_IP
   # The seed/extract execs must run as the same user the workload writes as.
   export AGENT_SANDBOX_WORKLOAD_USER="$WORKLOAD_USER"
-
-  # tty is a runtime precondition, not a file field: an interactive entrypoint needs a
-  # real terminal on the launcher's stdin. Check it BEFORE bringing anything up so we
-  # fail fast instead of tearing down a healthy stack we could never attach to.
-  local want_tty=false
-  if [[ "$(jq -r '.tty // false' "$workload")" == "true" ]]; then
-    [[ -t 0 ]] || {
-      as_error "workload.tty is true but the launcher's stdin is not a TTY — run agent-sandbox from an interactive terminal, or set tty:false"
-      return 1
-    }
-    want_tty=true
-  fi
 
   stack_partition_allowlist "$workload"
   # Grants must be validated and exported BEFORE `up`: compose passes
@@ -378,10 +513,72 @@ stack_run() {
     printf '%s' "${_profiles[*]-}"
   )"
   export COMPOSE_PROFILES
+}
+
+# The bring-up/serve seam: stack_bring_up publishes the session's identity and
+# container handles here for stack_serve_workload (and consumers like the prewarm
+# verb, which brings a stack up and stops before serving).
+_STACK_PROJECT=""
+_STACK_STATE=""
+_STACK_CID=""
+_STACK_OVERRIDE=""
+_STACK_OVERMOUNTS=""
+_STACK_SESSION_ID=""
+_STACK_RESUME_FROM=""
+_STACK_REATTACH=0
+_STACK_EPHEMERAL=""
+_STACK_WANT_TTY=false
+_STACK_PRIOR_BASE_COMMIT=""
+_STACK_PRIOR_REVIEW_BRANCH=""
+# 1: the session runs on an adopted prewarm spare (env/secret delivery moves to
+# exec time, teardown releases the spare's claim).
+_STACK_ADOPTED=0
+# 0: skip the up-time env staging AND the post-create secret delivery in
+# stack_bring_up. Set by stack_prewarm — a spare must never bake a workload's
+# env/secret_env (both are delivered at adoption exec time).
+_STACK_STAGE_ENV=1
+# 1: this session holds a deterministic-identity session-attach lock (taken in
+# stack_bring_up's probe, released in stack_serve_workload's teardown — the split
+# put claim and release in different functions, so the flag rides the seam).
+_STACK_SESSION_CLAIMED=0
+
+# stack_bring_up WORKLOAD_JSON COMPOSE RUNTIME — the workload-agnostic half of a
+# session: resolve identity, partition the allowlist, activate profiles, ensure
+# images, generate the per-session overrides, `up -d --wait`, resolve the workload
+# cid, clean up the up-only env delivery, and hold the fail-closed guardrail gate.
+# Ends with a healthy stack whose /workspace is still empty (seed mode: a fresh
+# named volume) — nothing workload-specific has run. Publishes the session's
+# handles in the _STACK_* globals above for stack_serve_workload. Fail-closed:
+# any failure tears down whatever came up (keeping volumes only where a prior
+# leg's work lives in them) and returns non-zero. Reads SANDBOX_IP/SANDBOX_SUBNET
+# from the caller (export_sandbox_subnet); _STACK_EXTRA_COMPOSE must already be
+# set (stack_run owns it).
+stack_bring_up() {
+  local workload="$1" compose="$2" runtime="$3"
+  local sandbox_dir project state session_id resume_from
+  sandbox_dir="$(cd "$(dirname "$compose")" && pwd)"
+  session_id="$(jq -r '.session_id // empty' "$workload")"
+  resume_from="$(jq -r '.resume_from // empty' "$workload")"
+  # One identity per session: the workload's session_id and the consumer env override
+  # both name the compose project, and a silent precedence rule would let lifecycle
+  # tooling target a different stack than the one that booted.
+  if [[ -n "$session_id" && -n "${AGENT_SANDBOX_PROJECT_NAME:-}" ]]; then
+    as_error "workload.session_id ('$session_id') and AGENT_SANDBOX_PROJECT_NAME ('$AGENT_SANDBOX_PROJECT_NAME') are both set — a session has exactly one identity; drop one"
+    return 1
+  fi
+  if [[ -n "$session_id" ]]; then
+    project="agent-sandbox-$session_id"
+  else
+    project="${AGENT_SANDBOX_PROJECT_NAME:-agent-sandbox-$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n')}"
+  fi
+  state="$(_stack_state_dir "$project")"
+  worktree_secure_mkdir "$state" || return 1
+
+  _stack_export_launch_env "$workload" "$runtime" || return 1
   stack_ensure_firewall_image "$sandbox_dir" || return 1
 
   local override="$state/workload-override.json"
-  _stack_write_override "$workload" "$override" || {
+  _stack_write_override "$workload" "$override" "$_STACK_STAGE_ENV" || {
     as_error "could not generate the per-session compose override"
     return 1
   }
@@ -397,6 +594,72 @@ stack_run() {
   local ephemeral
   ephemeral="$(jq -r '.ephemeral' "$workload")"
 
+  # A deterministic identity (session_id, or a pinned AGENT_SANDBOX_PROJECT_NAME) can
+  # name an EXISTING stack, so probe before `up`: a running session is refused (never
+  # disturb it), a stopped persistent one is re-attached (compose `up` under the same
+  # project recreates the containers onto the kept volumes) with seeding skipped. The
+  # probe covers containers AND volumes — a persistent teardown removes the containers
+  # but keeps the volumes, so volumes alone mean "stopped session".
+  local reattach=0
+  _STACK_SESSION_CLAIMED=0
+  if [[ -n "$session_id" || -n "${AGENT_SANDBOX_PROJECT_NAME:-}" ]]; then
+    # Serialize the probe-then-act against a concurrent run of the same identity.
+    _stack_session_claim "$project" || return 1
+    _STACK_SESSION_CLAIMED=1
+    if [[ -n "$(docker ps -q --filter "label=com.docker.compose.project=$project")" ]]; then
+      as_error "session $project is already running — use expand/down (or wait for it to exit) instead of launching it again"
+      _stack_session_release "$project"
+      return 1
+    fi
+    if [[ -n "$(docker ps -aq --filter "label=com.docker.compose.project=$project")" || -n "$(docker volume ls -q --filter "label=com.docker.compose.project=$project")" ]]; then
+      if [[ -n "$resume_from" ]]; then
+        as_error "resume_from needs a FRESH session, but project $project already has containers or volumes — pick a new session_id, or take the old stack down (agent-sandbox down $project)"
+        return 1
+      fi
+      if [[ "$ephemeral" == "true" ]]; then
+        as_error "project $project has a stopped persistent stack but this workload is ephemeral:true — re-attach needs ephemeral:false (or take the stack down first: agent-sandbox down $project)"
+        return 1
+      fi
+      reattach=1
+      as_info "re-attaching to the stopped session $project (kept volumes; seeding skipped)"
+    fi
+  fi
+
+  # Resume: resolve the prior session's manifest and exported artifacts BEFORE `up`,
+  # so its audit log can ride into the compose file set as a read-only bind.
+  local prior_state="" prior_base_commit="" prior_review_branch=""
+  if [[ -n "$resume_from" ]]; then
+    prior_state="$(_stack_state_dir "agent-sandbox-$resume_from")"
+    if [[ ! -f "$prior_state/session.json" ]]; then
+      as_error "nothing to resume: no session manifest at $prior_state/session.json (did session '$resume_from' run with session_id set and reach its seed?)"
+      return 1
+    fi
+    if ! prior_base_commit="$(_stack_read_manifest_field "$prior_state" base_commit)" ||
+      ! prior_review_branch="$(_stack_read_manifest_field "$prior_state" review_branch)"; then
+      as_error "the prior session's manifest $prior_state/session.json is missing base_commit/review_branch — cannot resume from it"
+      return 1
+    fi
+    if [[ "$(jq -r '.seed_from_git.review_branch' "$workload")" == "$prior_review_branch" ]]; then
+      as_error "seed_from_git.review_branch must differ from the prior session's ('$prior_review_branch') — a resumed session extracts onto its own review branch"
+      return 1
+    fi
+    if [[ ",${COMPOSE_PROFILES}," == *,audit,* ]]; then
+      # -f, not -s: a quiet prior session legitimately exported an EMPTY chain,
+      # and continuity means mounting whatever record exists.
+      if [[ -f "$prior_state/audit.jsonl" ]]; then
+        local audit_prior_override="$state/audit-prior-override.json"
+        _stack_write_audit_prior_override "$prior_state/audit.jsonl" "$audit_prior_override" || {
+          as_error "could not generate the prior-audit-log compose override"
+          return 1
+        }
+        _STACK_EXTRA_COMPOSE+=("$audit_prior_override")
+        as_info "audit continuity: the prior session's log rides read-only at /var/log/agent-sandbox/audit.prior.jsonl"
+      else
+        as_warn "the prior session exported no audit log ($prior_state/audit.jsonl) — audit.prior.jsonl will not be mounted"
+      fi
+    fi
+  fi
+
   # env delivery: a 0600 env-file consumed ONLY by `up` (staged as an up-only
   # override appended last to the compose file set), then unlinked once the container
   # is created — so the workload's env never persists in the on-disk override.
@@ -404,7 +667,7 @@ stack_run() {
   # via `docker inspect`; credentials belong in secret_env (file-delivered, invisible
   # to inspect — _stack_deliver_secrets below).
   local env_file="" env_override="" env_idx=-1
-  if [[ "$(jq '(.env // {}) | length' "$workload")" -gt 0 ]]; then
+  if [[ "$_STACK_STAGE_ENV" == 1 && "$(jq '(.env // {}) | length' "$workload")" -gt 0 ]]; then
     env_file="$state/workload.env"
     env_override="$state/workload-env-override.json"
     _stack_write_env_delivery "$workload" "$env_file" "$env_override" || {
@@ -441,7 +704,7 @@ stack_run() {
 
   # Stream secret_env files into the container's /run/secrets tmpfs BEFORE anything
   # else runs in it (the entrypoint idles), so the workload always sees its secrets.
-  if [[ "$(jq '(.secret_env // {}) | length' "$workload")" -gt 0 ]]; then
+  if [[ "$_STACK_STAGE_ENV" == 1 && "$(jq '(.secret_env // {}) | length' "$workload")" -gt 0 ]]; then
     if ! _stack_deliver_secrets "$workload" "$cid" "$WORKLOAD_USER"; then
       as_error "secret delivery failed — refusing to hand over the sandbox"
       _stack_compose "$project" "$compose" "$override" "$overmounts" down --volumes --timeout 30 || true # allow-exit-suppress: best-effort cleanup of a stack refused at secret delivery; the launch already failed loudly
@@ -498,6 +761,36 @@ stack_run() {
     fi
   fi
 
+  _STACK_PROJECT="$project"
+  _STACK_STATE="$state"
+  _STACK_CID="$cid"
+  _STACK_OVERRIDE="$override"
+  _STACK_OVERMOUNTS="$overmounts"
+  _STACK_SESSION_ID="$session_id"
+  _STACK_RESUME_FROM="$resume_from"
+  _STACK_REATTACH="$reattach"
+  _STACK_EPHEMERAL="$ephemeral"
+  _STACK_PRIOR_BASE_COMMIT="$prior_base_commit"
+  _STACK_PRIOR_REVIEW_BRANCH="$prior_review_branch"
+}
+
+# stack_serve_workload WORKLOAD_JSON COMPOSE — the workload-specific half of a
+# session, against the healthy stack stack_bring_up published in the _STACK_*
+# globals: control-plane readiness barrier, seed/re-attach/resume the workspace,
+# exec the Workload's entrypoint, extract the work onto the host review branch,
+# export the egress + audit logs, tear down. Returns the workload's exit status
+# when the session machinery succeeded; machinery failures return non-zero
+# themselves (a failed extract keeps the containers and volumes).
+stack_serve_workload() {
+  local workload="$1" compose="$2"
+  local project="$_STACK_PROJECT" state="$_STACK_STATE" cid="$_STACK_CID"
+  local override="$_STACK_OVERRIDE" overmounts="$_STACK_OVERMOUNTS"
+  local session_id="$_STACK_SESSION_ID" resume_from="$_STACK_RESUME_FROM"
+  local reattach="$_STACK_REATTACH" ephemeral="$_STACK_EPHEMERAL"
+  local want_tty="$_STACK_WANT_TTY"
+  local prior_base_commit="$_STACK_PRIOR_BASE_COMMIT"
+  local prior_review_branch="$_STACK_PRIOR_REVIEW_BRANCH"
+
   # Control-plane readiness barrier, BEFORE seeding: a consumer gate that never
   # comes up must fail the launch while there is still nothing to lose — no
   # seeded work, no running entrypoint the consumer believed was supervised.
@@ -506,35 +799,188 @@ stack_run() {
     return 1
   fi
 
+  # Adopted spare: the workload's env/secret_env were deliberately NOT baked at
+  # prewarm (a spare is workload-agnostic), so both arrive now — secrets before
+  # seeding (the cold path's delivered-before-anything-runs guarantee, same
+  # stdin-only machinery), env as an exec-time --env-file staged just below.
+  local adopt_env_file=""
+  local -a adopt_env_flags=()
+  if [[ "$_STACK_ADOPTED" == 1 ]]; then
+    if [[ "$(jq '(.env // {}) | length' "$workload")" -gt 0 ]]; then
+      adopt_env_file="$state/workload.env"
+      if ! _stack_write_env_file "$workload" "$adopt_env_file"; then
+        as_error "could not prepare the workload env-file for the adopted spare"
+        _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
+        return 1
+      fi
+      adopt_env_flags=(--env-file "$adopt_env_file")
+    fi
+    if [[ "$(jq '(.secret_env // {}) | length' "$workload")" -gt 0 ]]; then
+      if ! _stack_deliver_secrets "$workload" "$cid" "$WORKLOAD_USER"; then
+        as_error "secret delivery failed — refusing to hand over the sandbox"
+        [[ -n "$adopt_env_file" ]] && rm -f "$adopt_env_file"
+        _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup of a stack refused at secret delivery; the launch already failed loudly
+        return 1
+      fi
+    fi
+  fi
+
   # Seed the workspace from git BEFORE the entrypoint runs, so the workload never
-  # sees a half-seeded tree. A seed failure keeps nothing: no work exists yet, so
-  # tear the stack down and refuse.
-  local seeded=0 base_ref="" base_commit="" review_branch="" repo_root="" wip_patch=""
+  # sees a half-seeded tree. A cold-seed failure keeps nothing (no work exists yet,
+  # so tear the stack down and refuse); a RE-ATTACH failure instead stops the
+  # containers but KEEPS the volumes — they hold a prior leg's work.
+  local seeded=0 base_ref="" base_commit="" review_branch="" repo_root="" wip_patch="" seed_ref=""
   if jq -e '.seed_from_git' "$workload" >/dev/null; then
-    local ref
-    ref="$(jq -r '.seed_from_git.ref' "$workload")"
+    seed_ref="$(jq -r '.seed_from_git.ref' "$workload")"
     review_branch="$(jq -r '.seed_from_git.review_branch' "$workload")"
-    if [[ "$ref" != "HEAD" ]]; then
-      as_error "seed_from_git.ref: only HEAD (the current checkout's tracked tree + uncommitted delta) is supported by this build"
-      _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
-      return 1
-    fi
-    if ! repo_root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
-      as_error "seed_from_git needs to run from inside a git checkout (no repo at $PWD)"
-      _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
-      return 1
-    fi
-    base_commit="$(git -C "$repo_root" rev-parse HEAD)"
     wip_patch="$state/wip.patch"
-    if ! (umask 077 && worktree_capture_wip_patch "$repo_root" >"$wip_patch") ||
-      ! worktree_seed_tar "$repo_root" | worktree_seed_into_container "$cid" ||
-      ! base_ref="$(worktree_container_init_repo "$cid" "$review_branch")"; then
-      as_error "could not seed the workspace into the sandbox"
-      _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
-      return 1
+    if [[ "$reattach" == 1 ]]; then
+      # Trust the manifest + an in-container probe; the only destructive path is the
+      # explicit --reseed flag.
+      local manifest_mode
+      manifest_mode="$(_stack_read_manifest_field "$state" mode)" || manifest_mode=""
+      if [[ "$manifest_mode" != "seed" ]] ||
+        ! docker exec -u "$WORKLOAD_USER" "$cid" test -d /workspace/.git; then
+        as_error "re-attach: $project's manifest/workspace is not a seeded session (manifest mode '${manifest_mode:-absent}') — take the stack down (agent-sandbox down $project) and start fresh"
+        _stack_compose "$project" "$compose" "$override" "$overmounts" down --timeout 30 || true # allow-exit-suppress: best-effort stop of a stack refused at re-attach; volumes are deliberately kept
+        return 1
+      fi
+      if ! base_commit="$(_stack_read_manifest_field "$state" base_commit)" ||
+        ! review_branch="$(_stack_read_manifest_field "$state" review_branch)" ||
+        ! repo_root="$(_stack_read_manifest_field "$state" repo_root)"; then
+        as_error "re-attach: the session manifest $state/session.json is missing base_commit/review_branch/repo_root — cannot extract this leg's work; take the stack down and start fresh"
+        _stack_compose "$project" "$compose" "$override" "$overmounts" down --timeout 30 || true # allow-exit-suppress: best-effort stop of a stack refused at re-attach; volumes are deliberately kept
+        return 1
+      fi
+      if [[ "${AGENT_SANDBOX_RESEED:-0}" == 1 ]]; then
+        as_warn "--reseed: discarding $project's seeded workspace and re-seeding from the current checkout"
+        if ! repo_root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+          as_error "--reseed needs to run from inside a git checkout (no repo at $PWD)"
+          _stack_compose "$project" "$compose" "$override" "$overmounts" down --timeout 30 || true # allow-exit-suppress: best-effort stop of a stack refused at re-seed; volumes are deliberately kept
+          return 1
+        fi
+        base_commit="$(git -C "$repo_root" rev-parse HEAD)"
+        if ! (umask 077 && worktree_capture_wip_patch "$repo_root" >"$wip_patch") ||
+          ! worktree_seed_tar "$repo_root" | worktree_reseed_container "$cid" ||
+          ! base_ref="$(worktree_container_init_repo "$cid" "$review_branch")" ||
+          ! worktree_stamp_seed_fingerprint "$cid" "$repo_root" ||
+          ! _stack_write_manifest "$state" "$project" "$session_id" "seed" "HEAD" "$base_commit" "$base_ref" "$review_branch" "$repo_root"; then
+          as_error "could not re-seed the workspace"
+          _stack_compose "$project" "$compose" "$override" "$overmounts" down --timeout 30 || true # allow-exit-suppress: best-effort stop of a stack refused mid-re-seed; volumes are deliberately kept
+          return 1
+        fi
+        as_info "workspace re-seeded from $repo_root (HEAD + uncommitted delta); review branch: $review_branch"
+      else
+        if [[ "$(_stack_read_manifest_field "$state" seed_ref)" == "HEAD" ]] &&
+          ! worktree_seed_fingerprint_matches "$cid" "$repo_root"; then
+          as_warn "the re-attached workspace was seeded from an older state of $repo_root — continuing with the session's tree as-is; pass --reseed to discard it and re-seed from your current checkout"
+        fi
+        # The extract below assumes the prior legs' work is already on the host
+        # review branch; if the user deleted it (e.g. after merging), a rebuilt
+        # branch would start from leg 1's launch state and this leg's patches
+        # would misapply — refuse with the remedy instead.
+        if ! git -C "$repo_root" show-ref --verify --quiet "refs/heads/$review_branch"; then
+          as_error "re-attach: review branch '$review_branch' no longer exists in $repo_root (deleted after a merge?) — the session's prior work cannot extract onto it; pass --reseed to discard the in-container tree and start this session fresh"
+          _stack_compose "$project" "$compose" "$override" "$overmounts" down --timeout 30 || true # allow-exit-suppress: best-effort stop of a stack refused at re-attach; volumes are deliberately kept
+          return 1
+        fi
+        # This leg extracts only ITS OWN commits: the extract base is the container's
+        # current HEAD — the prior legs' work is already on the review branch.
+        if ! base_ref="$(worktree_container_seed_head "$cid")"; then
+          as_error "re-attach: could not read the workspace repo HEAD"
+          _stack_compose "$project" "$compose" "$override" "$overmounts" down --timeout 30 || true # allow-exit-suppress: best-effort stop of a stack refused at re-attach; volumes are deliberately kept
+          return 1
+        fi
+      fi
+    else
+      if ! repo_root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+        as_error "seed_from_git needs to run from inside a git checkout (no repo at $PWD)"
+        _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
+        return 1
+      fi
+      if [[ -n "$resume_from" ]]; then
+        # Resume: seed the prior session's recorded base commit, then replay its
+        # review branch on top — the workload's seed_from_git.ref is deliberately
+        # ignored (the prior manifest is the provenance).
+        as_info "resume: seeding from session '$resume_from' (base $prior_base_commit); seed_from_git.ref '$seed_ref' is ignored on resume"
+        if ! git -C "$repo_root" rev-parse --verify --quiet "$prior_base_commit^{commit}" >/dev/null; then
+          as_error "the prior session's base commit $prior_base_commit is not in $repo_root — cannot resume"
+          _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
+          return 1
+        fi
+        local resume_mbox="$state/resume.mbox"
+        if ! (umask 077 && : >"$wip_patch") ||
+          ! (umask 077 && git -C "$repo_root" format-patch --stdout --binary "$prior_base_commit..$prior_review_branch" >"$resume_mbox") ||
+          ! worktree_seed_tar_ref "$repo_root" "$prior_base_commit" | worktree_seed_into_container "$cid" ||
+          ! base_ref="$(worktree_container_init_repo "$cid" "$review_branch")"; then
+          as_error "could not seed the resumed workspace into the sandbox"
+          _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
+          return 1
+        fi
+        base_commit="$prior_base_commit"
+        if [[ -s "$resume_mbox" ]]; then
+          # The new session's extract must branch the host review branch from the
+          # prior work's tip — patches formatted against the post-replay tree only
+          # apply there. A tip that is the extract's uncommitted-changes fold is
+          # soft-reset back into an UNCOMMITTED overlay (and the host base steps to
+          # its parent), so the agent resumes with it uncommitted, as it was left.
+          if ! worktree_container_apply_mbox "$cid" <"$resume_mbox"; then
+            _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
+            return 1
+          fi
+          base_commit="$(git -C "$repo_root" rev-parse "$prior_review_branch")"
+          if worktree_tip_is_wip_fold "$repo_root" "$prior_review_branch"; then
+            if ! worktree_container_soft_reset_tip "$cid"; then
+              _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
+              return 1
+            fi
+            base_commit="$(git -C "$repo_root" rev-parse "$prior_review_branch~1")"
+          fi
+          if ! base_ref="$(worktree_container_seed_head "$cid")"; then
+            as_error "resume: could not read the post-replay workspace HEAD"
+            _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
+            return 1
+          fi
+        fi
+        # The manifest records the ACTUAL seed provenance (the prior base commit),
+        # not the ignored workload ref — so a later re-attach of this session never
+        # runs the HEAD-only staleness check against a seed that wasn't HEAD.
+        seed_ref="$prior_base_commit"
+        as_info "workspace resumed from session '$resume_from' ($prior_review_branch replayed); review branch: $review_branch"
+      elif [[ "$seed_ref" == "HEAD" ]]; then
+        base_commit="$(git -C "$repo_root" rev-parse HEAD)"
+        if ! (umask 077 && worktree_capture_wip_patch "$repo_root" >"$wip_patch") ||
+          ! worktree_seed_tar "$repo_root" | worktree_seed_into_container "$cid" ||
+          ! base_ref="$(worktree_container_init_repo "$cid" "$review_branch")" ||
+          ! worktree_stamp_seed_fingerprint "$cid" "$repo_root"; then
+          as_error "could not seed the workspace into the sandbox"
+          _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
+          return 1
+        fi
+        as_info "workspace seeded from $repo_root (HEAD + uncommitted delta); review branch: $review_branch"
+      else
+        # An arbitrary committed ref: seed its committed tree only; the wip patch is
+        # written EMPTY (its emptiness means "nothing uncommitted" downstream).
+        if ! base_commit="$(git -C "$repo_root" rev-parse --verify --quiet "$seed_ref^{commit}")"; then
+          as_error "seed_from_git.ref '$seed_ref' does not resolve to a commit in $repo_root"
+          _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
+          return 1
+        fi
+        if ! (umask 077 && : >"$wip_patch") ||
+          ! worktree_seed_tar_ref "$repo_root" "$base_commit" | worktree_seed_into_container "$cid" ||
+          ! base_ref="$(worktree_container_init_repo "$cid" "$review_branch")"; then
+          as_error "could not seed the workspace into the sandbox"
+          _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
+          return 1
+        fi
+        as_info "workspace seeded from $seed_ref ($base_commit, committed tree only); review branch: $review_branch"
+      fi
+      _stack_write_manifest "$state" "$project" "$session_id" "seed" "$seed_ref" "$base_commit" "$base_ref" "$review_branch" "$repo_root" || {
+        _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
+        return 1
+      }
     fi
     seeded=1
-    as_info "workspace seeded from $repo_root (HEAD + uncommitted delta); review branch: $review_branch"
   fi
 
   # Run the Workload's entrypoint. Its env rode in on the override, so a plain
@@ -550,11 +996,15 @@ stack_run() {
     argv+=("$(jq -r ".entrypoint[$_i]" "$workload")")
   done
   local -a exec_flags=(-u "$WORKLOAD_USER" -w /workspace)
+  exec_flags+=(${adopt_env_flags[@]+"${adopt_env_flags[@]}"})
   # tty:true attaches an interactive terminal (validated against a real stdin at the
   # top of stack_run); the default is a plain non-interactive exec.
   [[ "$want_tty" == true ]] && exec_flags+=(-it)
   local workload_rc=0
   docker exec "${exec_flags[@]}" "$cid" "${argv[@]}" || workload_rc=$?
+  # The exec consumed the adopted-path env-file at its start; drop it now so the
+  # 0600 staging file never outlives the entrypoint.
+  [[ -n "$adopt_env_file" ]] && rm -f "$adopt_env_file"
   if [[ "$workload_rc" -ne 0 ]]; then
     as_warn "workload exited with status $workload_rc"
   fi
@@ -565,6 +1015,7 @@ stack_run() {
     local wt_dir="$state/review-worktree" agent_mbox="$state/agent.mbox"
     if ! worktree_extract_to_host "$cid" "$base_ref" "$repo_root" "$base_commit" \
       "$review_branch" "$wt_dir" "$wip_patch" "$agent_mbox"; then
+      _stack_update_manifest "$state" "$workload_rc" false || true # allow-exit-suppress: manifest bookkeeping already warns; it must not mask the extract failure
       as_error "extract failed — keeping the session's containers and volumes (compose project $project) so the workload's work is not lost"
       return 1
     fi
@@ -572,11 +1023,20 @@ stack_run() {
     # surface. A failed remove is loud but non-fatal (the branch already exists).
     git -C "$repo_root" worktree remove "$wt_dir" 2>/dev/null ||
       as_warn "could not remove the scratch worktree $wt_dir (branch $review_branch is intact)"
-    worktree_print_merge_hint "$review_branch"
+    worktree_print_merge_hint "$review_branch" "$([[ "$ephemeral" == "true" ]] && echo 0 || echo 1)"
   fi
 
   _stack_export_egress_log "$project" "$compose" "$override" "$overmounts" "$state" || true # allow-exit-suppress: the export already warned loudly; a lost audit copy must not block teardown of an otherwise-complete session
+  if [[ ",${COMPOSE_PROFILES}," == *,audit,* ]]; then
+    _stack_export_audit_log "$project" "$compose" "$override" "$overmounts" "$state" || true # allow-exit-suppress: the export already warned loudly; a lost audit copy must not block teardown of an otherwise-complete session
+  fi
+  local extracted=false
+  [[ "$seeded" == 1 ]] && extracted=true
+  _stack_update_manifest "$state" "$workload_rc" "$extracted" || true # allow-exit-suppress: manifest bookkeeping already warns; it must not block teardown
 
+  # Adopted spare: release the claim ahead of BOTH teardown branches — the work is
+  # extracted, so even a failed teardown's leftovers are safe for gc to reap.
+  _stack_release_adopted_claim
   if [[ "$ephemeral" == "true" ]]; then
     _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || return 1
   else
@@ -586,5 +1046,235 @@ stack_run() {
     }
     as_info "volumes kept (ephemeral=false): docker volume ls --filter label=com.docker.compose.project=$project"
   fi
+  [[ "$_STACK_SESSION_CLAIMED" == 1 ]] && _stack_session_release "$project"
   return "$workload_rc"
+}
+
+# _stack_release_adopted_claim — release the adopted spare's claim lock (a no-op
+# for cold-booted sessions).
+_stack_release_adopted_claim() {
+  [[ "$_STACK_ADOPTED" == 1 ]] || return 0
+  _prewarm_release "$_STACK_PROJECT"
+}
+
+# _stack_adoption_eligible WORKLOAD_JSON — 0 iff this launch may adopt a spare:
+# seed mode, ephemeral, and no deterministic identity (session_id, resume_from,
+# and AGENT_SANDBOX_PROJECT_NAME all absent). Deterministic-identity sessions
+# always cold-boot: their pre-up probes, kept volumes, and manifest lifecycles
+# assume a stack this launch created under its own name.
+_stack_adoption_eligible() {
+  local workload="$1"
+  [[ -z "${AGENT_SANDBOX_PROJECT_NAME:-}" ]] || return 1
+  jq -e 'has("seed_from_git") and .ephemeral == true and ((has("session_id") or has("resume_from")) | not)' "$workload" >/dev/null
+}
+
+# _stack_abandon_candidate PROJECT STATE EXTRA_IDX — undo a partially-adopted
+# candidate so the loop can try the next spare (or fall back to cold): drop the
+# spare's prewarm override from the compose file set (EXTRA_IDX < 0 = never
+# appended), remove the adopted marker, release the claim.
+_stack_abandon_candidate() {
+  local project="$1" state="$2" extra_idx="$3"
+  [[ "$extra_idx" -ge 0 ]] && unset "_STACK_EXTRA_COMPOSE[$extra_idx]"
+  rm -f "$state/prewarm-adopted"
+  _prewarm_release "$project"
+}
+
+# _stack_export_session_net BASE — export the per-session address family derived
+# from a /24's base (BASE = e.g. 172.30.9): the subnet, firewall .2, app .3,
+# audit .4, and the .128/25 dynamic range — the same layout export_sandbox_subnet
+# lays down. Adoption swaps the WHOLE family to the spare's: any member left at
+# the fresh allocation (a .4 outside the spare's /24) would make compose reject
+# the service's static claim at the re-up.
+_stack_export_session_net() {
+  local b="$1"
+  export SANDBOX_SUBNET="$b.0/24" SANDBOX_IP="$b.2" SANDBOX_IP_APP="$b.3" SANDBOX_IP_AUDIT="$b.4" SANDBOX_IP_RANGE="$b.128/25"
+}
+
+# _stack_try_adopt WORKLOAD_JSON COMPOSE RUNTIME — run this launch on a prewarmed
+# spare when one matches: compute the spec hash, discover running spares carrying
+# it (labels are discovery only), claim one atomically, take over its project name
+# + state dir as this session's identity, re-enter `up -d --wait` through the same
+# compose choke point (idempotent — re-proves firewall/hardener/audit health under
+# this launch's live env), and verify /workspace is EMPTY (a non-empty spare is
+# corrupt). 0 = adopted, with the _STACK_* seam globals set for
+# stack_serve_workload. Every failure — no hash, no candidate, lost claim race,
+# broken re-up, corrupt workspace — returns 1 so the caller cold-boots: adoption
+# must never block a launch.
+_stack_try_adopt() {
+  local workload="$1" compose="$2" runtime="$3"
+  local sandbox_dir spec_hash
+  sandbox_dir="$(cd "$(dirname "$compose")" && pwd)"
+  # The spec hash digests both image Ids, so the firewall image must exist first.
+  stack_ensure_firewall_image "$sandbox_dir" || return 1
+  spec_hash="$(prewarm_spec_hash "$workload" "$compose" "$runtime" ${_STACK_EXTRA_COMPOSE[@]+"${_STACK_EXTRA_COMPOSE[@]}"})" || return 1
+  local -a candidates=()
+  local cand
+  while IFS= read -r cand; do
+    [[ -n "$cand" ]] && candidates+=("$cand")
+  done < <(docker ps -q --filter label=agent-sandbox.prewarm=ready --filter "label=agent-sandbox.prewarm-spec=$spec_hash" 2>/dev/null)
+  ((${#candidates[@]})) || return 1
+  # Adoption swaps this launch's fresh subnet for the spare's (the spare's network
+  # is already up under it); keep the fresh one restorable for the cold fallback.
+  local orig_base="${SANDBOX_SUBNET%.*}"
+  local project state cid probe subnet
+  for cand in "${candidates[@]}"; do
+    project="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$cand" 2>/dev/null)" || continue
+    # The project rides into docker filters and state paths — accept only the
+    # launcher's own prewarm naming.
+    [[ "$project" =~ ^agent-sandbox-prewarm-[0-9a-f]{8}$ ]] || continue
+    _prewarm_claim "$project" || continue
+    state="$(_stack_state_dir "$project")"
+    # The adopted marker keeps gc off this stack even after the claim goes stale:
+    # a crashed adopter's kept-for-rescue volumes must not be reaped as a spare.
+    if ! touch "$state/prewarm-adopted" 2>/dev/null ||
+      ! subnet="$(jq -er '.subnet' "$state/prewarm.json" 2>/dev/null)" ||
+      [[ ! "$subnet" =~ ^172\.[0-9]+\.[0-9]+\.0/24$ ]] ||
+      [[ ! -f "$state/workload-override.json" || ! -f "$state/overmount-override.json" || ! -f "$state/prewarm-override.json" ]]; then
+      _stack_abandon_candidate "$project" "$state" -1
+      continue
+    fi
+    _stack_export_session_net "${subnet%.*}"
+    if ! _stack_export_launch_env "$workload" "$runtime"; then
+      _stack_abandon_candidate "$project" "$state" -1
+      _stack_export_session_net "$orig_base"
+      continue
+    fi
+    # Count-as-index is safe here (same idiom as bring-up's env_idx): only the
+    # LAST-appended element is ever unset, so the array never holes below its max.
+    local extra_idx=${#_STACK_EXTRA_COMPOSE[@]}
+    _STACK_EXTRA_COMPOSE+=("$state/prewarm-override.json")
+    local override="$state/workload-override.json" overmounts="$state/overmount-override.json"
+    if ! _stack_compose "$project" "$compose" "$override" "$overmounts" up -d --wait --wait-timeout 240 ||
+      ! cid="$(_stack_compose "$project" "$compose" "$override" "$overmounts" ps -q workload)" ||
+      [[ -z "$cid" ]]; then
+      _stack_abandon_candidate "$project" "$state" "$extra_idx"
+      _stack_export_session_net "$orig_base"
+      continue
+    fi
+    # A spare's contract is an EMPTY workspace about to be seeded. The probe must
+    # POSITIVELY prove emptiness (echo EMPTY) — a failed exec printing nothing
+    # must read as corrupt, not as empty.
+    probe="$(docker exec -u "$WORKLOAD_USER" "$cid" sh -c 'if [ -n "$(ls -A /workspace 2>/dev/null)" ]; then echo NONEMPTY; elif [ -d /workspace ]; then echo EMPTY; fi' 2>/dev/null)"
+    if [[ "$probe" != "EMPTY" ]]; then
+      as_warn "prewarm spare $project has a non-empty or unverifiable /workspace — skipping it as corrupt"
+      _stack_abandon_candidate "$project" "$state" "$extra_idx"
+      _stack_export_session_net "$orig_base"
+      continue
+    fi
+    _STACK_PROJECT="$project"
+    _STACK_STATE="$state"
+    _STACK_CID="$cid"
+    _STACK_OVERRIDE="$override"
+    _STACK_OVERMOUNTS="$overmounts"
+    _STACK_SESSION_ID=""
+    _STACK_RESUME_FROM=""
+    _STACK_REATTACH=0
+    _STACK_EPHEMERAL="true"
+    _STACK_PRIOR_BASE_COMMIT=""
+    _STACK_PRIOR_REVIEW_BRANCH=""
+    _STACK_ADOPTED=1
+    as_info "adopted prewarmed spare $project"
+    return 0
+  done
+  _stack_export_session_net "$orig_base"
+  return 1
+}
+
+# stack_prewarm WORKLOAD_JSON COMPOSE RUNTIME [EXTRA_COMPOSE...] — bring a stack
+# up to just before serving (firewall healthy, hardener done, guardrails held,
+# /workspace empty) and LEAVE it running as an adoptable spare: labeled with the
+# spec hash for discovery, its subnet recorded for the adopter's idempotent
+# re-up, no workload env/secret_env baked (both are delivered at adoption exec
+# time). Prints the spare's compose project name on success.
+stack_prewarm() {
+  local workload="$1" compose="$2" runtime="$3"
+  shift 3
+  _STACK_EXTRA_COMPOSE=("$@")
+  local sandbox_dir spec_hash project state created
+  sandbox_dir="$(cd "$(dirname "$compose")" && pwd)"
+  # The spec hash digests both image Ids, so the firewall image must exist first.
+  stack_ensure_firewall_image "$sandbox_dir" || return 1
+  if ! spec_hash="$(prewarm_spec_hash "$workload" "$compose" "$runtime" "$@")"; then
+    as_error "could not compute the prewarm spec hash — is the workload image ($(jq -r '.image' "$workload")) present on this docker engine?"
+    return 1
+  fi
+  project="agent-sandbox-prewarm-$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n')"
+  state="$(_stack_state_dir "$project")"
+  worktree_secure_mkdir "$state" || return 1
+  created="$(date +%s)"
+  prewarm_write_override "$spec_hash" "$created" "$state/prewarm-override.json" || {
+    as_error "could not generate the prewarm labels override"
+    return 1
+  }
+  _STACK_EXTRA_COMPOSE+=("$state/prewarm-override.json")
+  # A spare bakes NO workload env/secret_env; its identity rides the project-name
+  # seam so every compose call of this bring-up lands on the spare's stack.
+  _STACK_STAGE_ENV=0
+  AGENT_SANDBOX_PROJECT_NAME="$project"
+  export AGENT_SANDBOX_PROJECT_NAME
+  if ! stack_bring_up "$workload" "$compose" "$runtime"; then
+    _STACK_STAGE_ENV=1
+    return 1
+  fi
+  _STACK_STAGE_ENV=1
+  # The adoption manifest records the subnet/ip the spare's network came up under:
+  # an adopting launch re-enters `up` with THESE (not its own fresh allocation) so
+  # compose reconciles the running stack instead of recreating its network.
+  #
+  # This write is the spare's BAKE WITNESS, and it is deliberately the LAST thing
+  # stack_prewarm does: the `ready` label is stamped by compose at container CREATE
+  # (before the guardrail gate stack_bring_up holds), so the label alone can't prove
+  # a spare finished booting. Adoption reads prewarm.json for the subnet and abandons
+  # any candidate missing it — so a spare interrupted mid-boot (before this line) is
+  # never usefully claimed, even though it already carries the ready label.
+  if ! (umask 077 && jq -n --arg project "$project" --arg spec "$spec_hash" --arg subnet "$SANDBOX_SUBNET" --argjson created "$created" '{project: $project, spec: $spec, subnet: $subnet, created: $created}' >"$state/prewarm.json"); then
+    as_error "could not write the prewarm manifest $state/prewarm.json — tearing the unusable spare down"
+    _stack_down_ephemeral "$project" "$compose" "$_STACK_OVERRIDE" "$_STACK_OVERMOUNTS" || true # allow-exit-suppress: best-effort cleanup of a spare refused at manifest write; the prewarm already failed loudly
+    return 1
+  fi
+  as_info "prewarm spare ready: $project (spec $spec_hash)"
+  printf '%s\n' "$project"
+}
+
+# stack_run WORKLOAD_JSON COMPOSE RUNTIME [EXTRA_COMPOSE...] — the whole session:
+# bring the stack up (adopting a matching prewarmed spare when eligible, else
+# stack_bring_up), then seed → exec → extract → export → teardown
+# (stack_serve_workload). Returns the workload's exit status when the session
+# machinery succeeded; machinery failures return non-zero themselves.
+# Reads SANDBOX_IP/SANDBOX_SUBNET from the caller (export_sandbox_subnet).
+# EXTRA_COMPOSE files are consumer overlays merged after the library's file set on
+# EVERY compose invocation of this session (see _stack_compose). The compose project
+# name is randomized per session unless the consumer pins its own identity via
+# AGENT_SANDBOX_PROJECT_NAME (its lifecycle tooling finds the stack by that label).
+stack_run() {
+  local workload="$1" compose="$2" runtime="$3"
+  shift 3
+  _STACK_EXTRA_COMPOSE=("$@")
+  _STACK_STAGE_ENV=1
+  _STACK_ADOPTED=0
+
+  # tty is a runtime precondition, not a file field: an interactive entrypoint needs a
+  # real terminal on the launcher's stdin. Check it BEFORE bringing anything up so we
+  # fail fast instead of tearing down a healthy stack we could never attach to. Kept
+  # out of stack_bring_up: a spare brought up for later adoption never execs, so tty
+  # is the serving launch's concern, not bring-up's.
+  _STACK_WANT_TTY=false
+  if [[ "$(jq -r '.tty // false' "$workload")" == "true" ]]; then
+    [[ -t 0 ]] || {
+      as_error "workload.tty is true but the launcher's stdin is not a TTY — run agent-sandbox from an interactive terminal, or set tty:false"
+      return 1
+    }
+    _STACK_WANT_TTY=true
+  fi
+
+  local adopted=0
+  if _stack_adoption_eligible "$workload"; then
+    if _stack_try_adopt "$workload" "$compose" "$runtime"; then
+      adopted=1
+    fi
+  fi
+  if [[ "$adopted" == 0 ]]; then
+    stack_bring_up "$workload" "$compose" "$runtime" || return 1
+  fi
+  stack_serve_workload "$workload" "$compose"
 }

@@ -22,6 +22,65 @@ the prose from the release's commits.
 
 ### Added
 
+- Warm-start pool (issue #34): `agent-sandbox prewarm <workload.json>` runs the
+  multi-second bring-up ahead of time and leaves the stack running as an
+  adoptable spare (firewall healthy, guardrails verified, empty workspace),
+  labeled with a spec hash of everything that shaped the boot.
+  - A later seed-mode, ephemeral `run` without `session_id`/`resume_from`
+    whose spec hash matches adopts the spare: claims it atomically (mkdir
+    claim locks — labels are discovery-only), re-proves the stack's health
+    through the same compose choke point, verifies the workspace is empty,
+    seeds into the already-running container, and serves as normal. Any
+    mismatch or failure falls back to a cold boot — adoption never blocks a
+    launch.
+  - The prewarm record's `env`/`secret_env` are accepted but never baked into
+    the spare; the adopting run delivers its own env at exec time
+    (`docker exec --env-file`, 0600, unlinked after) and secrets over the
+    same stdin-only machinery as a cold boot. `workspace_mount`,
+    `session_id`, and `resume_from` are refused by `prewarm`.
+  - `agent-sandbox gc` now also reaps spares older than
+    `AGENT_SANDBOX_PREWARM_MAX_AGE` seconds (default 86400) with volumes
+    verified gone, and removes claim locks whose owning process died;
+    `--dry-run` previews both.
+  - `run --prewarm-next` opts a launch into replenishing the pool: after the
+    session it boots a fresh spare of the same workload in the background (a
+    detached `prewarm`), so the next launch can adopt it — the pool does not
+    otherwise self-replenish. Refused for the records `prewarm` refuses;
+    `AGENT_SANDBOX_NO_PREWARM=1` disables the spawn.
+  - The spec hash also digests each seccomp profile the compose file
+    references (a profile edited in place would otherwise not move the hash
+    nor force a recreate at the adoption re-up).
+- Persistent sessions (issue #33): `ephemeral: false` is now a real lifecycle.
+  - `session_id` Workload field: a stable identity making the compose project
+    name the deterministic `agent-sandbox-<session_id>` (mutually exclusive with
+    the low-level `AGENT_SANDBOX_PROJECT_NAME` override). Running the same
+    `session_id` against its stopped stack **re-attaches** — same volumes,
+    seeding skipped, this leg's commits extracted onto the same review branch; a
+    still-running session is refused. A stale seed (the checkout moved since)
+    warns and continues; the new `run --reseed` flag is the loud, destructive
+    opt-in to discard and re-seed.
+  - `resume_from` Workload field: seed a FRESH session reproducing where a prior
+    session left off — the workspace is seeded from the prior session's recorded
+    base commit, its review branch's commits are replayed on top (an
+    uncommitted-changes fold is soft-reset back into an uncommitted overlay), and
+    the new work extracts onto a new review branch.
+  - Audit continuity: before teardown the launcher now exports the audit sink's
+    chained `audit.jsonl` and per-session HMAC `audit.secret` (owner-only) beside
+    the egress log; on resume the prior log is mounted read-only at
+    `/var/log/agent-sandbox/audit.prior.jsonl` in the new audit container, so the
+    prior chain stays verifiable while the new session mints a fresh secret. The
+    export folds any mounted prior chain ahead of the live log, so continuity is
+    transitive across a multi-hop resume chain (A→B→C carries A's events into C).
+  - Concurrent runs of the same deterministic identity are serialized by a
+    host-side session-attach lock (atomic mkdir under the runtime dir), so two
+    launches can never both re-attach and extract onto one stack; the loser is
+    refused, and a lock left by a crashed launcher is reclaimed as stale.
+  - Seed-mode sessions record a session manifest
+    (`sessions/<project>/session.json`, owner-only) carrying identity and seed
+    provenance (base commit, extract base, review branch, repo root, outcome).
+- `seed_from_git.ref` now accepts any commit-ish (branch, tag, sha), seeding that
+  ref's committed tree (no WIP capture); `HEAD` keeps its tracked-tree +
+  uncommitted-delta behavior. An unresolvable ref refuses the launch.
 - Bind mode (`workspace_mount`) is now a first-class, guarded consumer path:
   - `workspace_mount` and `seed_from_git` are mutually exclusive — a record
     carrying both is rejected by the schema and refused loudly by the launcher

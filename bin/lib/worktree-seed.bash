@@ -108,6 +108,11 @@ _wt_run() {
   fi
 }
 
+# The subject of the commit the extract FOLDS a session's uncommitted tree state into
+# (worktree_container_extract). The resume path reads it back (worktree_tip_is_wip_fold)
+# to soft-reset that fold into an uncommitted overlay, so both sides share one constant.
+WORKTREE_WIP_FOLD_SUBJECT="chore: uncommitted changes at session end"
+
 # _wt_user — the uid (or name) the workload runs as inside the container. Every
 # in-container seed/extract exec runs as this user so the seeded tree and the
 # extract's commits carry the same ownership as the workload's own writes. The
@@ -176,6 +181,18 @@ worktree_stage_seed() {
     as_error "worktree seed: could not build the working-tree seed tar from $repo_root"
     return 1
   fi
+}
+
+# worktree_seed_tar_ref <repo_root> <ref> — write the COMMITTED tree of <ref> (any
+# commit-ish the caller has already resolved) as a tar to stdout: the seed source for
+# an arbitrary-ref seed_from_git and for a resume (both seed a pinned commit, never the
+# working tree, so there is no WIP delta to capture — the caller records an empty
+# wip.patch, whose emptiness downstream means "nothing uncommitted"). `git archive`
+# emits repo-relative members only and never descends into a submodule's gitlink, so
+# the extract side's no--P containment holds exactly as for the ls-files tar.
+worktree_seed_tar_ref() {
+  local repo_root="$1" ref="$2"
+  git -C "$repo_root" archive --format=tar "$ref"
 }
 
 # worktree_capture_wip_patch [dir] — write <dir>'s uncommitted tracked delta
@@ -365,18 +382,53 @@ worktree_container_seed_head() {
 # empty trailing commit.
 worktree_container_extract() {
   local container_id="$1" base_ref="$2"
-  # shellcheck disable=SC2016  # $1 expands inside the container shell, not here.
+  # shellcheck disable=SC2016  # $1/$2 expand inside the container shell, not here.
   _wt_run docker exec -u "$(_wt_user)" "$container_id" sh -c '
     cd /workspace || exit 1
     git add -A || exit 1
     if ! git diff --cached --quiet; then
-      git commit -q --no-verify -m "chore: uncommitted changes at session end" || exit 1
+      git commit -q --no-verify -m "$2" || exit 1
     fi
     git format-patch -q --stdout --binary "$1"..HEAD
-  ' sh "$base_ref"
+  ' sh "$base_ref" "$WORKTREE_WIP_FOLD_SUBJECT"
 }
 
-# _worktree_add_locked <repo_root> <wt_dir> <branch> <base_commit> — `git worktree add`,
+# worktree_tip_is_wip_fold <repo_root> <branch> — 0 iff <branch>'s tip commit is the
+# extract's uncommitted-changes fold (subject == WORKTREE_WIP_FOLD_SUBJECT). A resume
+# reads this to decide whether the replayed tip must be soft-reset back into an
+# UNCOMMITTED overlay, so the new session starts exactly where the old one left off
+# rather than with the overlay spuriously committed.
+worktree_tip_is_wip_fold() {
+  local repo_root="$1" branch="$2" subject
+  subject="$(git -C "$repo_root" log -1 --format=%s "$branch" 2>/dev/null)" || return 1
+  [[ "$subject" == "$WORKTREE_WIP_FOLD_SUBJECT" ]]
+}
+
+# worktree_container_apply_mbox <container_id> — replay a format-patch mbox from stdin
+# onto <container_id>'s /workspace repo HEAD (`git am`, as the workload user): the
+# resume path's reconstruction of a prior session's commits on top of the fresh seed.
+# The caller must skip an EMPTY mbox (git am refuses empty input). Fail-loud.
+worktree_container_apply_mbox() {
+  local container_id="$1"
+  if ! docker exec -i -u "$(_wt_user)" "$container_id" sh -c 'cd /workspace && git am -q'; then
+    as_error "worktree seed: could not replay the prior session's commits into $container_id"
+    return 1
+  fi
+}
+
+# worktree_container_soft_reset_tip <container_id> — `git reset --mixed HEAD~1` in
+# <container_id>'s /workspace: turn a replayed uncommitted-changes fold back into the
+# uncommitted overlay it recorded, so a resumed agent sees the prior session's
+# working-tree state, not a synthetic commit. Fail-loud.
+worktree_container_soft_reset_tip() {
+  local container_id="$1"
+  if ! docker exec -u "$(_wt_user)" "$container_id" sh -c 'cd /workspace && git reset -q --mixed HEAD~1'; then
+    as_error "worktree seed: could not soft-reset the replayed uncommitted-changes fold in $container_id"
+    return 1
+  fi
+}
+
+# _worktree_add_locked <repo_root> <worktree-add-args...> — `git worktree add`,
 # serialized across simultaneous teardowns. git writes each new worktree's admin files
 # under the shared $GIT_DIR/worktrees/ and reads its siblings to validate the set, so two
 # concurrent adds race on a half-written `commondir` (surfaces as the opaque "fatal: failed
@@ -384,9 +436,10 @@ worktree_container_extract() {
 # unlocked where flock is absent (macOS) or the lock won't engage — the lock can never
 # prevent the add itself, so a lock hiccup can't turn into a lost branch.
 _worktree_add_locked() {
-  local repo_root="$1" wt_dir="$2" branch="$3" base_commit="$4"
+  local repo_root="$1"
+  shift
   local lock="$repo_root/.git/as-worktree-add.lock"
-  with_lock "$lock" _wt_run git -C "$repo_root" worktree add -q "$wt_dir" -b "$branch" "$base_commit"
+  with_lock "$lock" _wt_run git -C "$repo_root" worktree add -q "$@"
 }
 
 # worktree_host_apply <repo_root> <base_commit> <branch> <wt_dir> <wip_patch> <agent_mbox>
@@ -394,16 +447,24 @@ _worktree_add_locked() {
 # worktree at <wt_dir> on <branch> from <base_commit> (the launch-time HEAD), replays the
 # user's launch-time uncommitted delta <wip_patch> as the first commit (so the tree
 # matches the container's WIP root), then `git am`s the agent's <agent_mbox> patch-series
-# on top. The result is <base_commit> ← WIP(uncommitted) ← agent commits. Fail-loud: any
-# failure returns non-zero AND aborts a half-applied `git am` so a partial branch is never
-# left behind. An empty <wip_patch> or <agent_mbox> is skipped (clean tree / no agent work).
+# on top. The result is <base_commit> ← WIP(uncommitted) ← agent commits. When <branch>
+# ALREADY exists (a re-attached persistent session's later leg extracting onto the branch
+# its first leg created), the worktree checks it out as-is — no -b, and the WIP replay is
+# skipped (the leg that created the branch already replayed it) — so the new series lands
+# on top of the prior legs' commits. Fail-loud: any failure returns non-zero AND aborts a
+# half-applied `git am` so a partial branch is never left behind. An empty <wip_patch> or
+# <agent_mbox> is skipped (clean tree / no agent work).
 worktree_host_apply() {
   local repo_root="$1" base_commit="$2" branch="$3" wt_dir="$4" wip_patch="$5" agent_mbox="$6"
-  if ! _worktree_add_locked "$repo_root" "$wt_dir" "$branch" "$base_commit"; then
+  local branch_exists=0
+  git -C "$repo_root" show-ref --verify --quiet "refs/heads/$branch" && branch_exists=1
+  local -a add_args=("$wt_dir" -b "$branch" "$base_commit")
+  [[ "$branch_exists" == 1 ]] && add_args=("$wt_dir" "$branch")
+  if ! _worktree_add_locked "$repo_root" "${add_args[@]}"; then
     as_error "worktree extract: could not create the host worktree $wt_dir on $branch"
     return 1
   fi
-  if [[ -s "$wip_patch" ]]; then
+  if [[ "$branch_exists" == 0 && -s "$wip_patch" ]]; then
     if ! _wt_run git -C "$wt_dir" apply --index "$wip_patch"; then
       as_error "worktree extract: could not replay your uncommitted changes onto $branch"
       return 1
@@ -456,16 +517,27 @@ seed_branch_name() {
   printf 'sandbox/%s\n' "${1#ephemeral-}"
 }
 
-# worktree_print_merge_hint <branch> — at seed-mode teardown, tell the user where the workload's
-# work landed and the commands to bring it into their checkout. Reports only: never prompts,
-# never touches the host branch (the user reviews and merges on their own terms).
+# worktree_print_merge_hint <branch> [keep] — at seed-mode teardown, tell the user where the
+# workload's work landed and the commands to bring it into their checkout. Reports only: never
+# prompts, never touches the host branch (the user reviews and merges on their own terms).
+# keep=1 (a persistent session): the next re-attach leg extracts onto this same branch, so the
+# hint must NOT instruct deletion — a followed `git branch -d` would strand that extract base.
 worktree_print_merge_hint() {
   # Set the hint off with terminal-width top/bottom rules and centered content rather
   # than a full box: a box's side borders get dragged into the selection when the user
   # copies the command out. as_rule_frame (msg.bash) is the shared renderer the doctor
   # verdict mirrors.
+  local branch="$1" keep="${2:-0}"
+  if [[ "$keep" == 1 ]]; then
+    as_rule_frame \
+      "The workload's changes are on branch $branch." \
+      "Bring them into your checkout with:" \
+      "git merge $branch" \
+      "(keep the branch — re-attaching this session extracts onto it again)"
+    return 0
+  fi
   as_rule_frame \
-    "The workload's changes are on branch $1." \
+    "The workload's changes are on branch $branch." \
     "Bring them into your checkout with:" \
-    "git merge $1 && git branch -d $1"
+    "git merge $branch && git branch -d $branch"
 }

@@ -80,6 +80,16 @@
       "type": "boolean",
       "description": "When true, the workload's volumes are throwaway and torn down on exit; teardown fails loud on any survivor (the guarantee is verified, not assumed)."
     },
+    "session_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,40}(?![\\s\\S])",
+      "description": "Stable session identity: the compose project name becomes the deterministic agent-sandbox-<session_id> instead of a random per-launch suffix, so a later `run` with the same session_id finds this session's stopped stack and re-attaches to its kept volumes (ephemeral must be false for anything to survive). Mutually exclusive with the low-level AGENT_SANDBOX_PROJECT_NAME env override — a session has exactly one identity. The charset is compose-project-safe (lowercase alphanumerics, '_', '-'; must start alphanumeric; at most 41 chars)."
+    },
+    "resume_from": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,40}(?![\\s\\S])",
+      "description": "A PRIOR session_id whose outputs (review branch + exported state) seed a FRESH session reproducing where that session left off: the workspace is seeded from the prior session's recorded base commit (seed_from_git.ref is ignored), the prior review branch's commits are replayed on top (an uncommitted-changes fold is soft-reset back into an uncommitted overlay), and the prior session's exported audit log is mounted read-only beside the new sink's log at audit.prior.jsonl. Requires seed_from_git, must differ from session_id, and seed_from_git.review_branch must differ from the prior session's."
+    },
     "seed_from_git": {
       "type": "object",
       "additionalProperties": false,
