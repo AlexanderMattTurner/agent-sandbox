@@ -139,6 +139,24 @@ prewarm_spec_hash() {
   printf '%s\n' "${lines[@]}" | _prewarm_sha256 | cut -c1-16
 }
 
+# prewarm_ready_spare_exists SPEC_HASH — 0 iff a running, UNCLAIMED spare labeled
+# with this spec hash exists, i.e. replenishing now would only pile spares. A
+# claimed candidate is being consumed by an adoption in flight, and a container
+# outside the launcher's own prewarm project naming is not ours — neither may
+# suppress replenishment. Purely a dedup probe: a false negative costs one extra
+# spare, a false positive one cold boot.
+prewarm_ready_spare_exists() {
+  local spec="$1" cid project
+  while IFS= read -r cid; do
+    [[ -n "$cid" ]] || continue
+    project="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$cid" 2>/dev/null)" || continue
+    [[ "$project" =~ ^agent-sandbox-prewarm-[0-9a-f]{8}$ ]] || continue
+    [[ -d "$PREWARM_CLAIM_DIR/$project" ]] && continue
+    return 0
+  done < <(docker ps -q --filter label=agent-sandbox.prewarm=ready --filter "label=agent-sandbox.prewarm-spec=$spec" 2>/dev/null)
+  return 1
+}
+
 # prewarm_gc — spare hygiene for `agent-sandbox gc`: reap running spares whose
 # age (agent-sandbox.prewarm-created label) exceeds AGENT_SANDBOX_PREWARM_MAX_AGE
 # seconds (default 86400) via a full compose down --volumes (verified fail-loud),
@@ -207,18 +225,26 @@ prewarm_gc() {
   return "$rc"
 }
 
-# prewarm_spawn_next SELF WORKLOAD [EXTRA_COMPOSE...] — replenish the pool after a
-# `run --prewarm-next`: launch `SELF prewarm WORKLOAD [--extra-compose EXTRA]...`
-# fully detached so a fresh spare is ready for the next launch. The pool does NOT
-# self-replenish otherwise (an opt-in flag, unlike a per-launch auto-replenish), so
-# each --prewarm-next spawns exactly one spare; extras age out via prewarm_gc. The
-# spawn is best-effort: a failure to detach must never fail the completed run.
+# prewarm_spawn_next SELF WORKLOAD COMPOSE RUNTIME [EXTRA_COMPOSE...] — replenish
+# the pool after a `run --prewarm-next`: launch `SELF prewarm WORKLOAD
+# [--extra-compose EXTRA]...` fully detached so a fresh spare is ready for the next
+# launch. The pool does NOT self-replenish otherwise (an opt-in flag, unlike a
+# per-launch auto-replenish), and an unclaimed ready spare for this spec already
+# waiting skips the spawn — repeated --prewarm-next runs top the pool up to one
+# spare instead of piling extras. The spawn is best-effort: a failure to hash or
+# detach must never fail the completed run.
 # AGENT_SANDBOX_PREWARM_CMD overrides the launched command (tests point it at a
 # recorder); AGENT_SANDBOX_NO_PREWARM=1 disables the spawn entirely.
 prewarm_spawn_next() {
-  local self="$1" workload="$2"
-  shift 2
+  local self="$1" workload="$2" compose="$3" runtime="$4"
+  shift 4
   [[ -z "${AGENT_SANDBOX_NO_PREWARM:-}" ]] || return 0
+  local spec
+  if ! spec="$(prewarm_spec_hash "$workload" "$compose" "$runtime" "$@")"; then
+    as_warn "prewarm-next: could not compute the prewarm spec hash — skipping replenishment"
+    return 0
+  fi
+  prewarm_ready_spare_exists "$spec" && return 0
   local -a cmd=()
   if [[ -n "${AGENT_SANDBOX_PREWARM_CMD:-}" ]]; then
     # A test-provided recorder command, word-split deliberately, then the workload.

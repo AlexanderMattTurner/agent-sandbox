@@ -11,13 +11,15 @@ import json
 import os
 import re
 import subprocess
-import time
+
+import pytest
 
 from tests._helpers import (
     REPO_ROOT,
     commit_all,
     git_env,
     init_test_repo,
+    wait_for,
     write_exe,
 )
 
@@ -181,17 +183,6 @@ def test_prewarm_refuses_resume_from(tmp_path):
     assert "compose" not in log
 
 
-def test_run_prewarm_next_refuses_an_unprewarmable_workload(tmp_path):
-    """--prewarm-next spawns a spare of THIS workload, so it is refused up front for
-    the records `prewarm` itself refuses (a spare could never serve them)."""
-    r, log = _run(
-        tmp_path, "run", {**SEEDED, "session_id": "sid1"}, argv_tail=("--prewarm-next",)
-    )
-    assert r.returncode != 0
-    assert "prewarm refuses session_id/resume_from" in r.stderr
-    assert "compose" not in log
-
-
 def test_run_prewarm_next_spawns_a_background_spare(tmp_path):
     """An eligible run with --prewarm-next replenishes the pool: after the session it
     launches a detached prewarm of the same workload (recorded via the CMD override)."""
@@ -214,10 +205,7 @@ def test_run_prewarm_next_spawns_a_background_spare(tmp_path):
     assert "prewarm-next: spawned a background spare" in r.stderr
     # The detached recorder was handed the workload path (poll — it runs after the
     # launcher exits).
-    deadline = time.time() + 5
-    while time.time() < deadline and not marker.exists():
-        time.sleep(0.05)
-    assert marker.exists(), "the detached prewarm command never ran"
+    assert wait_for(marker.exists), "the detached prewarm command never ran"
     assert marker.read_text().strip().endswith("workload.json")
 
 
@@ -240,8 +228,7 @@ def test_run_prewarm_next_honors_the_no_prewarm_optout(tmp_path):
     )
     assert r.returncode == 0, r.stderr
     assert "prewarm-next: spawned" not in r.stderr
-    time.sleep(0.3)
-    assert not marker.exists()
+    assert not wait_for(marker.exists, deadline_s=0.5)
 
 
 def test_prewarm_refuses_an_invalid_record_like_run_does(tmp_path):
@@ -606,3 +593,75 @@ def test_non_ephemeral_workload_never_probes_for_spares(tmp_path):
     )
     assert r.returncode == 0, r.stderr
     assert "label=agent-sandbox.prewarm=ready" not in log
+
+
+# ── run --prewarm-next: opt-in replenishment ────────────────────────
+
+
+def _rec_env(tmp_path):
+    """A recorder standing in for the spawned prewarm (AGENT_SANDBOX_PREWARM_CMD),
+    plus the marker file it writes its argv to."""
+    rec = tmp_path / "record-spawn"
+    write_exe(rec, '#!/usr/bin/env bash\nprintf "%s\\n" "$@" >>"$SPAWN_MARKER"\n')
+    marker = tmp_path / "spawned.txt"
+    return {
+        "AGENT_SANDBOX_PREWARM_CMD": str(rec),
+        "SPAWN_MARKER": str(marker),
+    }, marker
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("workspace_mount", None),  # None: filled with a real dir per test
+        ("session_id", "sid1"),
+        ("resume_from", "sid0"),
+    ],
+)
+def test_run_prewarm_next_refuses_unprewarmable_workloads(tmp_path, field, value):
+    """The same refusal set as `prewarm` itself, one case per member, reported
+    BEFORE the session runs — a spare could never be booted for these records."""
+    wl = dict(SEEDED)
+    if field == "workspace_mount":
+        del wl["seed_from_git"]
+        value = str(tmp_path / "ws")
+        (tmp_path / "ws").mkdir()
+    r, log = _run(tmp_path, "run", {**wl, field: value}, argv_tail=("--prewarm-next",))
+    assert r.returncode != 0
+    assert "prewarm refuses" in r.stderr
+    assert "compose" not in log  # refused before anything was launched
+
+
+def test_run_prewarm_next_skips_when_a_ready_spare_exists(tmp_path):
+    """A non-ephemeral run never adopts, so the fake docker's ready spare is
+    still there at session end — replenishing would only pile spares."""
+    repo = _repo(tmp_path)
+    env, marker = _rec_env(tmp_path)
+    r, log = _run(
+        tmp_path,
+        "run",
+        {**SEEDED, "ephemeral": False},
+        extra_env={**env, **_spare_env()},
+        cwd=repo,
+        argv_tail=("--prewarm-next",),
+    )
+    assert r.returncode == 0, r.stderr
+    assert "prewarm-next: spawned" not in r.stderr
+    assert not wait_for(marker.exists, deadline_s=1.0)
+
+
+def test_run_prewarm_next_preserves_a_failed_launch_exit_status(tmp_path):
+    """The replenish tail must not mask the session's own outcome: a failed
+    launch stays failed, and the spare for the NEXT launch still spawns."""
+    env, marker = _rec_env(tmp_path)
+    r, _ = _run(
+        tmp_path,
+        "run",
+        {**SEEDED, "tty": True},  # stdin is not a TTY here: stack_run fails fast
+        extra_env=env,
+        argv_tail=("--prewarm-next",),
+        cwd=_repo(tmp_path),
+    )
+    assert r.returncode != 0
+    assert "stdin is not a TTY" in r.stderr
+    assert wait_for(marker.exists), "the detached replenish prewarm never ran"

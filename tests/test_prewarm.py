@@ -1,6 +1,7 @@
 """Sourced-function tests for bin/lib/prewarm.bash (issue #34): the claim locks
-that make adopting/reaping a spare single-winner, and the spec hash that gates
-adoption on bring-up equality.
+that make adopting/reaping a spare single-winner, the spec hash that gates
+adoption on bring-up equality, and the `run --prewarm-next` replenishment
+primitives (the ready-spare probe and the detached prewarm spawn).
 
 The claim tests exercise the real mkdir-based lock in a throwaway claim dir; the
 hash tests run against a fake `docker image inspect` on PATH so image identity is
@@ -12,23 +13,35 @@ move) — a member dropped from either side is a real adoption-gate change.
 import json
 import os
 import subprocess
-import time
 
 import pytest
 
-from tests._helpers import REPO_ROOT, write_exe
+from tests._helpers import REPO_ROOT, wait_for, write_exe
 
 PREWARM_LIB = REPO_ROOT / "bin" / "lib" / "prewarm.bash"
+MSG_LIB = REPO_ROOT / "bin" / "lib" / "msg.bash"
 
 # Answers `docker image inspect -f {{.Id}} <image>` with a per-image fake digest
 # (overridable via FAKE_IMAGE_ID_<name> for the sensitivity tests) and fails for
-# images marked missing — the shape prewarm_spec_hash consumes.
+# images marked missing — the shape prewarm_spec_hash consumes. `ps`/`inspect -f`
+# model the ready-spare listing prewarm_ready_spare_exists consumes: FAKE_SPARE_CID
+# holds the candidate cids (space-separated), FAKE_PROJECT_<cid> each one's
+# compose project label.
 FAKE_DOCKER = """#!/usr/bin/env bash
 if [[ "$1 $2" == "image inspect" ]]; then
   img="${*: -1}"
   [[ -n "${FAKE_IMAGE_MISSING:-}" && "$img" == "$FAKE_IMAGE_MISSING" ]] && exit 1
   key="FAKE_IMAGE_ID_${img//[^A-Za-z0-9]/_}"
   echo "${!key:-sha256:fake-$img}"
+  exit 0
+fi
+if [[ "$1" == ps ]]; then
+  [[ -n "${FAKE_SPARE_CID:-}" ]] && printf '%s\\n' $FAKE_SPARE_CID
+  exit 0
+fi
+if [[ "$1 $2" == "inspect -f" ]]; then
+  key="FAKE_PROJECT_${*: -1}"
+  echo "${!key:-}"
   exit 0
 fi
 exit 0
@@ -58,7 +71,7 @@ def _bash(tmp_path, snippet, *args, extra_env=None):
         [
             "bash",
             "-c",
-            f'set -Eeuo pipefail; source "{PREWARM_LIB}"; {snippet}',
+            f'set -Eeuo pipefail; source "{MSG_LIB}"; source "{PREWARM_LIB}"; {snippet}',
             "_",
             *args,
         ],
@@ -333,45 +346,131 @@ def test_spec_hash_fails_closed_when_an_image_is_not_inspectable(tmp_path):
     assert r.stdout.strip() == ""
 
 
-# ── prewarm_spawn_next (run --prewarm-next replenishment) ───────────
+# ── ready-spare probe + prewarm_spawn_next (run --prewarm-next) ─────
+
+READY_PROJECT = "agent-sandbox-prewarm-00c0ffee"
+
+# Records its argv so a test can prove the detached replenish spawn ran the
+# expected `prewarm` command (env rides through the fork).
+REC_STUB = """#!/usr/bin/env bash
+printf '%s\\n' "$*" >"$PREWARM_REC"
+"""
+
+
+def _probe(tmp_path, extra_env=None):
+    r = _bash(
+        tmp_path,
+        'if prewarm_ready_spare_exists "$1"; then echo YES; else echo NO; fi',
+        "0" * 16,
+        extra_env=extra_env,
+    )
+    assert r.returncode == 0, r.stderr
+    return r.stdout.strip()
+
+
+def test_probe_finds_no_spare_when_none_run(tmp_path):
+    assert _probe(tmp_path) == "NO"
+
+
+def test_probe_finds_an_unclaimed_matching_spare(tmp_path):
+    env = {"FAKE_SPARE_CID": "cid1", "FAKE_PROJECT_cid1": READY_PROJECT}
+    assert _probe(tmp_path, extra_env=env) == "YES"
+
+
+def test_probe_skips_a_claimed_spare(tmp_path):
+    (tmp_path / "claims" / READY_PROJECT).mkdir(parents=True)
+    env = {"FAKE_SPARE_CID": "cid1", "FAKE_PROJECT_cid1": READY_PROJECT}
+    assert _probe(tmp_path, extra_env=env) == "NO"
+
+
+def test_probe_skips_a_container_outside_the_prewarm_naming(tmp_path):
+    env = {"FAKE_SPARE_CID": "cid1", "FAKE_PROJECT_cid1": "some-other-stack"}
+    assert _probe(tmp_path, extra_env=env) == "NO"
+
+
+def test_probe_scans_past_a_foreign_candidate_to_a_real_spare(tmp_path):
+    env = {
+        "FAKE_SPARE_CID": "cid1 cid2",
+        "FAKE_PROJECT_cid1": "some-other-stack",
+        "FAKE_PROJECT_cid2": READY_PROJECT,
+    }
+    assert _probe(tmp_path, extra_env=env) == "YES"
+
+
+def _spawn_next(tmp_path, *, self_cmd, extra_env=None, extras=()):
+    """prewarm_spawn_next against a real workload/compose pair (the spec hash is
+    computed live) with a recorder standing in for the launcher self-path."""
+    wl = tmp_path / "wl.json"
+    wl.write_text(json.dumps(BASE_WORKLOAD))
+    compose = tmp_path / "compose.yml"
+    compose.write_text("services: {}\n")
+    rec_out = tmp_path / "rec.out"
+    r = _bash(
+        tmp_path,
+        'prewarm_spawn_next "$@"',
+        str(self_cmd),
+        str(wl),
+        str(compose),
+        "runc",
+        *[str(e) for e in extras],
+        extra_env={"PREWARM_REC": str(rec_out), **(extra_env or {})},
+    )
+    return r, wl, rec_out
 
 
 def test_spawn_next_launches_prewarm_with_extra_compose_and_workload(tmp_path):
     """The default (no CMD override) builds `<self> prewarm --extra-compose <f>...
-    <workload>` and detaches it. A recorder stands in for the launcher self-path."""
-    recorder = tmp_path / "self"
-    write_exe(recorder, '#!/usr/bin/env bash\nprintf "%s\\n" "$@" >>"$SPAWN_MARKER"\n')
-    marker = tmp_path / "spawned.txt"
-    _bash(
+    <workload>` and detaches it."""
+    rec = write_exe(tmp_path / "rec", REC_STUB)
+    extra = tmp_path / "extra.json"
+    extra.write_text('{"services": {}}')
+    r, wl, rec_out = _spawn_next(tmp_path, self_cmd=rec, extras=[extra])
+    assert r.returncode == 0, r.stderr
+    assert wait_for(rec_out.exists), "the detached prewarm spawn never ran"
+    assert rec_out.read_text() == f"prewarm --extra-compose {extra} {wl}\n"
+
+
+def test_spawn_next_command_env_overrides_self(tmp_path):
+    """AGENT_SANDBOX_PREWARM_CMD replaces the launched command wholesale (the
+    recorder gets just the workload path)."""
+    rec = write_exe(tmp_path / "rec", REC_STUB)
+    r, wl, rec_out = _spawn_next(
         tmp_path,
-        'as_info() { :; }; prewarm_spawn_next "$@"',
-        str(recorder),
-        "/wl.json",
-        "/overlay.yml",
-        extra_env={"SPAWN_MARKER": str(marker)},
+        self_cmd="/nonexistent/launcher",
+        extra_env={"AGENT_SANDBOX_PREWARM_CMD": str(rec)},
     )
-    deadline = time.time() + 5
-    while time.time() < deadline and not marker.exists():
-        time.sleep(0.05)
-    assert marker.exists(), "the detached command never ran"
-    assert marker.read_text().splitlines() == [
-        "prewarm",
-        "--extra-compose",
-        "/overlay.yml",
-        "/wl.json",
-    ]
+    assert r.returncode == 0, r.stderr
+    assert wait_for(rec_out.exists), "the detached prewarm spawn never ran"
+    assert rec_out.read_text() == f"{wl}\n"
 
 
 def test_spawn_next_is_a_noop_under_no_prewarm(tmp_path):
-    recorder = tmp_path / "self"
-    write_exe(recorder, '#!/usr/bin/env bash\ntouch "$SPAWN_MARKER"\n')
-    marker = tmp_path / "spawned.txt"
-    _bash(
-        tmp_path,
-        'as_info() { :; }; prewarm_spawn_next "$@"',
-        str(recorder),
-        "/wl.json",
-        extra_env={"SPAWN_MARKER": str(marker), "AGENT_SANDBOX_NO_PREWARM": "1"},
+    rec = write_exe(tmp_path / "rec", REC_STUB)
+    r, _, rec_out = _spawn_next(
+        tmp_path, self_cmd=rec, extra_env={"AGENT_SANDBOX_NO_PREWARM": "1"}
     )
-    time.sleep(0.3)
-    assert not marker.exists()
+    assert r.returncode == 0, r.stderr
+    assert not wait_for(rec_out.exists, deadline_s=1.0)
+
+
+def test_spawn_next_skips_when_a_ready_spare_exists(tmp_path):
+    rec = write_exe(tmp_path / "rec", REC_STUB)
+    r, _, rec_out = _spawn_next(
+        tmp_path,
+        self_cmd=rec,
+        extra_env={"FAKE_SPARE_CID": "cid1", "FAKE_PROJECT_cid1": READY_PROJECT},
+    )
+    assert r.returncode == 0, r.stderr
+    assert not wait_for(rec_out.exists, deadline_s=1.0)
+
+
+def test_spawn_next_warns_and_skips_on_a_hash_failure(tmp_path):
+    rec = write_exe(tmp_path / "rec", REC_STUB)
+    r, _, rec_out = _spawn_next(
+        tmp_path,
+        self_cmd=rec,
+        extra_env={"FAKE_IMAGE_MISSING": "debian:stable-slim"},
+    )
+    assert r.returncode == 0, r.stderr
+    assert "skipping replenishment" in r.stderr
+    assert not wait_for(rec_out.exists, deadline_s=1.0)

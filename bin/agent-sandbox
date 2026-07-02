@@ -39,9 +39,11 @@ name-level-allowlist firewall, waits for its health, then execs the workload.
                          session_id + ephemeral:false), DISCARD its seeded workspace and
                          re-seed from the current checkout. Destructive, per-invocation.
   --prewarm-next         After this session, boot a fresh spare of the same workload in
-                         the background (as if by `prewarm`) so the NEXT run can adopt it.
-                         The pool does not otherwise self-replenish. Refused for records
-                         `prewarm` refuses (workspace_mount / session_id / resume_from).
+                         the background (as if by `prewarm`) so the NEXT run can adopt it
+                         — skipped when an unclaimed ready spare for this spec already
+                         exists. The pool does not otherwise self-replenish. Refused for
+                         records `prewarm` refuses (workspace_mount / session_id /
+                         resume_from).
 
 A workload with `session_id` gets the deterministic compose project name
 agent-sandbox-<session_id>; running it again against its stopped stack re-attaches
@@ -172,7 +174,7 @@ cmd_run() {
   # --prewarm-next: after the session, replenish the pool by booting a fresh spare of
   # this workload in the background (the pool does NOT self-replenish otherwise). The
   # spawn never affects this run's exit status.
-  [[ "$prewarm_next" == 0 ]] || prewarm_spawn_next "$_AS_DIR/agent-sandbox" "$workload" ${extra_compose[@]+"${extra_compose[@]}"}
+  [[ "$prewarm_next" == 0 ]] || prewarm_spawn_next "$_AS_DIR/agent-sandbox" "$workload" "$compose" "$runtime" ${extra_compose[@]+"${extra_compose[@]}"}
   return "$run_rc"
 }
 
