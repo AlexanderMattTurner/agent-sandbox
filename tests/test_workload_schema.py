@@ -122,6 +122,45 @@ def test_default_service_optouts_reject_non_booleans(field, value):
         jsonschema.validate({**_with_allowlist([]), field: value}, SCHEMA)
 
 
+@pytest.mark.parametrize(
+    "secrets",
+    [
+        {"OAUTH_TOKEN": "v"},
+        {"_KEY": "multi\nline\nvalue"},
+        {},
+    ],
+    ids=["simple", "underscore-and-multiline", "empty"],
+)
+def test_secret_env_accepts_env_shaped_names_and_string_values(secrets):
+    jsonschema.validate({**_with_allowlist([]), "secret_env": secrets}, SCHEMA)
+
+
+@pytest.mark.parametrize(
+    "secrets",
+    [
+        {"../evil": "v"},
+        {"has space": "v"},
+        {"9starts_with_digit": "v"},
+        {"": "v"},
+        {"OAUTH_TOKEN": 42},
+        {"OAUTH_TOKEN": None},
+        "OAUTH_TOKEN=v",
+    ],
+    ids=[
+        "traversal-name",
+        "space-in-name",
+        "leading-digit",
+        "empty-name",
+        "non-string-value",
+        "null-value",
+        "not-an-object",
+    ],
+)
+def test_secret_env_rejects_unsafe_names_and_non_string_values(secrets):
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({**_with_allowlist([]), "secret_env": secrets}, SCHEMA)
+
+
 def test_tty_defaults_false_and_is_boolean():
     assert SCHEMA["properties"]["tty"]["type"] == "boolean"
     assert SCHEMA["properties"]["tty"]["default"] is False

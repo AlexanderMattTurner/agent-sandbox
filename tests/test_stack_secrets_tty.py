@@ -11,6 +11,10 @@ argv and on-disk lifecycle are observable:
   afterwards and that only `up` (never `down`) referenced the env override.
 - **tty**: `tty:true` allocates an interactive `docker exec -it` and is a fail-closed
   runtime precondition — the launch refuses BEFORE bring-up when stdin is not a TTY.
+- **secret_env**: each value is streamed over an exec's STDIN into /run/secrets/<name>
+  on a per-container tmpfs — never argv, never container env, never host disk. The fake
+  docker captures the delivery exec's stdin so byte-exactness is observable, and the
+  argv log proves the value appears in no docker invocation.
 """
 
 import json
@@ -36,6 +40,18 @@ FAKE_DOCKER = r"""#!/usr/bin/env bash
 printf '%s\n' "$*" >>"$DOCKER_LOG"
 if [[ "$1" == "exec" ]]; then
   printf '%s\n' "$*" >>"$DOCKER_LOG.exec"
+  if [[ "$*" == *"/run/secrets/"* ]]; then
+    [[ -n "${FAKE_SECRET_FAIL:-}" ]] && exit 1
+    # Always drain stdin like real docker exec would — exiting without reading
+    # races the writer into an EPIPE under the launcher's pipefail.
+    if [[ -n "${SECRET_CAPTURE_DIR:-}" ]]; then
+      mkdir -p "$SECRET_CAPTURE_DIR"
+      # The delivery exec's argv ends `... _ <name> <user>`; its stdin is the value.
+      cat >"$SECRET_CAPTURE_DIR/${*: -2:1}"
+    else
+      cat >/dev/null
+    fi
+  fi
   exit 0
 fi
 if [[ "$1" == "compose" ]]; then
@@ -187,6 +203,106 @@ def test_envfile_removed_when_no_container_starts(tmp_path):
     assert r.returncode != 0
     assert "workload container did not start" in r.stderr, r.stderr
     assert not (sess / "workload.env").exists()
+
+
+# ── secret_env file delivery ────────────────────────────────────────
+
+SECRET_VALUE = "q9X2mN7pK4rT8wY1cV5bZ3dF6gH0jL2e"
+
+
+def _read_all_session_bytes(sess):
+    return b"".join(
+        p.read_bytes() for p in sess.rglob("*") if p.is_file() and not p.is_symlink()
+    )
+
+
+def test_secret_env_streamed_via_stdin_never_argv_env_or_host_disk(tmp_path):
+    cap = tmp_path / "secrets"
+    wl = {**VALID, "secret_env": {"OAUTH_TOKEN": SECRET_VALUE}}
+    r, calls, sess = _run(tmp_path, wl, extra_env={"SECRET_CAPTURE_DIR": str(cap)})
+    assert r.returncode == 0, r.stderr
+    # The value arrived byte-exact over the delivery exec's stdin…
+    assert (cap / "OAUTH_TOKEN").read_text() == SECRET_VALUE
+    # …and appears in NO docker argv (exec included) and NO file the session left
+    # in the host state dir. `env` would fail both: it rides an env-file override.
+    assert all(SECRET_VALUE not in c for c in calls), calls
+    assert SECRET_VALUE.encode() not in _read_all_session_bytes(sess)
+    # No env-file machinery is involved for secrets.
+    assert not any("workload-env-override.json" in c for c in calls)
+
+
+def test_secret_delivery_exec_shape_and_ordering(tmp_path):
+    wl = {**VALID, "secret_env": {"OAUTH_TOKEN": SECRET_VALUE}}
+    r, _, _ = _run(tmp_path, wl)
+    assert r.returncode == 0, r.stderr
+    execs = (tmp_path / "docker.log.exec").read_text().splitlines()
+    delivery = [e for e in execs if "/run/secrets/" in e]
+    assert len(delivery) == 1, execs
+    # Root exec reading stdin, mode 0400 via umask, chowned to the workload user.
+    assert delivery[0].startswith("exec -i -u root "), delivery
+    assert "umask 377" in delivery[0] and "chown" in delivery[0]
+    assert delivery[0].endswith(" _ OAUTH_TOKEN 1000"), delivery
+    # Delivered BEFORE the workload's entrypoint ran.
+    entry = [i for i, e in enumerate(execs) if "bash -lc echo hi" in e]
+    assert entry and execs.index(delivery[0]) < entry[0], execs
+
+
+def test_secret_env_declares_the_run_secrets_tmpfs_in_the_override(tmp_path):
+    wl = {**VALID, "secret_env": {"OAUTH_TOKEN": SECRET_VALUE}}
+    r, _, sess = _run(tmp_path, wl)
+    assert r.returncode == 0, r.stderr
+    override = json.loads((sess / "workload-override.json").read_text())
+    assert override["services"]["workload"]["tmpfs"] == [
+        "/run/secrets:mode=0755,size=1m"
+    ]
+
+
+def test_multiline_secret_value_is_delivered_byte_exact(tmp_path):
+    cap = tmp_path / "secrets"
+    value = "-----BEGIN KEY-----\nline2\nline3\n-----END KEY-----\n"
+    wl = {**VALID, "secret_env": {"SIGNING_KEY": value}}
+    r, _, _ = _run(tmp_path, wl, extra_env={"SECRET_CAPTURE_DIR": str(cap)})
+    assert r.returncode == 0, r.stderr
+    assert (cap / "SIGNING_KEY").read_text() == value
+
+
+def test_no_secret_env_means_no_tmpfs_and_no_delivery_exec(tmp_path):
+    r, _, sess = _run(tmp_path, VALID)
+    assert r.returncode == 0, r.stderr
+    override = json.loads((sess / "workload-override.json").read_text())
+    assert "tmpfs" not in override["services"]["workload"]
+    execs = (tmp_path / "docker.log.exec").read_text().splitlines()
+    assert not any("/run/secrets/" in e for e in execs), execs
+
+
+def test_traversal_shaped_secret_name_is_refused_before_bringup(tmp_path):
+    wl = {**VALID, "secret_env": {"../evil": SECRET_VALUE}}
+    r, calls, _ = _run(tmp_path, wl)
+    assert r.returncode != 0
+    assert "secret_env names" in r.stderr, r.stderr
+    assert not any(" up " in f" {c} " for c in calls)
+
+
+def test_non_string_secret_value_is_refused_before_bringup(tmp_path):
+    wl = {**VALID, "secret_env": {"OAUTH_TOKEN": 42}}
+    r, calls, _ = _run(tmp_path, wl)
+    assert r.returncode != 0
+    assert "string values" in r.stderr, r.stderr
+    assert not any(" up " in f" {c} " for c in calls)
+
+
+def test_failed_secret_delivery_tears_the_stack_down(tmp_path):
+    wl = {**VALID, "secret_env": {"OAUTH_TOKEN": SECRET_VALUE}}
+    r, calls, _ = _run(tmp_path, wl, extra_env={"FAKE_SECRET_FAIL": "1"})
+    assert r.returncode != 0
+    assert "could not deliver secret 'OAUTH_TOKEN'" in r.stderr, r.stderr
+    assert "refusing to hand over the sandbox" in r.stderr, r.stderr
+    down = [c for c in calls if " down " in f" {c} "]
+    assert down and all("--volumes" in c for c in down), calls
+    # The workload's entrypoint never ran.
+    exec_log = tmp_path / "docker.log.exec"
+    execs = exec_log.read_text().splitlines() if exec_log.exists() else []
+    assert not any("bash -lc echo hi" in e for e in execs), execs
 
 
 # ── Interactive TTY ─────────────────────────────────────────────────
