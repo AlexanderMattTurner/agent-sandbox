@@ -385,18 +385,35 @@ _stack_down_ephemeral() {
   stack_verify_no_volumes "$project"
 }
 
-# stack_run WORKLOAD_JSON COMPOSE RUNTIME [EXTRA_COMPOSE...] — the whole session:
-# up → seed → exec → extract → export egress log → down. Returns the workload's exit
-# status when the session machinery succeeded; machinery failures return non-zero
-# themselves. Reads SANDBOX_IP/SANDBOX_SUBNET from the caller (export_sandbox_subnet).
-# EXTRA_COMPOSE files are consumer overlays merged after the library's file set on
-# EVERY compose invocation of this session (see _stack_compose). The compose project
-# name is randomized per session unless the consumer pins its own identity via
-# AGENT_SANDBOX_PROJECT_NAME (its lifecycle tooling finds the stack by that label).
-stack_run() {
+# The bring-up/serve seam: stack_bring_up publishes the session's identity and
+# container handles here for stack_serve_workload (and consumers like the prewarm
+# verb, which brings a stack up and stops before serving).
+_STACK_PROJECT=""
+_STACK_STATE=""
+_STACK_CID=""
+_STACK_OVERRIDE=""
+_STACK_OVERMOUNTS=""
+_STACK_SESSION_ID=""
+_STACK_RESUME_FROM=""
+_STACK_REATTACH=0
+_STACK_EPHEMERAL=""
+_STACK_WANT_TTY=false
+_STACK_PRIOR_BASE_COMMIT=""
+_STACK_PRIOR_REVIEW_BRANCH=""
+
+# stack_bring_up WORKLOAD_JSON COMPOSE RUNTIME — the workload-agnostic half of a
+# session: resolve identity, partition the allowlist, activate profiles, ensure
+# images, generate the per-session overrides, `up -d --wait`, resolve the workload
+# cid, clean up the up-only env delivery, and hold the fail-closed guardrail gate.
+# Ends with a healthy stack whose /workspace is still empty (seed mode: a fresh
+# named volume) — nothing workload-specific has run. Publishes the session's
+# handles in the _STACK_* globals above for stack_serve_workload. Fail-closed:
+# any failure tears down whatever came up (keeping volumes only where a prior
+# leg's work lives in them) and returns non-zero. Reads SANDBOX_IP/SANDBOX_SUBNET
+# from the caller (export_sandbox_subnet); _STACK_EXTRA_COMPOSE must already be
+# set (stack_run owns it).
+stack_bring_up() {
   local workload="$1" compose="$2" runtime="$3"
-  shift 3
-  _STACK_EXTRA_COMPOSE=("$@")
   local sandbox_dir project state session_id resume_from
   sandbox_dir="$(cd "$(dirname "$compose")" && pwd)"
   session_id="$(jq -r '.session_id // empty' "$workload")"
@@ -423,18 +440,6 @@ stack_run() {
   export WORKLOAD_IMAGE WORKLOAD_USER WORKLOAD_RUNTIME WORKLOAD_IP
   # The seed/extract execs must run as the same user the workload writes as.
   export AGENT_SANDBOX_WORKLOAD_USER="$WORKLOAD_USER"
-
-  # tty is a runtime precondition, not a file field: an interactive entrypoint needs a
-  # real terminal on the launcher's stdin. Check it BEFORE bringing anything up so we
-  # fail fast instead of tearing down a healthy stack we could never attach to.
-  local want_tty=false
-  if [[ "$(jq -r '.tty // false' "$workload")" == "true" ]]; then
-    [[ -t 0 ]] || {
-      as_error "workload.tty is true but the launcher's stdin is not a TTY — run agent-sandbox from an interactive terminal, or set tty:false"
-      return 1
-    }
-    want_tty=true
-  fi
 
   stack_partition_allowlist "$workload"
   # Grants must be validated and exported BEFORE `up`: compose passes
@@ -632,6 +637,36 @@ stack_run() {
       as_info "bind mode: no overmount guardrails apply — nothing under /workspace is mounted read-only this session"
     fi
   fi
+
+  _STACK_PROJECT="$project"
+  _STACK_STATE="$state"
+  _STACK_CID="$cid"
+  _STACK_OVERRIDE="$override"
+  _STACK_OVERMOUNTS="$overmounts"
+  _STACK_SESSION_ID="$session_id"
+  _STACK_RESUME_FROM="$resume_from"
+  _STACK_REATTACH="$reattach"
+  _STACK_EPHEMERAL="$ephemeral"
+  _STACK_PRIOR_BASE_COMMIT="$prior_base_commit"
+  _STACK_PRIOR_REVIEW_BRANCH="$prior_review_branch"
+}
+
+# stack_serve_workload WORKLOAD_JSON COMPOSE — the workload-specific half of a
+# session, against the healthy stack stack_bring_up published in the _STACK_*
+# globals: control-plane readiness barrier, seed/re-attach/resume the workspace,
+# exec the Workload's entrypoint, extract the work onto the host review branch,
+# export the egress + audit logs, tear down. Returns the workload's exit status
+# when the session machinery succeeded; machinery failures return non-zero
+# themselves (a failed extract keeps the containers and volumes).
+stack_serve_workload() {
+  local workload="$1" compose="$2"
+  local project="$_STACK_PROJECT" state="$_STACK_STATE" cid="$_STACK_CID"
+  local override="$_STACK_OVERRIDE" overmounts="$_STACK_OVERMOUNTS"
+  local session_id="$_STACK_SESSION_ID" resume_from="$_STACK_RESUME_FROM"
+  local reattach="$_STACK_REATTACH" ephemeral="$_STACK_EPHEMERAL"
+  local want_tty="$_STACK_WANT_TTY"
+  local prior_base_commit="$_STACK_PRIOR_BASE_COMMIT"
+  local prior_review_branch="$_STACK_PRIOR_REVIEW_BRANCH"
 
   # Control-plane readiness barrier, BEFORE seeding: a consumer gate that never
   # comes up must fail the launch while there is still nothing to lose — no
@@ -847,4 +882,36 @@ stack_run() {
     as_info "volumes kept (ephemeral=false): docker volume ls --filter label=com.docker.compose.project=$project"
   fi
   return "$workload_rc"
+}
+
+# stack_run WORKLOAD_JSON COMPOSE RUNTIME [EXTRA_COMPOSE...] — the whole session:
+# bring the stack up (stack_bring_up), then seed → exec → extract → export →
+# teardown (stack_serve_workload). Returns the workload's exit status when the
+# session machinery succeeded; machinery failures return non-zero themselves.
+# Reads SANDBOX_IP/SANDBOX_SUBNET from the caller (export_sandbox_subnet).
+# EXTRA_COMPOSE files are consumer overlays merged after the library's file set on
+# EVERY compose invocation of this session (see _stack_compose). The compose project
+# name is randomized per session unless the consumer pins its own identity via
+# AGENT_SANDBOX_PROJECT_NAME (its lifecycle tooling finds the stack by that label).
+stack_run() {
+  local workload="$1" compose="$2" runtime="$3"
+  shift 3
+  _STACK_EXTRA_COMPOSE=("$@")
+
+  # tty is a runtime precondition, not a file field: an interactive entrypoint needs a
+  # real terminal on the launcher's stdin. Check it BEFORE bringing anything up so we
+  # fail fast instead of tearing down a healthy stack we could never attach to. Kept
+  # out of stack_bring_up: a spare brought up for later adoption never execs, so tty
+  # is the serving launch's concern, not bring-up's.
+  _STACK_WANT_TTY=false
+  if [[ "$(jq -r '.tty // false' "$workload")" == "true" ]]; then
+    [[ -t 0 ]] || {
+      as_error "workload.tty is true but the launcher's stdin is not a TTY — run agent-sandbox from an interactive terminal, or set tty:false"
+      return 1
+    }
+    _STACK_WANT_TTY=true
+  fi
+
+  stack_bring_up "$workload" "$compose" "$runtime" || return 1
+  stack_serve_workload "$workload" "$compose"
 }
