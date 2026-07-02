@@ -100,20 +100,27 @@ _stack_export_egress_log() {
   as_info "egress log: $state/egress.log"
 }
 
-# _stack_down_ephemeral PROJECT COMPOSE OVERRIDE OVERMOUNTS — remove containers, networks AND
-# volumes, then verify no volume survived. The guarantee is verified, not assumed:
-# any survivor fails loud so "ephemeral" can never silently mean "persistent".
-_stack_down_ephemeral() {
-  local project="$1" compose="$2" override="$3" overmounts="$4" leftovers
-  _stack_compose "$project" "$compose" "$override" "$overmounts" down --volumes --timeout 30 || {
-    as_error "ephemeral teardown failed (compose project $project) — session containers/volumes may survive"
-    return 1
-  }
+# stack_verify_no_volumes PROJECT — verify no compose-labeled volume survived a
+# teardown. The guarantee is verified, not assumed: any survivor fails loud so
+# "ephemeral" can never silently mean "persistent".
+stack_verify_no_volumes() {
+  local project="$1" leftovers
   leftovers="$(docker volume ls -q --filter "label=com.docker.compose.project=$project")"
   [[ -z "$leftovers" ]] || {
     as_error "ephemeral teardown left volumes behind (fail-loud): $leftovers"
     return 1
   }
+}
+
+# _stack_down_ephemeral PROJECT COMPOSE OVERRIDE OVERMOUNTS — remove containers, networks AND
+# volumes, then verify no volume survived (stack_verify_no_volumes fails loud on any).
+_stack_down_ephemeral() {
+  local project="$1" compose="$2" override="$3" overmounts="$4"
+  _stack_compose "$project" "$compose" "$override" "$overmounts" down --volumes --timeout 30 || {
+    as_error "ephemeral teardown failed (compose project $project) — session containers/volumes may survive"
+    return 1
+  }
+  stack_verify_no_volumes "$project"
 }
 
 # stack_run WORKLOAD_JSON COMPOSE RUNTIME [EXTRA_COMPOSE...] — the whole session:

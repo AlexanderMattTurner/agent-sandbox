@@ -2,7 +2,7 @@
 # agent-sandbox — run an untrusted Workload in a hardware-isolated,
 # name-level-allowlist-firewalled, ephemeral sandbox with a tamper-evident egress log.
 #
-# Usage: agent-sandbox run <workload.json>
+# Usage: agent-sandbox run <workload.json> | gc [--dry-run] | down <project>
 #
 # The launcher reads the Workload record (schema/workload.schema.json), selects a
 # runtime via the backend ladder (fail-closed), allocates a subnet, then brings up the
@@ -23,6 +23,8 @@ source "$_AS_DIR/lib/stack.bash"
 usage() {
   cat >&2 <<'EOF'
 Usage: agent-sandbox run [--extra-compose FILE]... <workload.json>
+       agent-sandbox gc [--dry-run]
+       agent-sandbox down <project>
 
 Run a Workload (see schema/workload.schema.json) in an isolated, egress-restricted,
 ephemeral sandbox. The launcher selects a runtime, allocates a subnet, brings up the
@@ -31,6 +33,11 @@ name-level-allowlist firewall, waits for its health, then execs the workload.
   --extra-compose FILE   Merge FILE (repeatable, in order) after the library's compose
                          file set on every compose invocation of the session — the seam
                          for consumer-owned companion services and service extensions.
+
+gc prunes stale sandbox networks (no live containers), reclaiming dead sessions'
+subnets; --dry-run previews what a real run would remove. down tears down one
+session's stack by compose project name — containers, networks AND volumes — and
+fails loud if any volume survives.
 
 Environment: AGENT_SANDBOX_PROJECT_NAME pins the compose project name (default: a
 random per-session name) so consumer lifecycle tooling can find the stack by label.
@@ -159,11 +166,61 @@ cmd_run() {
   stack_run "$workload" "$compose" "$runtime" ${extra_compose[@]+"${extra_compose[@]}"}
 }
 
+# cmd_gc [--dry-run] — prune stale sandbox networks (no live containers), reclaiming
+# dead sessions' subnets. --dry-run previews what a real run would remove.
+cmd_gc() {
+  case "${1:-}" in
+  --dry-run)
+    GC_DRY_RUN=1 prune_stale_sandbox_networks
+    ;;
+  "")
+    prune_stale_sandbox_networks
+    ;;
+  *)
+    as_error "unknown gc option: $1"
+    usage
+    return 1
+    ;;
+  esac
+}
+
+# cmd_down <project> — tear down one session's stack by compose project name:
+# containers, networks AND volumes. Fails loud when there is nothing to tear down
+# (a typo'd project must not look like a clean teardown) and when any volume
+# survives, so "down" can never silently mean "still persisted".
+cmd_down() {
+  local project="${1:-}" containers volumes
+  [[ -n "$project" ]] || {
+    as_error "no compose project given"
+    usage
+    return 1
+  }
+  containers="$(docker ps -aq --filter "label=com.docker.compose.project=$project")"
+  volumes="$(docker volume ls -q --filter "label=com.docker.compose.project=$project")"
+  if [[ -z "$containers" && -z "$volumes" ]]; then
+    as_error "nothing to tear down: no containers or volumes belong to compose project $project"
+    return 1
+  fi
+  docker compose -p "$project" down --volumes --timeout 30 || {
+    as_error "teardown failed (compose project $project) — session containers/volumes may survive"
+    return 1
+  }
+  stack_verify_no_volumes "$project"
+}
+
 main() {
   case "${1:-}" in
   run)
     shift
     cmd_run "$@"
+    ;;
+  gc)
+    shift
+    cmd_gc "$@"
+    ;;
+  down)
+    shift
+    cmd_down "$@"
     ;;
   -h | --help | "")
     usage
