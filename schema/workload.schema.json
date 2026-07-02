@@ -25,9 +25,9 @@
     },
     "secret_env": {
       "type": "object",
-      "propertyNames": { "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+      "propertyNames": { "pattern": "^[A-Za-z_][A-Za-z0-9_]*(?![\\s\\S])" },
       "additionalProperties": { "type": "string" },
-      "description": "name -> value map of CREDENTIALS, each delivered as a file the workload reads at /run/secrets/<name> (mode 0400, owned by the workload user) — never as an environment variable. Values are streamed over an exec's stdin into a per-container tmpfs after the container is created, so they are invisible to `docker inspect` (no env, no argv, no mount source) and no secret byte ever touches the host state dir or a compose file; the tmpfs dies with the container, so teardown removes the material by construction. The consumer contract is file-based: the workload must read each value from its /run/secrets path. Values may contain newlines and are delivered byte-exact; the tmpfs caps total secret material at 1 MiB."
+      "description": "name -> value map of CREDENTIALS, each delivered as a file the workload reads at /run/secrets/<name> (mode 0400, owned by the workload user) — never as an environment variable. Values are streamed over an exec's stdin into a per-container tmpfs after the container is created, so they are invisible to `docker inspect` (no env, no argv, no mount source) and no secret byte ever touches the host state dir or a compose file; the tmpfs dies with the container, so teardown removes the material by construction. The consumer contract is file-based: the workload must read each value from its /run/secrets path. Values may contain newlines and are delivered byte-exact; the tmpfs caps total secret material at 1 MiB. Names must be env-var-shaped; the name pattern ends in (?![\\s\\S]) rather than $ because a name is an in-container path component and Python's re lets a plain $ match before a string-final newline."
     },
     "tty": {
       "type": "boolean",

@@ -23,6 +23,8 @@ import pty
 import subprocess
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve()
 while not (REPO / ".git").exists():
     REPO = REPO.parent
@@ -35,15 +37,18 @@ LAUNCHER = REPO / "bin" / "agent-sandbox"
 #   - `compose ... ps -q workload|firewall`: print a fake cid (none for workload under
 #     $FAKE_NO_CID, so the no-container fail-closed branch is exercised).
 #   - `exec ...`: record the exec argv to $DOCKER_LOG.exec so -it can be asserted.
+#     A secret-delivery exec (argv mentions /run/secrets/) drains stdin like real
+#     docker would, captures it to $SECRET_CAPTURE_DIR/<name> when set, and fails
+#     under $FAKE_SECRET_FAIL so the delivery fail-closed branch is exercised.
 # Every invocation's argv is logged (one line) to $DOCKER_LOG.
 FAKE_DOCKER = r"""#!/usr/bin/env bash
 printf '%s\n' "$*" >>"$DOCKER_LOG"
 if [[ "$1" == "exec" ]]; then
   printf '%s\n' "$*" >>"$DOCKER_LOG.exec"
   if [[ "$*" == *"/run/secrets/"* ]]; then
-    [[ -n "${FAKE_SECRET_FAIL:-}" ]] && exit 1
     # Always drain stdin like real docker exec would — exiting without reading
     # races the writer into an EPIPE under the launcher's pipefail.
+    [[ -n "${FAKE_SECRET_FAIL:-}" ]] && { cat >/dev/null; exit 1; }
     if [[ -n "${SECRET_CAPTURE_DIR:-}" ]]; then
       mkdir -p "$SECRET_CAPTURE_DIR"
       # The delivery exec's argv ends `... _ <name> <user>`; its stdin is the value.
@@ -257,17 +262,35 @@ def test_secret_env_declares_the_run_secrets_tmpfs_in_the_override(tmp_path):
     ]
 
 
-def test_multiline_secret_value_is_delivered_byte_exact(tmp_path):
+@pytest.mark.parametrize(
+    "value",
+    ["-----BEGIN KEY-----\nline2\nline3\n-----END KEY-----\n", ""],
+    ids=["multiline", "empty-string"],
+)
+def test_secret_value_is_delivered_byte_exact(tmp_path, value):
     cap = tmp_path / "secrets"
-    value = "-----BEGIN KEY-----\nline2\nline3\n-----END KEY-----\n"
     wl = {**VALID, "secret_env": {"SIGNING_KEY": value}}
     r, _, _ = _run(tmp_path, wl, extra_env={"SECRET_CAPTURE_DIR": str(cap)})
     assert r.returncode == 0, r.stderr
     assert (cap / "SIGNING_KEY").read_text() == value
 
 
-def test_no_secret_env_means_no_tmpfs_and_no_delivery_exec(tmp_path):
-    r, _, sess = _run(tmp_path, VALID)
+def test_several_secrets_are_each_delivered(tmp_path):
+    cap = tmp_path / "secrets"
+    wl = {**VALID, "secret_env": {"ALPHA": "a-value", "BETA": "b-value"}}
+    r, _, _ = _run(tmp_path, wl, extra_env={"SECRET_CAPTURE_DIR": str(cap)})
+    assert r.returncode == 0, r.stderr
+    assert (cap / "ALPHA").read_text() == "a-value"
+    assert (cap / "BETA").read_text() == "b-value"
+    execs = (tmp_path / "docker.log.exec").read_text().splitlines()
+    assert len([e for e in execs if "/run/secrets/" in e]) == 2, execs
+
+
+@pytest.mark.parametrize(
+    "workload", [VALID, {**VALID, "secret_env": {}}], ids=["absent", "empty-object"]
+)
+def test_no_secrets_means_no_tmpfs_and_no_delivery_exec(tmp_path, workload):
+    r, _, sess = _run(tmp_path, workload)
     assert r.returncode == 0, r.stderr
     override = json.loads((sess / "workload-override.json").read_text())
     assert "tmpfs" not in override["services"]["workload"]
@@ -275,12 +298,35 @@ def test_no_secret_env_means_no_tmpfs_and_no_delivery_exec(tmp_path):
     assert not any("/run/secrets/" in e for e in execs), execs
 
 
-def test_traversal_shaped_secret_name_is_refused_before_bringup(tmp_path):
-    wl = {**VALID, "secret_env": {"../evil": SECRET_VALUE}}
+@pytest.mark.parametrize(
+    "name", ["../evil", "OAUTH_TOKEN\n"], ids=["traversal", "trailing-newline"]
+)
+def test_unsafe_secret_name_is_refused_before_bringup(tmp_path, name):
+    wl = {**VALID, "secret_env": {name: SECRET_VALUE}}
     r, calls, _ = _run(tmp_path, wl)
     assert r.returncode != 0
     assert "secret_env names" in r.stderr, r.stderr
     assert not any(" up " in f" {c} " for c in calls)
+
+
+def test_library_level_name_check_refuses_an_unshaped_name(tmp_path):
+    """stack_run is the documented library entry point, so _stack_deliver_secrets
+    revalidates the name below the launcher gate — an unshaped name must never
+    choose the path of a root-privileged in-container write."""
+    wl = tmp_path / "wl.json"
+    wl.write_text(json.dumps({"secret_env": {"bad/name": "v"}}))
+    harness = (
+        f"source {REPO / 'bin' / 'lib' / 'stack.bash'}\n"
+        f"_stack_deliver_secrets {wl} cid_workload 1000\n"
+    )
+    r = subprocess.run(
+        ["bash", "-c", harness],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "NO_COLOR": "1"},
+    )
+    assert r.returncode != 0
+    assert "not env-var-shaped" in r.stderr, r.stderr
 
 
 def test_non_string_secret_value_is_refused_before_bringup(tmp_path):

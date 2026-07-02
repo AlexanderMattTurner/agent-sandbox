@@ -99,15 +99,30 @@ _stack_write_override() {
 # host state dir — so no secret byte is visible to `docker inspect` or ever touches
 # host disk. jq -j delivers the value byte-exact (newlines allowed). The tmpfs dies
 # with the container, so teardown removes the material by construction. Fail-closed:
-# any failed delivery refuses the session.
+# any failed delivery refuses the session. Keys are read by INDEX (like stack_run's
+# entrypoint argv), never by iterating a newline-joined key list — a line-based read
+# would silently deliver zero secrets when the producing jq fails, and would split a
+# newline-carrying key into bogus names.
 _stack_deliver_secrets() {
-  local workload="$1" cid="$2" user="$3" name
-  while IFS= read -r name; do
-    jq -j --arg k "$name" '.secret_env[$k]' "$workload" | docker exec -i -u root "$cid" bash -c 'umask 377 && cat >"/run/secrets/$1" && chown "$2" "/run/secrets/$1"' _ "$name" "$user" || {
+  local workload="$1" cid="$2" user="$3" name n i
+  # POSIX sh, not bash: the workload image is arbitrary and may not carry bash.
+  # $1 (name) and $2 (user) ride argv; the secret VALUE rides stdin only.
+  local deliver='umask 377 && cat >"/run/secrets/$1" && chown -- "$2" "/run/secrets/$1"'
+  n="$(jq '(.secret_env // {}) | keys | length' "$workload")"
+  for ((i = 0; i < n; i++)); do
+    name="$(jq -r "(.secret_env | keys)[$i]" "$workload")"
+    # Defense in depth: the launcher validates name shapes before launch, but stack_run
+    # is the documented library entry point — an unshaped name must never choose the
+    # path of a root-privileged write inside the container.
+    [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || {
+      as_error "secret_env name '$name' is not env-var-shaped — refusing the delivery exec"
+      return 1
+    }
+    jq -j --arg k "$name" '.secret_env[$k]' "$workload" | docker exec -i -u root "$cid" sh -c "$deliver" _ "$name" "$user" || {
       as_error "could not deliver secret '$name' into the sandbox"
       return 1
     }
-  done < <(jq -r '(.secret_env // {}) | keys[]' "$workload")
+  done
 }
 
 # _stack_write_env_delivery WORKLOAD_JSON ENVFILE OVERRIDE — stage the workload's env

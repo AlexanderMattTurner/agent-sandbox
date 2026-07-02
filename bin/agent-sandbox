@@ -154,7 +154,10 @@ cmd_run() {
       as_error "workload.secret_env must be a name -> value object of string values"
       return 1
     }
-    jq -e '.secret_env | keys | all(test("^[A-Za-z_][A-Za-z0-9_]*$"))' "$workload" >/dev/null || {
+    # \A/\z, not ^/$: Oniguruma's $ matches BEFORE a string-final newline, so a
+    # ^…$ test would accept "NAME\n" — a name is a /run/secrets path component
+    # and must be anchored against the true ends of the string.
+    jq -e '.secret_env | keys | all(test("\\A[A-Za-z_][A-Za-z0-9_]*\\z"))' "$workload" >/dev/null || {
       as_error "workload.secret_env names must match ^[A-Za-z_][A-Za-z0-9_]*\$ — each becomes a file at /run/secrets/<name>"
       return 1
     }
