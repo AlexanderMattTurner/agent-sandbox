@@ -89,8 +89,9 @@ exec -u 1000 wcid sh -c
 compose -p <PROJECT> -f <SANDBOX>/docker-compose.yml -f <STATE>/workload-override.json -f <STATE>/overmount-override.json ps -q firewall
 cp fwcid:/var/log/squid/access.log <STATE>/egress.log
 compose -p <PROJECT> -f <SANDBOX>/docker-compose.yml -f <STATE>/workload-override.json -f <STATE>/overmount-override.json ps -q audit
-cp acid:/var/log/agent-sandbox/audit.jsonl <STATE>/audit.jsonl
+cp acid:/var/log/agent-sandbox/audit.jsonl <STATE>/.audit.live
 cp acid:/run/audit-secret/secret <STATE>/audit.secret
+cp acid:/var/log/agent-sandbox/audit.prior.jsonl <STATE>/.audit.prior
 compose -p <PROJECT> -f <SANDBOX>/docker-compose.yml -f <STATE>/workload-override.json -f <STATE>/overmount-override.json down --volumes --timeout 30
 volume ls -q --filter label=com.docker.compose.project=<PROJECT>
 """
