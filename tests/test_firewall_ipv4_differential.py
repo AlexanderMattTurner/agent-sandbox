@@ -14,15 +14,20 @@ reimplementation is the whole point of a *differential* test. For every IP the
 oracle places inside a bogon range, bash `is_public_ipv4` MUST agree it is
 non-public; a single violation fails loudly with the offending IP.
 
-To stay fast, candidates are classified in BULK: all IPs are written to one file
-and a single bash harness sources the lib and classifies every line, rather than
-forking bash per candidate.
+Corpus generation is driven by Hypothesis rather than a hand-rolled RNG so a
+failure reports the minimal shrunk counterexample plus a reproducible seed. To
+stay fast under per-example forking, each Hypothesis example is a *batch* of IPs
+classified in ONE bash invocation (the harness sources the lib and classifies
+every line), so Hypothesis shrinks a failing batch toward a single offending IP
+while a passing batch costs one fork, not one-per-IP.
 
 # covers: sandbox/firewall-lib.bash
 """
 
 import ipaddress
-import random
+
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from tests._helpers import REPO_ROOT, run_capture
 
@@ -49,13 +54,43 @@ _BOGON_NETS = [ipaddress.ip_network(c) for c in BOGON_CIDRS]
 # allowlist build would refuse legitimate egress.
 KNOWN_PUBLIC = ["8.8.8.8", "1.1.1.1"]
 
-SEED = 0xB0607  # fixed seed → deterministic corpus across runs
-
 
 def _oracle_is_bogon(ip: str) -> bool:
     """Independent oracle: True when `ip` falls inside any encoded bogon range."""
     addr = ipaddress.ip_address(ip)
     return any(addr in net for net in _BOGON_NETS)
+
+
+# === Hypothesis strategies ===============================================
+
+
+def _u32_to_ip(n: int) -> str:
+    return str(ipaddress.ip_address(n))
+
+
+# A single dotted-quad drawn uniformly from the whole u32 space. Integer
+# strategies bias toward their bounds, so 0.0.0.0 / 255.255.255.255 and the
+# adjacent values are hit deterministically.
+_any_ipv4 = st.integers(min_value=0, max_value=0xFFFFFFFF).map(_u32_to_ip)
+
+
+def _ip_in_net(net: ipaddress.IPv4Network) -> st.SearchStrategy[str]:
+    """Addresses drawn from within `net` — the integer bounds are the network and
+    broadcast addresses, so Hypothesis exercises each range's edges by design."""
+    return st.integers(
+        min_value=int(net.network_address),
+        max_value=int(net.broadcast_address),
+    ).map(_u32_to_ip)
+
+
+# Every draw is guaranteed to fall inside SOME bogon range, so the security
+# assertion is never vacuous and needs no `assume()` filtering.
+_bogon_ipv4 = st.one_of(*[_ip_in_net(net) for net in _BOGON_NETS])
+
+# Batches keep the bash fork amortized: one invocation classifies up to 64 IPs,
+# and Hypothesis shrinks a failing batch toward the single offending address.
+_bogon_batch = st.lists(_bogon_ipv4, min_size=1, max_size=64)
+_any_batch = st.lists(_any_ipv4, min_size=1, max_size=64)
 
 
 def _curated_ips() -> list[str]:
@@ -127,23 +162,6 @@ def _cidr_edge_ips() -> set[str]:
     return ips
 
 
-def _random_ips(n: int) -> list[str]:
-    """`n` random dotted-quads from a fixed-seed RNG (deterministic)."""
-    rng = random.Random(SEED)
-    return [".".join(str(rng.randint(0, 255)) for _ in range(4)) for _ in range(n)]
-
-
-def _fuzz_tokens(
-    seed_offset: int, alphabet: str, maxlen: int, n: int = 400
-) -> list[str]:
-    """`n` random strings of length 0..maxlen drawn from `alphabet` (fixed seed)."""
-    rng = random.Random(SEED + seed_offset)
-    return [
-        "".join(rng.choice(alphabet) for _ in range(rng.randint(0, maxlen)))
-        for _ in range(n)
-    ]
-
-
 def _classify_ips(ips: list[str]) -> dict[str, str]:
     """Bulk-classify every IP through bash in ONE invocation. Writes the corpus to
     the bash process's stdin; the harness sources the lib and prints, per line,
@@ -169,30 +187,55 @@ def _classify_ips(ips: list[str]) -> dict[str, str]:
 # === is_public_ipv4 differential ===
 
 
-def test_bogon_addresses_are_never_public() -> None:
-    """THE security gate (no-leak direction): every IP the independent oracle
-    places inside a bogon range MUST be reported non-public by bash. A single
-    violation = the egress firewall would admit an internal/SSRF target."""
-    corpus = _curated_ips() + _random_ips(4000)
+def test_curated_bogon_edges_are_never_public() -> None:
+    """Deterministic boundary sweep: every network/broadcast/straddling address of
+    every bogon prefix (plus the cloud-metadata endpoint and named internals) must
+    be reported non-public by bash. These are the exact IPs a netmask off-by-one
+    would leak, so they are pinned explicitly rather than left to random sampling."""
+    corpus = _curated_ips()
     classified = _classify_ips(corpus)
 
-    leaks = []
-    bogon_count = 0
-    for ip in corpus:
-        if not _oracle_is_bogon(ip):
-            continue
-        bogon_count += 1
-        # "<valid> <public>"; public flag is the second field.
-        if classified[ip].split(" ")[1] == "1":
-            leaks.append(ip)
-
+    leaks = [
+        ip
+        for ip in corpus
+        if _oracle_is_bogon(ip) and classified[ip].split(" ")[1] == "1"
+    ]
     assert not leaks, (
         "is_public_ipv4 classified bogon/internal addresses as PUBLIC "
         f"(egress leak): {sorted(set(leaks))}"
     )
-    # Guard against the corpus going degenerate (e.g. RNG/oracle wiring breaks and
-    # exercises zero bogons), which would make the assertion above vacuous.
-    assert bogon_count > 0
+    # Guard against the corpus going degenerate (oracle wiring breaks, exercising
+    # zero bogons), which would make the assertion above vacuous.
+    assert any(_oracle_is_bogon(ip) for ip in corpus)
+
+
+@settings(max_examples=200, deadline=None)
+@given(_bogon_batch)
+def test_bogon_addresses_are_never_public(ips: list[str]) -> None:
+    """THE security gate (no-leak direction): every IP Hypothesis draws from inside
+    a bogon range MUST be reported non-public by bash. A single violation = the
+    egress firewall would admit an internal/SSRF target. On failure Hypothesis
+    shrinks the batch to the minimal offending address and prints a repro seed."""
+    classified = _classify_ips(ips)
+    # "<valid> <public>"; public flag is the second field.
+    leaks = [ip for ip in ips if classified[ip].split(" ")[1] == "1"]
+    assert not leaks, (
+        "is_public_ipv4 classified bogon/internal addresses as PUBLIC "
+        f"(egress leak): {sorted(set(leaks))}"
+    )
+
+
+@settings(max_examples=100, deadline=None)
+@given(_any_batch)
+def test_wellformed_dotted_quads_are_always_valid(ips: list[str]) -> None:
+    """Every syntactically well-formed dotted quad (any of the 2^32 addresses) must
+    pass valid_ipv4 — the shape gate must never reject a legal address, or a
+    legitimate A record would be dropped before it reaches the public/bogon split.
+    The public flag is left unchecked here: over-blocking a public address is
+    fail-safe and is pinned only for the known-public anchors below."""
+    classified = _classify_ips(ips)
+    invalid = [ip for ip in ips if classified[ip].split(" ")[0] != "1"]
+    assert not invalid, f"valid_ipv4 rejected well-formed dotted quads: {invalid}"
 
 
 def test_known_public_samples_are_public() -> None:
@@ -209,9 +252,10 @@ def test_known_public_samples_are_public() -> None:
 def test_reverse_divergences_are_only_informational() -> None:
     """Sanity-check the softer direction: where the oracle says public but bash
     says private, that is fail-safe over-blocking and must NOT fail the suite. We
-    assert the divergence set excludes the known-public anchors (those are pinned
-    in their own test) rather than asserting it is empty."""
-    corpus = _curated_ips() + _random_ips(2000)
+    assert the divergence set (over the curated boundary corpus) excludes the
+    known-public anchors — those are pinned in their own test — rather than
+    asserting it is empty."""
+    corpus = _curated_ips()
     classified = _classify_ips(corpus)
     over_blocked = [
         ip
@@ -271,13 +315,20 @@ def test_valid_ipv4_accepts_well_formed() -> None:
         assert _valid_ipv4(token) is True, f"valid_ipv4 wrongly rejected {token!r}"
 
 
-def test_valid_ipv4_never_errors_on_fuzzed_strings() -> None:
+# Metacharacter-heavy alphabet (no NUL — it cannot ride in an argv slot): a
+# quoting/regex bug in valid_ipv4 would surface as a bash error rather than a
+# clean true/false on exactly these bytes.
+_IPISH_ALPHABET = "0123456789.abcf:/ -\t*$`\\\n"
+
+
+@settings(max_examples=300, deadline=None)
+@given(st.text(alphabet=_IPISH_ALPHABET, max_size=16))
+def test_valid_ipv4_never_errors_on_fuzzed_strings(token: str) -> None:
     """valid_ipv4 must return cleanly true/false for arbitrary junk, never a bash
-    error (a regex/quoting bug here would crash the resolve loop). Fuzz it with a
-    few hundred random ASCII strings, including IP-ish ones and metacharacters."""
-    for token in _fuzz_tokens(1, "0123456789.abcf:/ -\t*$`\\", 12):
-        # _valid_ipv4 asserts the call exits 0 and prints exactly ok/no.
-        _valid_ipv4(token)
+    error (a regex/quoting bug here would crash the resolve loop). `_valid_ipv4`
+    asserts the call exits 0 and prints exactly ok/no, so simply invoking it over
+    fuzzed input is the assertion."""
+    _valid_ipv4(token)
 
 
 # === valid_domain_name robustness ===
@@ -318,8 +369,12 @@ def test_valid_domain_name_rejects_embedded_empty_label() -> None:
     assert _valid_domain("a..com") is False
 
 
-def test_valid_domain_name_never_errors_on_fuzzed_input() -> None:
+_DOMAINISH_ALPHABET = "abc.-_0129 \t\n/:@*$`\\"
+
+
+@settings(max_examples=300, deadline=None)
+@given(st.text(alphabet=_DOMAINISH_ALPHABET, max_size=16))
+def test_valid_domain_name_never_errors_on_fuzzed_input(name: str) -> None:
     """Like valid_ipv4: arbitrary junk must yield a clean true/false, never a bash
     error from an unescaped metacharacter reaching the regex."""
-    for name in _fuzz_tokens(2, "abc.-_0129 \t\n/:@*$`\\", 16):
-        _valid_domain(name)
+    _valid_domain(name)

@@ -1,10 +1,10 @@
 name: gVisor isolation smoke
 
-# NOT a required check: this is a Docker end-to-end that installs the real runsc
-# (gVisor) runtime and asserts a runsc-launched container enforces process, device,
-# network, filesystem, and capability isolation. It runs on the GitHub runner's
-# Docker daemon (which this repo's dev sandbox lacks). No paths filter so it always
-# reports and is easy to reason about.
+# Required check (via the runsc-smoke-passed reporter): a Docker end-to-end that
+# installs the real runsc (gVisor) runtime and asserts a runsc-launched container
+# enforces process, device, network, filesystem, and capability isolation. It runs
+# on CI's Docker daemon (this repo's dev sandbox lacks one). No paths filter, so it
+# always fires and reports.
 on:
   push:
     branches: ["main"]
@@ -32,3 +32,15 @@ jobs:
       # reload the daemon — do NOT --cap-drop the step itself.
       - name: Install runsc and run gVisor isolation smoke
         run: sudo bash .github/scripts/run-runsc-smoke.sh
+
+  # Stable Required check: runs even when runsc-smoke is cancelled/skipped, so a
+  # protected branch never gets stuck on a check that never reports.
+  runsc-smoke-passed: # required-check: true
+    if: always()
+    needs: [runsc-smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail if any required job did not pass
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1

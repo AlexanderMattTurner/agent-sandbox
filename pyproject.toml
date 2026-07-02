@@ -4,10 +4,16 @@ version = "0.0.0"
 requires-python = ">=3.10"
 
 [project.optional-dependencies]
-dev = ["pytest>=7", "jsonschema>=4", "pytest-xdist>=3"]
+dev = ["pytest>=7", "jsonschema>=4", "pytest-xdist>=3", "hypothesis>=6"]
+# Mutation testing (cosmic-ray) for the untrusted-input Python hooks. Heavy and
+# CI-only — see .github/workflows/mutation-testing.yaml; never run locally.
+mutation = ["cosmic-ray>=8.3"]
 
 [tool.ruff]
 target-version = "py310"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "cross_platform: host-facing test that must pass on every supported host OS; the cross-platform CI matrix selects these to run on macOS (BSD) as well as Linux (GNU). Derived automatically from a test's `# covers:` directive — see tests/_xplat.py.",
+]

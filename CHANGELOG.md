@@ -12,8 +12,25 @@ the prose from the release's commits.
 
 ## Unreleased
 
+### Changed
+
+- The library's structured trace events now have a single source of truth,
+  `config/trace-events.json`, mirrored by `sandbox/trace-events.bash` and pinned
+  equal to it (with an emitter check) by a contract test. The event set is trimmed
+  to those the library actually emits (firewall, hardener, audit); consumer-only
+  events belong in a consumer overlay, not the library.
+
 ### Added
 
+- `secret_env` Workload field: credentials delivered as files at
+  `/run/secrets/<name>` (mode 0400, owned by the workload user) instead of
+  environment variables. Values are streamed over an exec's stdin into a
+  per-container tmpfs after create, so they are invisible to `docker inspect`
+  (no env, no argv, no mount source), never touch the host state dir or a
+  compose file, and die with the container on teardown. Names must be
+  env-var-shaped (`^[A-Za-z_][A-Za-z0-9_]*$`); values may contain newlines and
+  arrive byte-exact. The consumer contract is file-based: the workload reads
+  each value from its `/run/secrets` path.
 - `tty` Workload field (default false): run the entrypoint under an interactive
   `docker exec -it`, refusing the launch fail-closed when the launcher's stdin is
   not a terminal.

@@ -1,12 +1,12 @@
 name: Sandbox runtime smoke
 
-# NOT a required check: this is a Docker smoke that installs gVisor/runsc on the
-# runner and proves the extracted runtime-detect ladder + backend seam SELECT a
-# runtime AND that Docker can actually RUN a container under it (registration in
-# `docker info` is not enough — a listed-but-broken runtime dies deep in a launch).
-# It uses the runner's Docker daemon (which this repo's dev sandbox lacks). No paths
-# filter so it always fires and is easy to reason about. gVisor unavailability
-# degrades to a runc-only smoke rather than failing the job.
+# Required check (via the runtime-smoke-passed reporter): a Docker smoke that
+# installs gVisor/runsc on the runner and proves the extracted runtime-detect ladder
+# + backend seam SELECT a runtime AND that Docker can actually RUN a container under
+# it (registration in `docker info` is not enough — a listed-but-broken runtime dies
+# deep in a launch). It uses CI's Docker daemon (this repo's dev sandbox lacks one).
+# No paths filter, so it always fires and reports. gVisor unavailability degrades to
+# a runc-only smoke rather than failing the job.
 on:
   push:
     branches: ["main"]
@@ -34,3 +34,15 @@ jobs:
       # refused fail-closed.
       - name: Runtime ladder install + smoke (runc always; gVisor if installable)
         run: bash .github/scripts/run-sandbox-runtime-smoke.sh
+
+  # Stable Required check: runs even when runtime-smoke is cancelled/skipped, so a
+  # protected branch never gets stuck on a check that never reports.
+  runtime-smoke-passed: # required-check: true
+    if: always()
+    needs: [runtime-smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail if any required job did not pass
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
