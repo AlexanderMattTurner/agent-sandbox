@@ -1,0 +1,13 @@
+{
+  "_comment": "SSOT for the library's structured trace events. Every event here has a real emitter in the library (firewall init/refresh/expand, the hardener, the audit sink). sandbox/trace-events.bash is the in-container bash mirror of this file and is pinned equal to it by tests/test_trace_events_ssot.py in the same commit; each event is also asserted to have at least one emitter under sandbox/. Consumer-specific events (a monitor, a redactor, managed-settings, host-side worktree seed/extract) are NOT library events and live in the consumer's own overlay.",
+  "events": {
+    "firewall_rules_applied": { "layer": "firewall", "level": "info" },
+    "firewall_allow_all_applied": { "layer": "firewall", "level": "info" },
+    "firewall_refresh_supervised": { "layer": "firewall", "level": "info" },
+    "firewall_allowlist_expanded": { "layer": "firewall", "level": "info" },
+    "firewall_refresh_died": { "layer": "firewall", "level": "info" },
+    "firewall_ipset_batch_failed": { "layer": "firewall", "level": "info" },
+    "hardener_lockdown_applied": { "layer": "hardener", "level": "info" },
+    "audit_sink_started": { "layer": "audit", "level": "info" }
+  }
+}
