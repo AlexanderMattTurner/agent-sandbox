@@ -1,7 +1,7 @@
 name: Packet-layer egress e2e
 
-# NOT a required check: this is a Docker end-to-end that boots the real firewall
-# image (the repo's dev sandbox lacks a Docker daemon). It proves the PACKET-LAYER
+# Required check (via the packet-egress-passed reporter): a Docker end-to-end that
+# boots the real firewall image (this repo's dev sandbox lacks a Docker daemon). It proves the PACKET-LAYER
 # default-deny egress boundary — the iptables OUTPUT chain that backstops
 # squid/dnsmasq — by driving the SAME install_egress_output_rules production
 # installs and asserting per-destination packet counters: a cloud-metadata bogon is
@@ -39,3 +39,15 @@ jobs:
       # is required (dummy interface + ipset rules) — do NOT --cap-drop.
       - name: Packet-layer egress probe (bogon DROP; unlisted REJECT; allowed ACCEPT)
         run: bash .github/scripts/run-firewall-probe.sh packet-egress-probe.sh
+
+  # Stable Required check: runs even when packet-egress is cancelled/skipped, so a
+  # protected branch never gets stuck on a check that never reports.
+  packet-egress-passed: # required-check: true
+    if: always()
+    needs: [packet-egress]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail if any required job did not pass
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1

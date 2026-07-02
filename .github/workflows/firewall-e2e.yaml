@@ -1,9 +1,9 @@
 name: Firewall egress e2e
 
-# NOT a required check: this is a Docker end-to-end that boots the real squid +
-# dnsmasq to observe block/allow behaviour and the tamper-evident log. It runs on
-# the GitHub runner's Docker daemon (which this repo's dev sandbox lacks). No
-# paths filter so it is easy to reason about; the build is cheap.
+# Required check (via the egress-floor-passed reporter): a Docker end-to-end that
+# boots the real squid + dnsmasq to observe block/allow behaviour and the
+# tamper-evident log. It runs on CI's Docker daemon (this repo's dev sandbox lacks
+# one). No paths filter, so it always fires and reports.
 on:
   push:
     branches: ["main"]
@@ -34,3 +34,15 @@ jobs:
       # (dnsmasq binds :53, squid drops privileges itself) — do NOT --cap-drop.
       - name: Egress-floor probe (block denied+logged; allow spliced+logged)
         run: bash .github/scripts/run-egress-floor-probe.sh
+
+  # Stable Required check: runs even when egress-floor is cancelled/skipped, so a
+  # protected branch never gets stuck on a check that never reports.
+  egress-floor-passed: # required-check: true
+    if: always()
+    needs: [egress-floor]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail if any required job did not pass
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1

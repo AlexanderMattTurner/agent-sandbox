@@ -1,8 +1,8 @@
 name: Egress quota e2e
 
-# NOT a required check: this is a Docker end-to-end that boots the real firewall
-# image and instruments the kernel `-m quota` counter (the repo's dev sandbox
-# lacks a Docker daemon). It proves EGRESS_QUOTA_MB is a byte-exact hard cap on
+# Required check (via the egress-quota-passed reporter): a Docker end-to-end that
+# boots the real firewall image and instruments the kernel `-m quota` counter (this
+# repo's dev sandbox lacks a Docker daemon). It proves EGRESS_QUOTA_MB is a byte-exact hard cap on
 # allowed-domain egress — the e2e probe egress-rules.bash promises in its header —
 # by driving the SAME install_egress_output_rules production installs and asserting
 # the over-quota REJECT counter flips 0 -> >0 once the budget is spent. No external
@@ -37,3 +37,15 @@ jobs:
       # Root is required (dummy interface + ipset rules) — do NOT --cap-drop.
       - name: Egress-quota hard-cap probe (REJECT counter flips once budget spent)
         run: bash .github/scripts/run-firewall-probe.sh egress-quota-probe.sh
+
+  # Stable Required check: runs even when egress-quota is cancelled/skipped, so a
+  # protected branch never gets stuck on a check that never reports.
+  egress-quota-passed: # required-check: true
+    if: always()
+    needs: [egress-quota]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail if any required job did not pass
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
