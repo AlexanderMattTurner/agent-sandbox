@@ -20,8 +20,13 @@
     },
     "env": {
       "type": "object",
-      "description": "name -> value map exported into the workload container.",
+      "description": "name -> value map exported into the workload container. Delivered via a 0600 env-file consumed only while the container is created, then unlinked, so secrets never persist in the on-disk compose override (they remain visible on the live container via `docker inspect` — see docs). Values must be single-line (the env-file is line-based); a value containing a newline is refused.",
       "additionalProperties": { "type": "string" }
+    },
+    "tty": {
+      "type": "boolean",
+      "default": false,
+      "description": "When true, allocate an interactive TTY for the workload's entrypoint (docker exec -it) and attach the launcher's stdin. Requires the launcher to run from a real terminal; the launch fails loudly if stdin is not a TTY. Default false (non-interactive, e.g. CI)."
     },
     "user": {
       "type": "string",

@@ -14,6 +14,13 @@ the prose from the release's commits.
 
 ### Added
 
+- `tty` Workload field (default false): run the entrypoint under an interactive
+  `docker exec -it`, refusing the launch fail-closed when the launcher's stdin is
+  not a terminal.
+- Workload `env` is now delivered via a 0600 env-file consumed only while the
+  container is created, then unlinked — so secrets no longer persist in the
+  on-disk session compose override (they remain visible on the live container via
+  `docker inspect`). Values must be single-line; a newline is refused.
 - `agent-sandbox gc [--dry-run]` prunes stale sandbox networks with no live
   containers, reclaiming dead sessions' subnets; `--dry-run` previews the count
   a real run would remove.
