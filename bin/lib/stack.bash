@@ -68,22 +68,43 @@ stack_ensure_firewall_image() {
 }
 
 # _stack_write_override WORKLOAD_JSON OUT — generate the per-session compose
-# override carrying the parts of the Workload record a static file can't: its env
-# map and (host-mode) its workspace bind, which replaces the named volume by
-# target-path merge. JSON is valid YAML, so compose consumes it directly.
+# override carrying the part of the Workload record a static file can't: (host-mode)
+# its workspace bind, which replaces the named volume by target-path merge. The env
+# map does NOT ride here — it is delivered via a 0600 up-only env-file
+# (_stack_write_env_delivery) so secrets never persist in this on-disk override. JSON
+# is valid YAML, so compose consumes it directly. With no workspace_mount the workload
+# object is `{}`, a valid no-op override.
 _stack_write_override() {
   local workload="$1" out="$2"
-  # `$` → `$$`: compose runs variable interpolation over every file it loads,
-  # so a literal dollar in a Workload env value (or mount path) must be escaped
-  # or it would be expanded against the LAUNCHER's environment.
+  # `$` → `$$`: compose runs variable interpolation over every file it loads, so a
+  # literal dollar in a mount path must be escaped or it would be expanded against
+  # the LAUNCHER's environment.
   jq '{
     services: {
-      workload: ({environment: ((.env // {}) | with_entries(.value |= gsub("\\$"; "$$")))}
-        + (if .workspace_mount
-           then {volumes: [{type: "bind", source: (.workspace_mount | gsub("\\$"; "$$")), target: "/workspace"}]}
-           else {} end))
+      workload: (if .workspace_mount
+                 then {volumes: [{type: "bind", source: (.workspace_mount | gsub("\\$"; "$$")), target: "/workspace"}]}
+                 else {} end)
     }
   }' "$workload" >"$out"
+}
+
+# _stack_write_env_delivery WORKLOAD_JSON ENVFILE OVERRIDE — stage the workload's env
+# map for delivery to the container WITHOUT persisting it in the session override:
+# write a 0600 KEY=VALUE env-file and an up-only compose override that references it
+# via `env_file`. The caller passes the override to `up` only, then unlinks the
+# env-file, so the secrets live on disk just long enough for compose to bake them into
+# the container. env-file is line-based, so a value containing a newline (which would
+# corrupt the file / split into bogus KEY lines) is refused loudly.
+_stack_write_env_delivery() {
+  local workload="$1" envfile="$2" override="$3"
+  if jq -e '[(.env // {})[] | select(contains("\n"))] | length > 0' "$workload" >/dev/null; then
+    as_error "workload.env values must be single-line (a value contains a newline); env is delivered via a line-based env-file"
+    return 1
+  fi
+  # env-file values are literal (compose does no interpolation over env_file), so —
+  # unlike the compose override above — no `$` escaping is applied.
+  (umask 077 && jq -r '(.env // {}) | to_entries[] | "\(.key)=\(.value)"' "$workload" >"$envfile") || return 1
+  jq -n --arg ef "$envfile" '{services: {workload: {env_file: [$ef]}}}' >"$override"
 }
 
 # _stack_export_egress_log PROJECT COMPOSE OVERRIDE OVERMOUNTS STATE_DIR — copy squid's
@@ -148,6 +169,19 @@ stack_run() {
   export WORKLOAD_IMAGE WORKLOAD_USER WORKLOAD_RUNTIME WORKLOAD_IP
   # The seed/extract execs must run as the same user the workload writes as.
   export AGENT_SANDBOX_WORKLOAD_USER="$WORKLOAD_USER"
+
+  # tty is a runtime precondition, not a file field: an interactive entrypoint needs a
+  # real terminal on the launcher's stdin. Check it BEFORE bringing anything up so we
+  # fail fast instead of tearing down a healthy stack we could never attach to.
+  local want_tty=false
+  if [[ "$(jq -r '.tty // false' "$workload")" == "true" ]]; then
+    [[ -t 0 ]] || {
+      as_error "workload.tty is true but the launcher's stdin is not a TTY — run agent-sandbox from an interactive terminal, or set tty:false"
+      return 1
+    }
+    want_tty=true
+  fi
+
   stack_partition_allowlist "$workload"
   # The default library services (hardener, audit) are profile-gated in the
   # compose: compose cannot REMOVE a service via an override, so a workload
@@ -181,11 +215,29 @@ stack_run() {
   local ephemeral
   ephemeral="$(jq -r '.ephemeral' "$workload")"
 
+  # Secret env delivery: a 0600 env-file consumed ONLY by `up` (staged as an up-only
+  # override appended last to the compose file set), then unlinked once the container
+  # is created — so the workload's secrets never persist in the on-disk override.
+  # Empty env → no file, no override. Residual `docker inspect` visibility on the live
+  # container is documented (compose-secrets is tracked separately).
+  local env_file="" env_override="" env_idx=-1
+  if [[ "$(jq '(.env // {}) | length' "$workload")" -gt 0 ]]; then
+    env_file="$state/workload.env"
+    env_override="$state/workload-env-override.json"
+    _stack_write_env_delivery "$workload" "$env_file" "$env_override" || {
+      as_error "could not prepare the workload env-file"
+      return 1
+    }
+    env_idx=${#_STACK_EXTRA_COMPOSE[@]}
+    _STACK_EXTRA_COMPOSE+=("$env_override")
+  fi
+
   as_info "compose: bringing up firewall + workload (project $project)"
   if ! _stack_compose "$project" "$compose" "$override" "$overmounts" up -d --wait --wait-timeout 240; then
     as_error "the firewall+workload compose stack did not come up healthy — firewall logs follow"
     _stack_compose "$project" "$compose" "$override" "$overmounts" logs firewall >&2 || true           # allow-exit-suppress: best-effort diagnostics on an already-failed launch
     _stack_compose "$project" "$compose" "$override" "$overmounts" down --volumes --timeout 30 || true # allow-exit-suppress: best-effort cleanup of a stack that never came up healthy; the launch already failed loudly
+    [[ -n "$env_file" ]] && rm -f "$env_file"                                                          # never leave the secret env-file on disk, even on a failed launch
     return 1
   fi
   local cid
@@ -193,7 +245,15 @@ stack_run() {
   if [[ -z "$cid" ]]; then
     as_error "the workload container did not start (compose project $project)"
     _stack_compose "$project" "$compose" "$override" "$overmounts" down --volumes --timeout 30 || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
+    [[ -n "$env_file" ]] && rm -f "$env_file"                                                          # never leave the secret env-file on disk
     return 1
+  fi
+
+  # Container created — its env is baked in. Drop the up-only env override so no later
+  # compose call (ps/logs/down) references it, and unlink the secret env-file now.
+  if [[ -n "$env_file" ]]; then
+    [[ "$env_idx" -ge 0 ]] && unset "_STACK_EXTRA_COMPOSE[$env_idx]"
+    rm -f "$env_file" "$env_override"
   fi
 
   # Fail-closed guardrail verify (BIND MODE only): the read-only overmounts are a security
@@ -260,8 +320,12 @@ stack_run() {
   for ((_i = 0; _i < _n; _i++)); do
     argv+=("$(jq -r ".entrypoint[$_i]" "$workload")")
   done
+  local -a exec_flags=(-u "$WORKLOAD_USER" -w /workspace)
+  # tty:true attaches an interactive terminal (validated against a real stdin at the
+  # top of stack_run); the default is a plain non-interactive exec.
+  [[ "$want_tty" == true ]] && exec_flags+=(-it)
   local workload_rc=0
-  docker exec -u "$WORKLOAD_USER" -w /workspace "$cid" "${argv[@]}" || workload_rc=$?
+  docker exec "${exec_flags[@]}" "$cid" "${argv[@]}" || workload_rc=$?
   if [[ "$workload_rc" -ne 0 ]]; then
     as_warn "workload exited with status $workload_rc"
   fi

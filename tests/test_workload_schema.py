@@ -122,6 +122,22 @@ def test_default_service_optouts_reject_non_booleans(field, value):
         jsonschema.validate({**_with_allowlist([]), field: value}, SCHEMA)
 
 
+def test_tty_defaults_false_and_is_boolean():
+    assert SCHEMA["properties"]["tty"]["type"] == "boolean"
+    assert SCHEMA["properties"]["tty"]["default"] is False
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_tty_accepts_booleans(value):
+    jsonschema.validate({**_with_allowlist([]), "tty": value}, SCHEMA)
+
+
+@pytest.mark.parametrize("value", ["true", 1, None], ids=["string", "int", "null"])
+def test_tty_rejects_non_booleans(value):
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({**_with_allowlist([]), "tty": value}, SCHEMA)
+
+
 def _overmount_paths_schema() -> dict:
     return SCHEMA["properties"]["overmount_paths"]
 
