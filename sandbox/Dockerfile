@@ -50,4 +50,5 @@ RUN mkdir -p /var/log/squid && chmod 750 /var/log/squid && chown proxy:proxy /va
 # they must all land together on PATH.
 COPY firewall-lib.bash ip-validation.bash dns-resolver.bash squid-config.bash \
   egress-rules.bash conntrack.bash trace.bash trace-events.bash launch-trace.bash \
-  launch-marks.bash json.bash init-firewall.bash /usr/local/bin/
+  launch-marks.bash json.bash init-firewall.bash hardener-entrypoint.bash \
+  audit_sink.py /usr/local/bin/

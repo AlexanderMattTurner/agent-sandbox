@@ -127,6 +127,19 @@ stack_run() {
   # The seed/extract execs must run as the same user the workload writes as.
   export AGENT_SANDBOX_WORKLOAD_USER="$WORKLOAD_USER"
   stack_partition_allowlist "$workload"
+  # The default library services (hardener, audit) are profile-gated in the
+  # compose: compose cannot REMOVE a service via an override, so a workload
+  # opt-out (hardener:false / audit:false) is expressed by not activating the
+  # profile. The workload's depends_on entries carry required:false, so a
+  # deactivated profile drops the gate instead of failing `up`.
+  local _profiles=()
+  jq -e '.hardener == false' "$workload" >/dev/null || _profiles+=("hardener")
+  jq -e '.audit == false' "$workload" >/dev/null || _profiles+=("audit")
+  COMPOSE_PROFILES="$(
+    IFS=,
+    printf '%s' "${_profiles[*]-}"
+  )"
+  export COMPOSE_PROFILES
   stack_ensure_firewall_image "$sandbox_dir" || return 1
 
   local override="$state/workload-override.json"
