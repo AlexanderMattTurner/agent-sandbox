@@ -163,6 +163,49 @@ def test_secret_env_rejects_unsafe_names_and_non_string_values(secrets):
         jsonschema.validate({**_with_allowlist([]), "secret_env": secrets}, SCHEMA)
 
 
+# (?![\s\S]) rather than $: Python's re lets a plain $ match before a string-final
+# newline, and the value becomes a compose project name / docker label filter.
+SESSION_TOKEN_PATTERN = "^[a-z0-9][a-z0-9_-]{0,40}(?![\\s\\S])"
+
+
+@pytest.mark.parametrize("field", ["session_id", "resume_from"])
+def test_session_identity_fields_pin_the_compose_safe_pattern(field):
+    """The pattern is the runtime contract too: bin/agent-sandbox mirrors it in a jq
+    gate, and the compose project name / docker label filters are built from the raw
+    value, so the schema must never silently loosen it."""
+    assert SCHEMA["properties"][field]["pattern"] == SESSION_TOKEN_PATTERN
+
+
+@pytest.mark.parametrize("field", ["session_id", "resume_from"])
+@pytest.mark.parametrize(
+    "value",
+    ["a", "abc-123", "a_b-c", "0" + "a" * 40],
+    ids=["single-char", "hyphenated", "underscore", "max-41-chars"],
+)
+def test_session_identity_fields_accept_compose_safe_tokens(field, value):
+    jsonschema.validate({**_with_allowlist([]), field: value}, SCHEMA)
+
+
+@pytest.mark.parametrize("field", ["session_id", "resume_from"])
+@pytest.mark.parametrize(
+    "value",
+    ["", "-leading-hyphen", "Has-Upper", "has space", "a" * 42, "dot.dot", "sid\n", 7],
+    ids=[
+        "empty",
+        "leading-hyphen",
+        "uppercase",
+        "space",
+        "too-long-42",
+        "dot",
+        "trailing-newline",
+        "non-string",
+    ],
+)
+def test_session_identity_fields_reject_unsafe_tokens(field, value):
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({**_with_allowlist([]), field: value}, SCHEMA)
+
+
 def test_tty_defaults_false_and_is_boolean():
     assert SCHEMA["properties"]["tty"]["type"] == "boolean"
     assert SCHEMA["properties"]["tty"]["default"] is False
