@@ -1,8 +1,8 @@
 name: Demo workload acceptance (e2e)
 
-# NOT a required check: Docker end-to-ends that run the real launcher against the
-# shipped demo workloads on the runner's daemon (this repo's dev sandbox has no
-# Docker). demo-acceptance (seed mode): a non-claude workload boots, is
+# Required check (via the demo-acceptance-passed reporter): Docker end-to-ends that
+# run the real launcher against the shipped demo workloads on CI's daemon (this
+# repo's dev sandbox has no Docker). demo-acceptance (seed mode): a non-claude workload boots, is
 # egress-restricted to exactly its declared allowlist (denied at the proxy AND in
 # the egress log; allowed host splices through AND is logged), its writes land on a
 # review branch, and the ephemeral teardown leaves nothing behind. bind-acceptance
@@ -45,3 +45,15 @@ jobs:
 
       - name: Run the bind-mode workload end-to-end and assert the guardrails are read-only
         run: bash .github/scripts/run-bind-acceptance.sh
+
+  # Stable Required check: runs even when either acceptance job is cancelled/skipped,
+  # so a protected branch never gets stuck on a check that never reports.
+  demo-acceptance-passed: # required-check: true
+    if: always()
+    needs: [demo-acceptance, bind-acceptance]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail if any required job did not pass
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1

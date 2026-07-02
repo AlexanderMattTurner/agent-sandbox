@@ -1,0 +1,51 @@
+name: Egress quota e2e
+
+# Required check (via the egress-quota-passed reporter): a Docker end-to-end that
+# boots the real firewall image and instruments the kernel `-m quota` counter (this
+# repo's dev sandbox lacks a Docker daemon). It proves EGRESS_QUOTA_MB is a byte-exact hard cap on
+# allowed-domain egress — the e2e probe egress-rules.bash promises in its header —
+# by driving the SAME install_egress_output_rules production installs and asserting
+# the over-quota REJECT counter flips 0 -> >0 once the budget is spent. No external
+# network. See tests/smoke/egress-quota-probe.sh.
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  egress-quota:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Build firewall image
+        run: docker build -f sandbox/Dockerfile -t agent-sandbox-firewall:ci sandbox/
+
+      # The probe stands up a dummy interface with a public ip, installs the real
+      # OUTPUT chain via the SSOT function under EGRESS_QUOTA_MB=1, drives a >1 MB
+      # upload, and asserts the quota REJECT counter flips once the budget is spent.
+      # Root is required (dummy interface + ipset rules) — do NOT --cap-drop.
+      - name: Egress-quota hard-cap probe (REJECT counter flips once budget spent)
+        run: bash .github/scripts/run-firewall-probe.sh egress-quota-probe.sh
+
+  # Stable Required check: runs even when egress-quota is cancelled/skipped, so a
+  # protected branch never gets stuck on a check that never reports.
+  egress-quota-passed: # required-check: true
+    if: always()
+    needs: [egress-quota]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail if any required job did not pass
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1

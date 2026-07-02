@@ -1,0 +1,65 @@
+name: Mutation testing
+
+# cosmic-ray mutation gate for the untrusted-input Python hooks. Proves the unit
+# tests ASSERT behaviour (kill mutants) rather than merely execute lines — the
+# distinction that matters for safe-launch-parse.py, which parses attacker-
+# influenced PreToolUse JSON to gate self-repair edits on hook files.
+#
+# No paths filter: mutation-testing-passed is a required status check, so the
+# workflow must always fire and report — a path-gated required check hangs at
+# "Expected — Waiting" forever when a PR doesn't touch the filtered paths. The
+# run is a single tiny module (~30 mutants), so it stays cheap enough to always
+# run rather than decide-gate.
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  mutate:
+    name: cosmic-ray (safe-launch-parse)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Setup base environment
+        uses: ./.github/actions/setup-base-env
+        with:
+          setup-python: "true"
+
+      # Pass BOTH extras on the run itself: `uv run` syncs the environment to the
+      # invocation's extras, so requesting them here keeps cosmic-ray installed and
+      # activates the venv (its console scripts + `python -m pytest` test-command
+      # all resolve to this interpreter).
+      - name: Run cosmic-ray mutation gate
+        run: uv run --extra dev --extra mutation bash .github/scripts/run-mutation.sh
+
+      - name: Upload mutation report
+        if: always() && hashFiles('safe-launch-parse-mutation.html') != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mutation-report
+          path: safe-launch-parse-mutation.html
+          retention-days: 14
+
+  # Stable Required check: runs even when `mutate` is cancelled/skipped, so a
+  # protected branch never gets stuck on a check that never reports.
+  mutation-testing-passed: # required-check: true
+    if: always()
+    needs: [mutate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail if any required job did not pass
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
