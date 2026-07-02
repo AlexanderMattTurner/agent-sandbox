@@ -117,6 +117,7 @@ def fake_fw(tmp_path: Path) -> dict:
     env.pop("IPSET_MISSING", None)
     return {
         "env": env,
+        "stub_dir": stub_dir,
         "overlay": overlay,
         "dnsmasq_conf": dnsmasq_conf,
         "ro_domains": ro_domains,
@@ -194,7 +195,7 @@ def test_add_failure_with_set_present_warns_and_does_not_abort(fake_fw: dict) ->
     failure: when the set is still present but `ipset add` fails, the domain resolved yet
     was not admitted — a half-populated allowlist that must be surfaced (WARNING), not
     swallowed by `|| true`, while expansion continues so the next refresh re-adds it."""
-    stub_dir = Path(fake_fw["env"]["PATH"].split(":", 1)[0])
+    stub_dir = fake_fw["stub_dir"]
     # list -name succeeds (set IS present) but every add fails.
     write_exe(
         stub_dir / "ipset",
@@ -213,7 +214,7 @@ def test_add_failure_with_set_present_warns_and_does_not_abort(fake_fw: dict) ->
 
 def test_requires_root(fake_fw: dict) -> None:
     # Shadow `id` with one reporting a non-root uid; the guard must fire.
-    stub_dir = Path(fake_fw["env"]["PATH"].split(":", 1)[0])
+    stub_dir = fake_fw["stub_dir"]
     write_exe(stub_dir / "id", "#!/bin/sh\necho 1000\n")
     r = run_expand(fake_fw["env"], "example.com")
     assert r.returncode == 1
