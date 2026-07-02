@@ -329,8 +329,7 @@ def test_render_fails_closed_when_a_host_does_not_resolve(tmp_path):
         tmp_path, '[{"uid":7777,"hosts":["gate.example.com"]}]', resolve="dead"
     )
     assert r.returncode != 0
-    assert "gate.example.com" in r.stderr
-    assert "did not resolve" in r.stderr
+    assert "host 'gate.example.com' did not resolve" in r.stderr
     # No half-applied grant: the ACCEPT rule was never emitted.
     assert not any(ln.startswith("iptables ") for ln in log)
     assert not conf.exists() or "address=" not in conf.read_text()
