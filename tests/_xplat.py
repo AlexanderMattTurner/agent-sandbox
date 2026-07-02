@@ -1,0 +1,146 @@
+"""SSOT for which host-facing shell files get macOS/BSD CI coverage.
+
+The host launcher shell — `setup.sh`, the `bin/agent-sandbox` wrapper, and the
+`bin/lib/*.bash` helpers it sources — runs on the user's own machine, where macOS
+ships BSD coreutils and a 2007-vintage bash 3.2. Linux CI only ever runs the GNU
+arm of each `stat -c '%a' || stat -f '%Lp'` fallback and never the `uname -s`
+Darwin branch; the BSD arm — the one that actually executes on a Mac — runs only
+on the cross-platform matrix (`.github/workflows/cross-platform-tests.yaml`),
+which selects exactly the `@pytest.mark.cross_platform`-marked tests.
+
+`XPLAT_HOST_FILES` is the human-judgment SSOT of which host files must get that
+coverage. `tests/conftest.py` derives the marker from it: a test whose `# covers:`
+directive names one of these files is marked `cross_platform` automatically, so
+the matrix runs it on macOS/BSD too — no per-file `pytestmark` to drift.
+
+The set is hand-maintained on purpose. `PORTABLE_CONSTRUCTS` is only a
+completeness backstop: `tests/test_cross_platform_coverage_guard.py` asserts every
+host file whose CODE contains a GNU/BSD-divergent construct is declared here, so a
+new helper with a real fallback can't land with only a Linux-only test. The set
+may also hold POSIX host files with no divergent construct (they still write into
+the user's macOS filesystem) — the backstop under-matches on purpose.
+"""
+
+import re
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+# Host source files that must get macOS/BSD coverage. Hand-maintained SSOT —
+# read the module docstring before changing it.
+XPLAT_HOST_FILES: set[str] = {
+    # Branches on `uname -s` (the Darwin arm only ever runs on a Mac) and probes
+    # /dev/kvm presence — the runtime-detection ladder the launcher runs first.
+    "bin/lib/runtime-detect.bash",
+    # Reads the sandbox netns dir owner/mode via `stat -c '%u'/'%a' || stat -f
+    # '%u'/'%Lp'`; the BSD arm runs on the macOS host.
+    "bin/lib/sandbox-net.bash",
+    # worktree_secure_mkdir locks the host plaintext-store dir owner-only, reading
+    # its mode/owner via `stat -c '%a'/'%u' || stat -f '%Lp'/'%u'`, and writes into
+    # the user's filesystem (macOS BSD coreutils on the host), so its mode /
+    # hostile-pre-state assertions must run on the BSD leg too.
+    "bin/lib/worktree-seed.bash",
+}
+
+# GNU/BSD-divergent constructs. Completeness backstop only — NOT used to drive
+# marking (see docstring); the guard asserts the set they detect is a subset of
+# XPLAT_HOST_FILES.
+PORTABLE_CONSTRUCTS = re.compile(
+    r"""
+      stat\ -c            # GNU stat format
+    | stat\ -f            # BSD stat format
+    | readlink\ -f        # GNU-only; macOS lacks it — the shim's tell
+    | \bgtimeout\b        # coreutils-via-brew shim names
+    | \bgrealpath\b
+    | \bgstat\b
+    | \bgsed\b
+    | sed\ -i\ ''         # BSD in-place sed — empty suffix arg
+    | BASH_VERSINFO       # the bash-5 guard / re-exec
+    | uname\ -s           # OS branch
+    """,
+    re.VERBOSE,
+)
+
+# Inline opt-out for a host source file whose only portable construct runs INSIDE
+# the Linux sandbox container, never on the macOS host.
+CONTAINER_ONLY_MARKER = "cross-platform-guard: container-only"
+
+# Inline opt-out for a TEST that covers an XPLAT host file but exercises only
+# Linux-specific behavior (a kata/runsc microVM path, a real Docker dependency the
+# macOS leg lacks), so it can't honestly run on the macOS leg. The conftest skips
+# the derived marker for such a module; the host file it covers stays macOS-covered
+# by its OTHER coverers — the guard asserts that, so this can't silently hollow a
+# file's BSD coverage.
+DERIVE_SKIP_MARKER = "cross-platform-derive: linux-only"
+
+
+def _strip_comments(text: str) -> str:
+    """Drop whole-line bash comments so a construct merely DOCUMENTED in a comment
+    doesn't count as live portability code."""
+    return "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+
+
+def _is_host_bash(path: Path) -> bool:
+    """A host-runnable bash file: a `.bash` library, or an extension-less
+    `bin/agent-sandbox*` wrapper with a bash shebang (excludes Python entry points)."""
+    if path.suffix == ".bash":
+        return True
+    if path.suffix:
+        return False
+    try:
+        first = path.read_bytes().split(b"\n", 1)[0]
+    except OSError:
+        return False
+    return first.startswith(b"#!") and b"bash" in first
+
+
+def host_source_files() -> list[Path]:
+    """The host launcher surface: setup.sh, the bin/agent-sandbox bash wrapper, and
+    the bin/lib/*.bash helpers. Excludes sandbox/ (runs inside the container)."""
+    files: list[Path] = []
+    setup = REPO_ROOT / "setup.sh"
+    if setup.is_file():
+        files.append(setup)
+    for p in sorted((REPO_ROOT / "bin").glob("agent-sandbox*")):
+        if p.is_file() and _is_host_bash(p):
+            files.append(p)
+    files.extend(sorted((REPO_ROOT / "bin" / "lib").glob("*.bash")))
+    return files
+
+
+def portable_host_files() -> set[str]:
+    """Repo-relative host source files containing a GNU/BSD-divergent construct in
+    CODE (comments stripped), minus the inline container-only opt-outs."""
+    found: set[str] = set()
+    for p in host_source_files():
+        text = p.read_text()
+        if CONTAINER_ONLY_MARKER in text:
+            continue
+        if PORTABLE_CONSTRUCTS.search(_strip_comments(text)):
+            found.add(str(p.relative_to(REPO_ROOT)))
+    return found
+
+
+_COVERS_RE = re.compile(r"^#\s*covers:\s*(?P<targets>.+)$", re.M)
+
+
+def _covers_targets(text: str) -> set[str]:
+    targets: set[str] = set()
+    for line in _COVERS_RE.findall(text):
+        targets.update(t for t in re.split(r"[,\s]+", line.strip()) if t)
+    return targets
+
+
+def covers_of(test_file: Path) -> set[str]:
+    """Parse a test file's `# covers:` directives into the set of repo-relative
+    source files it covers (targets are comma- and/or space-separated)."""
+    return _covers_targets(test_file.read_text())
+
+
+def derives_cross_platform(test_file: Path) -> bool:
+    """Whether the conftest should mark this test `cross_platform`: it covers an
+    XPLAT host file AND is not opted out as Linux-only-behavior (DERIVE_SKIP_MARKER)."""
+    text = test_file.read_text()
+    if DERIVE_SKIP_MARKER in text:
+        return False
+    return bool(_covers_targets(text) & XPLAT_HOST_FILES)

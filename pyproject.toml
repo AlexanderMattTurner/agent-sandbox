@@ -14,3 +14,6 @@ target-version = "py310"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "cross_platform: host-facing test that must pass on every supported host OS; the cross-platform CI matrix selects these to run on macOS (BSD) as well as Linux (GNU). Derived automatically from a test's `# covers:` directive — see tests/_xplat.py.",
+]

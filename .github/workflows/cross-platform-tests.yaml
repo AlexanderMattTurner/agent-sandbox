@@ -1,0 +1,112 @@
+name: Cross-platform host tests
+
+# One platform-agnostic test set, run on every supported host OS. Tests tagged
+# `@pytest.mark.cross_platform` (derived from a test's `# covers:` directive naming
+# a file in tests/_xplat.py's XPLAT_HOST_FILES — the single source of truth for
+# "must pass on GNU/Linux AND BSD/macOS") are selected here and run under an OS
+# matrix. There is no second, macOS-specific test set to keep in sync: marking a new
+# host-facing test is all it takes to get macOS coverage.
+#
+# Scope: this tier is the host launcher shell (setup.sh, bin/agent-sandbox, the
+# bin/lib/*.bash helpers) — no Docker. The container / firewall / runsc e2e stay
+# Linux-only because they need a Linux kernel; macOS runners have none (and no
+# Docker daemon). The macOS leg exercises the BSD arm of each `stat -c || stat -f`
+# fallback and the `uname -s` Darwin branch — the code that only ever runs on a Mac.
+#
+# The expensive leg is job-gated (decide) so an unrelated PR never boots the macOS
+# runner, but the workflow always fires so the required reporter always reports (a
+# path-filtered required check hangs at "Expected — Waiting" forever). The push
+# trigger keeps a paths filter to skip redundant post-merge runs.
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "setup.sh"
+      - "bin/**"
+      - "tests/**/*.py"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".python-version"
+      - ".github/scripts/xplat-decide.sh"
+      - ".github/workflows/cross-platform-tests.yaml"
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Job-level path gate so an irrelevant PR never boots the (10x-cost) macOS runner,
+  # while the workflow still always fires and the reporter always reports.
+  decide:
+    name: Decide (cross-platform host tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.c.outputs.run }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - id: c
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: bash .github/scripts/xplat-decide.sh
+
+  cross-platform-run:
+    name: Cross-platform host tests (${{ matrix.os }})
+    needs: decide
+    if: needs.decide.outputs.run == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Setup base environment
+        uses: ./.github/actions/setup-base-env
+        with:
+          setup-python: "true"
+
+      # The host suites source bin/lib/*.bash, which use bash 5 constructs (mapfile)
+      # and call `timeout` — neither ships on stock macOS. A real setup provisions
+      # exactly these (Homebrew bash on PATH; gtimeout symlinked to `timeout`), so
+      # mirror that here. BSD coreutils stay the default (no gnubin on PATH), so the
+      # lane still exercises the GNU/BSD `stat` divergence it exists to catch.
+      - name: Provision bash 5 + timeout shim (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install bash coreutils
+          mkdir -p "$HOME/.local/bin"
+          ln -sf "$(command -v gtimeout)" "$HOME/.local/bin/timeout"
+          echo "$(brew --prefix bash)/bin" >>"$GITHUB_PATH"
+          echo "$HOME/.local/bin" >>"$GITHUB_PATH"
+
+      # Same selection on both OSes — the marker is the only thing that decides what
+      # runs. macOS exercises BSD coreutils (where `stat`, `readlink` diverge from GNU).
+      - name: Run cross-platform-marked host tests
+        run: uv run --extra dev pytest -m cross_platform -v --tb=short
+
+  # Stable Required check: runs even when the matrix is skipped (decide=false) or a
+  # leg is cancelled, so a protected branch never gets stuck on a check that never
+  # reports. A skipped matrix is not a failure, so the gate passes.
+  cross-platform-tests-passed: # required-check: true
+    if: always()
+    needs: [decide, cross-platform-run]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail if any required job did not pass
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
