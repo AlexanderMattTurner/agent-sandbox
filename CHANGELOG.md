@@ -40,7 +40,13 @@ the prose from the release's commits.
     chained `audit.jsonl` and per-session HMAC `audit.secret` (owner-only) beside
     the egress log; on resume the prior log is mounted read-only at
     `/var/log/agent-sandbox/audit.prior.jsonl` in the new audit container, so the
-    prior chain stays verifiable while the new session mints a fresh secret.
+    prior chain stays verifiable while the new session mints a fresh secret. The
+    export folds any mounted prior chain ahead of the live log, so continuity is
+    transitive across a multi-hop resume chain (A→B→C carries A's events into C).
+  - Concurrent runs of the same deterministic identity are serialized by a
+    host-side session-attach lock (atomic mkdir under the runtime dir), so two
+    launches can never both re-attach and extract onto one stack; the loser is
+    refused, and a lock left by a crashed launcher is reclaimed as stale.
   - Seed-mode sessions record a session manifest
     (`sessions/<project>/session.json`, owner-only) carrying identity and seed
     provenance (base commit, extract base, review branch, repo root, outcome).

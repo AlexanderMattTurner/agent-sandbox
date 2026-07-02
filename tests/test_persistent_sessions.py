@@ -41,7 +41,12 @@ case "$*" in
   "volume ls -q --filter label=com.docker.compose.project="*)
     [[ -n "${{FAKE_VOLUMES:-}}" ]] && echo vol1 ;;
   "cp "*)
-    touch "$3" ;;
+    case "$2" in
+      *audit.prior.jsonl)
+        [[ -n "${{FAKE_AUDIT_PRIOR:-}}" ]] && printf 'PRIOR\\n' >"$3" || exit 1 ;;
+      *audit.jsonl) printf 'LIVE\\n' >"$3" ;;
+      *) touch "$3" ;;
+    esac ;;
   *"cat /workspace/.git/sandbox-seed-head"*)
     [[ -n "${{FAKE_SEED_HEAD:-}}" ]] && echo "$FAKE_SEED_HEAD" ;;
   "compose "*" ps -q workload")
@@ -176,6 +181,40 @@ def test_running_session_with_same_id_is_refused(tmp_path):
     assert "already running" in r.stderr
     # Refused before any compose invocation (only the probe `ps` ran).
     assert not [line for line in log.splitlines() if line.startswith("compose ")]
+
+
+def test_deterministic_run_refused_when_session_claim_is_held(tmp_path):
+    """Concurrency guard: a live claim on the session's project (another launcher
+    mid-probe) refuses the second run before it can `up` — no double-attach."""
+    claim = tmp_path / "xdg" / "agent-sandbox" / "session-claims" / "agent-sandbox-sid1"
+    claim.mkdir(parents=True)
+    (claim / "pid").write_text(f"{os.getpid()}\n")  # this (live) process holds it
+    r, log = _run(
+        tmp_path,
+        _seeded(session_id="sid1", ephemeral=False, review_branch="sandbox/rb1"),
+        extra_env={"FAKE_WORKLOAD_CID": "1"},
+    )
+    assert r.returncode != 0
+    assert "already being launched by pid" in r.stderr
+    assert not [line for line in log.splitlines() if line.startswith("compose ")]
+
+
+def test_deterministic_run_steals_a_stale_session_claim(tmp_path):
+    """A claim left by a crashed launcher (dead holder pid) must not block forever:
+    the next run detects it stale and reclaims it, launching normally."""
+    claim = tmp_path / "xdg" / "agent-sandbox" / "session-claims" / "agent-sandbox-sid1"
+    claim.mkdir(parents=True)
+    # A pid that is not alive (the reserved max pid is never a running process here).
+    (claim / "pid").write_text("2147483647\n")
+    repo, _head = _repo(tmp_path)
+    r, log = _run(
+        tmp_path,
+        _seeded(session_id="sid1", ephemeral=False, review_branch="sandbox/rb1"),
+        extra_env={"FAKE_WORKLOAD_CID": "1"},
+        cwd=repo,
+    )
+    assert r.returncode == 0, r.stderr
+    assert [line for line in log.splitlines() if " up -d " in line]
 
 
 def test_reattach_with_ephemeral_true_is_refused(tmp_path):
@@ -536,6 +575,40 @@ def test_export_audit_log_copies_log_and_secret_owner_only(tmp_path):
     assert "cp acid:/run/audit-secret/secret" in log
     for name in ("audit.jsonl", "audit.secret"):
         assert (state / name).stat().st_mode & 0o777 == 0o600
+
+
+def test_export_audit_log_folds_prior_chain_before_live(tmp_path):
+    """Transitive continuity: a resumed session's export concatenates the mounted
+    prior chain BEFORE this session's live log, so the NEXT resume's mounted prior
+    carries the full kill-chain across every hop, not just one back."""
+    state = tmp_path / "state"
+    state.mkdir()
+    r, _ = _source_stack(
+        tmp_path,
+        '_stack_export_audit_log proj compose.yml o.json m.json "$1"',
+        str(state),
+        extra_env={"FAKE_AUDIT_CID": "1", "FAKE_AUDIT_PRIOR": "1"},
+    )
+    assert r.returncode == 0, r.stderr
+    assert (state / "audit.jsonl").read_text() == "PRIOR\nLIVE\n"
+    # The scratch halves are cleaned up.
+    assert not (state / ".audit.live").exists()
+    assert not (state / ".audit.prior").exists()
+
+
+def test_export_audit_log_without_prior_is_live_only(tmp_path):
+    """The common (non-resumed) case: no audit.prior.jsonl to fold, so the export
+    is exactly the live chain — not an error."""
+    state = tmp_path / "state"
+    state.mkdir()
+    r, _ = _source_stack(
+        tmp_path,
+        '_stack_export_audit_log proj compose.yml o.json m.json "$1"',
+        str(state),
+        extra_env={"FAKE_AUDIT_CID": "1"},
+    )
+    assert r.returncode == 0, r.stderr
+    assert (state / "audit.jsonl").read_text() == "LIVE\n"
 
 
 def test_export_audit_log_warns_when_no_audit_container(tmp_path):

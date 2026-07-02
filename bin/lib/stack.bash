@@ -337,19 +337,46 @@ _stack_update_manifest() {
 # _stack_export_audit_log PROJECT COMPOSE OVERRIDE OVERMOUNTS STATE_DIR — copy the audit
 # sink's chained log AND its per-session HMAC secret out of the audit container before
 # teardown (the _stack_export_egress_log twin): a later resume mounts the exported log
-# read-only beside the new sink's, and the exported secret keeps the prior chain
-# verifiable. Owner-only on the host (docker cp preserves the source mode, so chmod is
-# explicit). Warn-loud on failure but never block teardown.
+# read-only beside the new sink's. Owner-only on the host (docker cp preserves the source
+# mode, so chmod is explicit). Warn-loud on failure but never block teardown.
+#
+# When THIS session resumed from another, an audit.prior.jsonl is mounted; we fold that
+# prior chain BEFORE the live one into the exported audit.jsonl, so the export — and thus
+# the NEXT resume's mounted prior — carries the full kill-chain across EVERY resume hop,
+# not just one back (claude-guard's cumulative archive fold). The in-container live
+# audit.jsonl is never mutated; the export is a host-side cumulative VIEW.
+#
+# Note on the exported secret: it lets an offline reader re-check the LIVE tail's HMAC,
+# but a folded export concatenates chains signed by different per-session secrets and is
+# not itself one HMAC-verifiable chain — it is a monitoring/forensic view. Exporting the
+# secret at all means anyone holding the export can re-sign a rewritten live chain, so the
+# guarantee is in-session integrity, not tamper-evidence against later host tampering
+# (acceptable under the host-trusted threat model; each session's in-container live log
+# stays the pristine, independently verifiable record).
 _stack_export_audit_log() {
   local project="$1" compose="$2" override="$3" overmounts="$4" state="$5" audit_cid
   audit_cid="$(_stack_compose "$project" "$compose" "$override" "$overmounts" ps -q audit)"
+  local live="$state/.audit.live" prior="$state/.audit.prior"
   if [[ -z "$audit_cid" ]] ||
-    ! docker cp "$audit_cid:/var/log/agent-sandbox/audit.jsonl" "$state/audit.jsonl" >/dev/null 2>&1 ||
-    ! docker cp "$audit_cid:/run/audit-secret/secret" "$state/audit.secret" >/dev/null 2>&1 ||
-    ! chmod 600 "$state/audit.jsonl" "$state/audit.secret" 2>/dev/null; then
+    ! docker cp "$audit_cid:/var/log/agent-sandbox/audit.jsonl" "$live" >/dev/null 2>&1 ||
+    ! docker cp "$audit_cid:/run/audit-secret/secret" "$state/audit.secret" >/dev/null 2>&1; then
+    rm -f "$live"
     as_warn "could not export the audit log + HMAC secret from the audit container — this session's audit chain has no host copy (a later resume cannot mount it)"
     return 1
   fi
+  # The prior sibling exists only for a resumed session; its absence is the common case,
+  # not an error — a failed cp of a non-existent file just leaves no prior to fold.
+  docker cp "$audit_cid:/var/log/agent-sandbox/audit.prior.jsonl" "$prior" >/dev/null 2>&1 || rm -f "$prior"
+  if ! {
+    [[ -f "$prior" ]] && cat "$prior"
+    cat "$live"
+  } >"$state/audit.jsonl" 2>/dev/null ||
+    ! chmod 600 "$state/audit.jsonl" "$state/audit.secret" 2>/dev/null; then
+    rm -f "$live" "$prior"
+    as_warn "could not assemble the exported audit log on the host — a later resume cannot mount this session's chain"
+    return 1
+  fi
+  rm -f "$live" "$prior"
   as_info "audit log: $state/audit.jsonl"
 }
 
@@ -383,6 +410,57 @@ _stack_down_ephemeral() {
     return 1
   }
   stack_verify_no_volumes "$project"
+}
+
+# Session-attach lock. A deterministic-identity run (session_id, or a pinned
+# AGENT_SANDBOX_PROJECT_NAME) probes an existing stack and then acts on it — so two
+# concurrent runs of the SAME identity could both see "stopped" and both `up`, exec, and
+# extract onto one stack. An atomic mkdir keyed by the compose project makes exactly one
+# win; the loser is refused. The claim lives under the RUNTIME dir, never the state dir —
+# it is an ephemeral cross-process mutex, correct to clear on reboot (the same reasoning
+# as the prewarm claim dir). No separate reaper runs, so a claim left by a crashed
+# launcher is detected here (dead holder pid) and stolen race-safely.
+_STACK_SESSION_CLAIM_DIR="${AGENT_SANDBOX_SESSION_CLAIM_DIR:-${XDG_RUNTIME_DIR:-/tmp/agent-sandbox-$(id -u)}/agent-sandbox/session-claims}"
+
+# _stack_session_claim PROJECT — win the exclusive claim on PROJECT or fail loud. mkdir is
+# the atomic test-and-set: exactly one racer creates the dir. An existing claim with a
+# LIVE holder pid is refused; a stale one (holder dead/missing) is stolen by renaming it
+# aside — rename(2) succeeds for exactly one racer, so no two callers ever both hold it.
+_stack_session_claim() {
+  local project="$1" dir="$_STACK_SESSION_CLAIM_DIR/$project"
+  mkdir -p "$_STACK_SESSION_CLAIM_DIR" 2>/dev/null && chmod 700 "$_STACK_SESSION_CLAIM_DIR" 2>/dev/null || {
+    as_error "could not create the session-claim dir $_STACK_SESSION_CLAIM_DIR"
+    return 1
+  }
+  if mkdir "$dir" 2>/dev/null; then
+    printf '%s\n' "$$" >"$dir/pid"
+    return 0
+  fi
+  local holder=""
+  [[ -f "$dir/pid" ]] && holder="$(cat "$dir/pid" 2>/dev/null)"
+  if [[ -n "$holder" ]] && kill -0 "$holder" 2>/dev/null; then
+    as_error "session $project is already being launched by pid $holder — wait for it to finish, or take the stack down (agent-sandbox down $project)"
+    return 1
+  fi
+  # Stale: steal by renaming the dead claim aside (atomic, single-winner), then recreate
+  # the canonical claim. A fresh racer that mkdir's the freed path first wins instead and
+  # we are refused — fail-closed, never two holders.
+  local aside="$dir.stale.$$"
+  if mv "$dir" "$aside" 2>/dev/null; then
+    rm -rf "$aside" 2>/dev/null
+    if mkdir "$dir" 2>/dev/null; then
+      printf '%s\n' "$$" >"$dir/pid"
+      return 0
+    fi
+  fi
+  as_error "session $project had a stale claim from a crashed launcher and another run is reclaiming it — retry in a moment (or clear it: agent-sandbox down $project)"
+  return 1
+}
+
+# _stack_session_release PROJECT — drop this session's claim. Best-effort: a claim not
+# released (a crashed launcher) is self-healing, detected as stale on the next claim.
+_stack_session_release() {
+  rm -rf "$_STACK_SESSION_CLAIM_DIR/$1" 2>/dev/null || true # allow-exit-suppress: releasing a claim must never fail a completed session; a leftover is reclaimed as stale
 }
 
 # stack_run WORKLOAD_JSON COMPOSE RUNTIME [EXTRA_COMPOSE...] — the whole session:
@@ -479,10 +557,14 @@ stack_run() {
   # project recreates the containers onto the kept volumes) with seeding skipped. The
   # probe covers containers AND volumes — a persistent teardown removes the containers
   # but keeps the volumes, so volumes alone mean "stopped session".
-  local reattach=0
+  local reattach=0 _session_claimed=0
   if [[ -n "$session_id" || -n "${AGENT_SANDBOX_PROJECT_NAME:-}" ]]; then
+    # Serialize the probe-then-act against a concurrent run of the same identity.
+    _stack_session_claim "$project" || return 1
+    _session_claimed=1
     if [[ -n "$(docker ps -q --filter "label=com.docker.compose.project=$project")" ]]; then
       as_error "session $project is already running — use expand/down (or wait for it to exit) instead of launching it again"
+      _stack_session_release "$project"
       return 1
     fi
     if [[ -n "$(docker ps -aq --filter "label=com.docker.compose.project=$project")" || -n "$(docker volume ls -q --filter "label=com.docker.compose.project=$project")" ]]; then
@@ -857,5 +939,6 @@ stack_run() {
     }
     as_info "volumes kept (ephemeral=false): docker volume ls --filter label=com.docker.compose.project=$project"
   fi
+  [[ "$_session_claimed" == 1 ]] && _stack_session_release "$project"
   return "$workload_rc"
 }

@@ -302,9 +302,10 @@ lifecycle rather than a one-shot:
    session (new project, new volumes, new review branch) seeded to reproduce the old
    one's end state, including an uncommitted overlay if the old session left one.
    The prior session's exported audit log rides read-only at
-   `/var/log/agent-sandbox/audit.prior.jsonl` in the new audit container; its chain
-   stays verifiable against the exported per-session HMAC secret
-   (`sessions/<project>/audit.secret`), while the new session mints its own.
+   `/var/log/agent-sandbox/audit.prior.jsonl` in the new audit container; the new
+   session mints its own HMAC secret. Continuity is **transitive**: each export folds
+   the mounted prior chain ahead of its own live log, so a resume chain A→B→C carries
+   A's events all the way into C, not just one hop back.
 
 ### Environment variables
 
@@ -330,9 +331,14 @@ If the export fails it warns loudly (the session then has no host-side audit rec
 but does not block teardown of an otherwise-complete session. When the audit service
 is on, the launcher likewise exports the audit sink's chained `audit.jsonl` and its
 per-session HMAC `audit.secret` (owner-only) into the same directory — that pair is
-what a later `resume_from` mounts for audit continuity. The session directory also
-holds the seed's WIP patch, the session manifest (`session.json`), and the extracted
-worktree/mbox for seed runs.
+what a later `resume_from` mounts for audit continuity. Exporting the secret lets an
+offline reader re-check the live tail's HMAC, but it also means the exported chain's
+guarantee is **in-session integrity, not tamper-evidence against later host tampering**
+(anyone holding the export can re-sign a rewritten chain) — acceptable under this
+library's host-trusted threat model; the in-container live log stays the pristine
+record for the duration of the session. The session directory also holds the seed's
+WIP patch, the session manifest (`session.json`), and the extracted worktree/mbox for
+seed runs.
 
 ### The review-branch flow (seed mode)
 
