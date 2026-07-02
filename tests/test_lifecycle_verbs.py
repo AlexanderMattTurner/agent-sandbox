@@ -39,6 +39,7 @@ case "$*" in
     fi
     ;;
   "compose -p "*" down --volumes --timeout 30")
+    [[ -n "${FAKE_DOWN_FAIL:-}" ]] && exit 1
     touch "$FAKE_DOCKER_LOG.down"
     ;;
 esac
@@ -101,6 +102,21 @@ def test_down_removes_project_with_only_containers(tmp_path):
     r, log = _run(tmp_path, ["down", "proj1"], {"FAKE_CONTAINERS": "1"})
     assert r.returncode == 0, r.stderr
     assert "compose -p proj1 down --volumes --timeout 30" in log
+
+
+def test_down_fails_loud_when_compose_down_itself_fails(tmp_path):
+    """A non-zero `compose down` is reported as a teardown failure — not silently
+    passed through to (or masked by) the survivor check."""
+    r, log = _run(
+        tmp_path,
+        ["down", "proj1"],
+        {"FAKE_VOLUMES": "until-down", "FAKE_DOWN_FAIL": "1"},
+    )
+    assert r.returncode != 0
+    assert "compose -p proj1 down --volumes --timeout 30" in log
+    assert "teardown failed (compose project proj1)" in r.stderr
+    # It failed on the down itself, not on the later survivor verification.
+    assert "left volumes behind" not in r.stderr
 
 
 def test_down_fails_loud_on_surviving_volume(tmp_path):
