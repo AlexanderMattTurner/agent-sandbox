@@ -1,0 +1,33 @@
+name: dependency-review
+
+# Lockfile diff (pnpm-lock.yaml, uv.lock) for newly introduced vulnerable or
+# license-incompatible dependencies. Requires the repo's Dependency graph +
+# GitHub Advanced Security, which is already enabled (the weekly security scan
+# reads code-scanning/secret-scanning alerts and Dependabot is configured).
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  # One in-flight run per workflow per branch; a new commit (or merge that
+  # deletes the branch) cancels the superseded run so it stops holding runners.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dependency-review:
+    name: Dependency review # required-check: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Dependency review
+        uses: actions/dependency-review-action@595b5aeba73380359d98a5e087f648dbb0edce1b # v4.7.3
+        with:
+          fail-on-severity: moderate
