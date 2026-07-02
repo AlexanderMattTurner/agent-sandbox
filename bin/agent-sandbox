@@ -59,12 +59,16 @@ it permanent in the Workload record's egress_allowlist. With several sessions up
 name one via --project (or AGENT_SANDBOX_PROJECT_NAME).
 
 gc prunes stale sandbox networks (no live containers), reclaiming dead sessions'
-subnets; --dry-run previews what a real run would remove. down tears down one
-session's stack by compose project name — containers, networks AND volumes — and
-fails loud if any volume survives.
+subnets, reaps prewarm spares older than AGENT_SANDBOX_PREWARM_MAX_AGE seconds
+(default 86400; spares whose spec no longer matches anything simply age out —
+adoption's hash equality already routes around them), and removes prewarm claims
+whose owning process died; --dry-run previews what a real run would remove. down
+tears down one session's stack by compose project name — containers, networks
+AND volumes — and fails loud if any volume survives.
 
 Environment: AGENT_SANDBOX_PROJECT_NAME pins the compose project name (default: a
 random per-session name) so consumer lifecycle tooling can find the stack by label.
+AGENT_SANDBOX_PREWARM_MAX_AGE tunes gc's spare reaping age (seconds).
 EOF
 }
 
@@ -416,15 +420,18 @@ cmd_expand() {
   }
 }
 
-# cmd_gc [--dry-run] — prune stale sandbox networks (no live containers), reclaiming
-# dead sessions' subnets. --dry-run previews what a real run would remove.
+# cmd_gc [--dry-run] — prune stale sandbox networks (no live containers), reap
+# over-age prewarm spares and dead prewarm claims (prewarm_gc). --dry-run
+# previews what a real run would remove.
 cmd_gc() {
   case "${1:-}" in
   --dry-run)
     GC_DRY_RUN=1 prune_stale_sandbox_networks
+    GC_DRY_RUN=1 prewarm_gc
     ;;
   "")
     prune_stale_sandbox_networks
+    prewarm_gc
     ;;
   *)
     as_error "unknown gc option: $1"

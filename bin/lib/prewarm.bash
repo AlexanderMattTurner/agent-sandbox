@@ -125,3 +125,71 @@ prewarm_spec_hash() {
   done
   printf '%s\n' "${lines[@]}" | _prewarm_sha256 | cut -c1-16
 }
+
+# prewarm_gc — spare hygiene for `agent-sandbox gc`: reap running spares whose
+# age (agent-sandbox.prewarm-created label) exceeds AGENT_SANDBOX_PREWARM_MAX_AGE
+# seconds (default 86400) via a full compose down --volumes (verified fail-loud),
+# and remove claim dirs whose recorded claimer is dead. Spec-STALE spares are not
+# detected here — gc has no workload to hash against — they age out on this
+# timer, and hash equality already fail-closes adoption away from them. Honors
+# GC_DRY_RUN=1 (report counts, touch nothing).
+prewarm_gc() {
+  local max="${AGENT_SANDBOX_PREWARM_MAX_AGE:-86400}"
+  if [[ ! "$max" =~ ^[0-9]+$ ]]; then
+    as_error "AGENT_SANDBOX_PREWARM_MAX_AGE must be a whole number of seconds, got '$max'"
+    return 1
+  fi
+  local now rc=0
+  now="$(date +%s)"
+  local -a cids=()
+  local cid
+  while IFS= read -r cid; do
+    [[ -n "$cid" ]] && cids+=("$cid")
+  done < <(docker ps -q --filter label=agent-sandbox.prewarm=ready 2>/dev/null)
+  local project created would_reap=0
+  for cid in ${cids[@]+"${cids[@]}"}; do
+    project="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$cid" 2>/dev/null)" || continue
+    [[ "$project" =~ ^agent-sandbox-prewarm-[0-9a-f]{8}$ ]] || continue
+    created="$(docker inspect -f '{{index .Config.Labels "agent-sandbox.prewarm-created"}}' "$cid" 2>/dev/null)" || continue
+    if [[ ! "$created" =~ ^[0-9]+$ ]]; then
+      as_warn "prewarm spare $project has an unparseable creation label ('$created') — leaving it alone"
+      continue
+    fi
+    ((now - created > max)) || continue
+    # An ADOPTED stack keeps its immutable ready label; its lifecycle belongs to
+    # the session that adopted it (or to `down`), never to spare hygiene — even
+    # when the adopter crashed and its claim went stale (kept-for-rescue volumes).
+    [[ -e "$(_stack_state_dir "$project")/prewarm-adopted" ]] && continue
+    if [[ "${GC_DRY_RUN:-}" == "1" ]]; then
+      would_reap=$((would_reap + 1))
+      continue
+    fi
+    # Claim before down: an adoption in flight owns the spare — skip, next gc
+    # pass sees either an adopted marker or a stale claim.
+    _prewarm_claim "$project" || continue
+    if ! docker compose -p "$project" down --volumes --timeout 30; then
+      as_error "could not reap the over-age prewarm spare $project — its containers/volumes may survive"
+      _prewarm_release "$project"
+      rc=1
+      continue
+    fi
+    stack_verify_no_volumes "$project" || rc=1
+    _prewarm_release "$project"
+  done
+  [[ "${GC_DRY_RUN:-}" == "1" ]] && printf 'Would remove: %s over-age prewarm spare(s)\n' "$would_reap"
+
+  # Dead claims: a crashed claimer's mkdir would otherwise pin its spare forever.
+  local claim would_release=0
+  for claim in "$PREWARM_CLAIM_DIR"/*/; do
+    [[ -d "$claim" ]] || continue
+    claim="${claim%/}"
+    _prewarm_claim_is_stale "${claim##*/}" || continue
+    if [[ "${GC_DRY_RUN:-}" == "1" ]]; then
+      would_release=$((would_release + 1))
+      continue
+    fi
+    rm -rf "$claim"
+  done
+  [[ "${GC_DRY_RUN:-}" == "1" ]] && printf 'Would remove: %s stale prewarm claim(s)\n' "$would_release"
+  return "$rc"
+}
