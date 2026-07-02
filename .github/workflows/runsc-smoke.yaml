@@ -18,7 +18,7 @@ permissions:
   contents: read
 
 jobs:
-  runsc-smoke:
+  runsc-smoke: # required-check: true
     name: gVisor (runsc) isolation smoke
     runs-on: ubuntu-latest
     timeout-minutes: 15

@@ -22,7 +22,7 @@ permissions:
   contents: read
 
 jobs:
-  demo-acceptance:
+  demo-acceptance: # required-check: true
     name: agent-sandbox run demo-bash (egress + review-branch acceptance)
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -34,7 +34,7 @@ jobs:
       - name: Run the demo workload end-to-end and assert the acceptance
         run: bash .github/scripts/run-demo-acceptance.sh
 
-  bind-acceptance:
+  bind-acceptance: # required-check: true
     name: agent-sandbox run demo-bind (read-only overmount guardrail acceptance)
     runs-on: ubuntu-latest
     timeout-minutes: 20

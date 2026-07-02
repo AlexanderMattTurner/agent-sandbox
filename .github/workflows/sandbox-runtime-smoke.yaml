@@ -20,7 +20,7 @@ permissions:
   contents: read
 
 jobs:
-  runtime-smoke:
+  runtime-smoke: # required-check: true
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

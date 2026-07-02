@@ -17,7 +17,7 @@ permissions:
   contents: read
 
 jobs:
-  egress-floor:
+  egress-floor: # required-check: true
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
