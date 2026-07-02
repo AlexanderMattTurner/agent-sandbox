@@ -93,3 +93,10 @@ repos:
         entry: bash .hooks/lint-skills.sh
         language: system
         files: ^\.claude/skills/.*\.md$
+
+      - id: gen-trace-events
+        name: regenerate sandbox/trace-events.bash from config/trace-events.json
+        entry: python3 scripts/gen-trace-events.py
+        language: system
+        pass_filenames: false
+        files: ^(config/trace-events\.json|sandbox/trace-events\.bash|scripts/gen-trace-events\.py)$
