@@ -22,17 +22,24 @@ source "$_AS_DIR/lib/stack.bash"
 
 usage() {
   cat >&2 <<'EOF'
-Usage: agent-sandbox run <workload.json>
+Usage: agent-sandbox run [--extra-compose FILE]... <workload.json>
        agent-sandbox expand <host>[:ro|rw] [--project NAME]
 
 Run a Workload (see schema/workload.schema.json) in an isolated, egress-restricted,
 ephemeral sandbox. The launcher selects a runtime, allocates a subnet, brings up the
 name-level-allowlist firewall, waits for its health, then execs the workload.
 
+  --extra-compose FILE   Merge FILE (repeatable, in order) after the library's compose
+                         file set on every compose invocation of the session — the seam
+                         for consumer-owned companion services and service extensions.
+
 `expand` widens a RUNNING session's egress allowlist by one host without resetting
 the firewall (default access ro = GET/HEAD only). The grant is session-scoped; make
 it permanent in the Workload record's egress_allowlist. With several sessions up,
 name one via --project (or AGENT_SANDBOX_PROJECT_NAME).
+
+Environment: AGENT_SANDBOX_PROJECT_NAME pins the compose project name (default: a
+random per-session name) so consumer lifecycle tooling can find the stack by label.
 EOF
 }
 
@@ -52,7 +59,40 @@ require_field() {
 # record, an unusable runtime, or a missing firewall stack refuses the launch rather
 # than proceeding into a half-isolated state.
 cmd_run() {
-  local workload="${1:-}"
+  # Flag parse is fail-closed like the field checks below: an --extra-compose that
+  # doesn't name a readable file refuses the launch (a consumer overlay silently
+  # dropped from the file set would boot the stack without its companion services).
+  local -a extra_compose=()
+  local workload=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --extra-compose)
+      [[ -n "${2:-}" ]] || {
+        as_error "--extra-compose needs a file argument"
+        return 1
+      }
+      [[ -f "$2" ]] || {
+        as_error "extra compose file not found: $2"
+        return 1
+      }
+      extra_compose+=("$2")
+      shift 2
+      ;;
+    -*)
+      as_error "unknown option for run: $1"
+      usage
+      return 1
+      ;;
+    *)
+      if [[ -n "$workload" ]]; then
+        as_error "run takes exactly one workload file (got '$workload' and '$1')"
+        return 1
+      fi
+      workload="$1"
+      shift
+      ;;
+    esac
+  done
   [[ -n "$workload" ]] || {
     as_error "no workload file given"
     usage
@@ -122,7 +162,7 @@ cmd_run() {
     as_error "the firewall+workload compose stack ($compose) is not present in this build — refusing to launch a workload without the egress boundary"
     return 1
   }
-  stack_run "$workload" "$compose" "$runtime"
+  stack_run "$workload" "$compose" "$runtime" ${extra_compose[@]+"${extra_compose[@]}"}
 }
 
 # cmd_expand HOST[:ro|rw] [--project NAME] — widen a running session's firewall
