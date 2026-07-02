@@ -1,15 +1,16 @@
 # shellcheck shell=bash
 # shellcheck disable=SC2034  # consumed by as_trace (trace.bash) via the maps below, not here.
-# In-container bash mirror of config/trace-events.json (the SSOT). Edit BOTH together:
-# tests/test_trace_events_ssot.py pins this file's constants + layer/level maps equal to
-# the JSON in the same commit, and asserts every event has ≥1 emitter under sandbox/.
+# GENERATED FROM config/trace-events.json BY scripts/gen-trace-events.py — DO NOT EDIT.
+# Change an event in config/trace-events.json, then regenerate:
+#   python3 scripts/gen-trace-events.py
+# The pre-commit `gen-trace-events` hook regenerates this on commit, and
+# tests/test_trace_events_ssot.py fails CI if it is ever out of sync with the JSON.
 #
 # Sourced by sandbox/trace.bash (co-located, copied into the container beside it).
-# as_trace looks an event's layer and level up in the maps below to label and gate its
-# line. as_trace runs in-container with no JSON manifest to read, so the map lives here
-# as plain bash. Only LIBRARY-emitted events belong here; a consumer's own events
-# (monitor, redactor, managed settings, host-side worktree seed/extract) live in the
-# consumer's overlay, not the library.
+# as_trace runs in-container with no JSON parser available, so the events must exist
+# here as plain bash — this file is that generated in-container mirror. Only
+# LIBRARY-emitted events live in the JSON (a consumer's own events belong in the
+# consumer's overlay), so only those are generated here.
 
 # Idempotent: a re-source returns early rather than redefining.
 [[ -n "${TRACE_EVENTS_LOADED:-}" ]] && return 0

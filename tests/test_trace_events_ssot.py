@@ -1,12 +1,20 @@
-"""Contract tests binding config/trace-events.json (the SSOT) to its two consumers.
+"""Contract tests for config/trace-events.json (the SSOT) and its generated mirror.
 
-1. Round-trip: sandbox/trace-events.bash (the in-container bash mirror as_trace reads)
-   must declare EXACTLY the JSON's events — same constant names/values, same layer, same
-   level — so the two can never drift. Editing one without the other fails here.
-2. Emitter guard: every declared event must have at least one real emitter under
-   sandbox/ (the constant used in an `as_trace` call, or the literal in a Python
-   `trace(...)` call), so a declared-but-never-emitted event can't accumulate. The guard
-   is proven non-vacuous: a fabricated event finds no emitter.
+config/trace-events.json is the single authored source; sandbox/trace-events.bash is
+GENERATED from it by scripts/gen-trace-events.py (the in-container map as_trace reads,
+since it can't parse JSON). Three contracts:
+
+1. Generated-in-sync: `gen-trace-events.py --check` passes — the committed .bash is
+   exactly what the generator produces from the current JSON. A hand-edit of the
+   generated file, or a JSON change without regeneration, fails here. This is what
+   makes the JSON a true single source rather than one of two hand-kept copies.
+2. Generator correctness: sourcing the generated .bash yields runtime maps (constants,
+   layer, level) that match the JSON — so the generator emits semantically correct
+   bash, not merely bytes that happen to match themselves.
+3. Emitter guard: every declared event has ≥1 real emitter under sandbox/ (the constant
+   in an `as_trace` call, or the literal in a Python `trace(...)` call), so a
+   declared-but-never-emitted event can't accumulate. Proven non-vacuous: a fabricated
+   event finds no emitter.
 """
 
 import json
@@ -23,9 +31,23 @@ REPO = Path(
 )
 JSON_PATH = REPO / "config" / "trace-events.json"
 BASH_PATH = REPO / "sandbox" / "trace-events.bash"
+GEN_SCRIPT = REPO / "scripts" / "gen-trace-events.py"
 SANDBOX = REPO / "sandbox"
 
 EVENTS = json.loads(JSON_PATH.read_text())["events"]
+
+
+def test_generated_bash_is_in_sync_with_json():
+    # The committed .bash must be exactly what the generator emits from the current
+    # JSON — this is the contract that makes the JSON a true single source. --check
+    # exits non-zero (printing a diff to stderr) if they have drifted.
+    r = subprocess.run(
+        ["python3", str(GEN_SCRIPT), "--check"], capture_output=True, text=True
+    )
+    assert r.returncode == 0, (
+        "sandbox/trace-events.bash is out of sync with config/trace-events.json; run "
+        f"`python3 scripts/gen-trace-events.py`.\n{r.stderr}"
+    )
 
 
 def _bash_dump() -> dict:
