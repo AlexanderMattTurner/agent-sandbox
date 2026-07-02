@@ -240,7 +240,7 @@ you assemble is validated against the schema at `run`.
 `agent-sandbox` has five verbs:
 
 ```
-agent-sandbox run [--extra-compose FILE]... [--reseed] <workload.json>
+agent-sandbox run [--extra-compose FILE]... [--reseed] [--prewarm-next] <workload.json>
 agent-sandbox prewarm [--extra-compose FILE]... <workload.json>
 agent-sandbox expand <host>[:ro|rw] [--project NAME]
 agent-sandbox gc [--dry-run]
@@ -282,6 +282,18 @@ Only meaningful when re-attaching to a stopped persistent session: **discard** i
 seeded workspace and re-seed from the current checkout (fresh in-container repo,
 manifest rewritten). Destructive and per-invocation — without it, a re-attach that
 detects a stale seed warns and continues with the session's tree as-is.
+
+#### `--prewarm-next`
+
+After the session ends (whatever its outcome), forks a **detached** background
+`agent-sandbox prewarm` of the same workload and extra-compose set, so the next
+launch of this spec [adopts a warm spare](#prewarm--warm-start-pool) instead of
+cold-booting. Skipped when an unclaimed ready spare for this spec already exists,
+so repeated runs never pile spares. Refused for workloads `prewarm` itself refuses
+(`workspace_mount`, `session_id`/`resume_from`); `AGENT_SANDBOX_NO_PREWARM=1`
+disables the spawn entirely. The pool does **not** otherwise self-replenish:
+without this flag (or your own `prewarm` calls), each adoption consumes a spare
+and the launch after it cold-boots.
 
 <a id="persistent-sessions"></a>
 
@@ -382,15 +394,16 @@ create). Spares are reaped by `gc` once older than
 
 **The pool does not self-replenish.** A `run` adopts at most one spare and, once
 adopted, that spare is gone — the next `run` cold-boots unless something has staged
-a new one. `run --prewarm-next` is the opt-in that closes the loop: after the
-session, it boots a fresh spare of the same workload in the background (a detached
-`prewarm`, so a Ctrl-C can't cancel it), ready for the next launch. It is refused for
-the records `prewarm` itself refuses (`workspace_mount` / `session_id` /
-`resume_from`). Each `--prewarm-next` stages exactly one spare; repeated use just
-stages more, and the age limit reaps any surplus. Set `AGENT_SANDBOX_NO_PREWARM=1` to
-disable the spawn (e.g. in an environment that manages the pool itself). A consumer
-that wants a continuously warm pool runs `prewarm` from its own harness, or passes
-`--prewarm-next` on every launch.
+a new one. [`run --prewarm-next`](#--prewarm-next) is the opt-in that closes the
+loop: after the session, it boots a fresh spare of the same workload in the
+background (a detached `prewarm`, so a Ctrl-C can't cancel it), ready for the next
+launch. It is refused for the records `prewarm` itself refuses (`workspace_mount` /
+`session_id` / `resume_from`), and skipped when an unclaimed ready spare for this
+spec already exists — repeated use tops the pool up to one spare per spec rather
+than piling extras. Set `AGENT_SANDBOX_NO_PREWARM=1` to disable the spawn (e.g. in
+an environment that manages the pool itself). A consumer that wants a continuously
+warm pool runs `prewarm` from its own harness, or passes `--prewarm-next` on every
+launch.
 
 ### `expand` — widen a running session's allowlist
 

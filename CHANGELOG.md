@@ -43,10 +43,12 @@ the prose from the release's commits.
     verified gone, and removes claim locks whose owning process died;
     `--dry-run` previews both.
   - `run --prewarm-next` opts a launch into replenishing the pool: after the
-    session it boots a fresh spare of the same workload in the background (a
-    detached `prewarm`), so the next launch can adopt it — the pool does not
-    otherwise self-replenish. Refused for the records `prewarm` refuses;
-    `AGENT_SANDBOX_NO_PREWARM=1` disables the spawn.
+    session it boots a fresh spare of the same workload and extra-compose set
+    in the background (a detached `prewarm`), so the next launch can adopt it
+    — the pool does not otherwise self-replenish. Skipped when an unclaimed
+    ready spare for the spec already exists, so repeated runs top the pool up
+    to one spare instead of piling extras. Refused for the records `prewarm`
+    refuses; `AGENT_SANDBOX_NO_PREWARM=1` disables the spawn.
   - The spec hash also digests each seccomp profile the compose file
     references (a profile edited in place would otherwise not move the hash
     nor force a recreate at the adoption re-up).

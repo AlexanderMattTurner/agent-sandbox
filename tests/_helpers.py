@@ -8,11 +8,23 @@ import os
 import shutil
 import stat
 import subprocess
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 _EXEC_BITS = stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+
+
+def wait_for(predicate, deadline_s: float = 8.0) -> bool:
+    """Poll `predicate` until it holds or `deadline_s` elapses — for asserting on
+    artifacts a DETACHED background process writes after its parent already exited."""
+    end = time.time() + deadline_s
+    while time.time() < end:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return predicate()
 
 
 def run_capture(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
