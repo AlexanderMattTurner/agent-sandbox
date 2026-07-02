@@ -107,6 +107,7 @@ _stack_deliver_secrets() {
   local workload="$1" cid="$2" user="$3" name n i
   # POSIX sh, not bash: the workload image is arbitrary and may not carry bash.
   # $1 (name) and $2 (user) ride argv; the secret VALUE rides stdin only.
+  # shellcheck disable=SC2016 # single quotes are the point: $1/$2 expand in the container's sh, never here
   local deliver='umask 377 && cat >"/run/secrets/$1" && chown -- "$2" "/run/secrets/$1"'
   n="$(jq '(.secret_env // {}) | keys | length' "$workload")"
   for ((i = 0; i < n; i++)); do
