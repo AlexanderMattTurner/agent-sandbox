@@ -15,6 +15,8 @@ source "$_STACK_LIB_DIR/msg.bash"
 source "$_STACK_LIB_DIR/worktree-seed.bash"
 # shellcheck source=overmounts.bash disable=SC1091
 source "$_STACK_LIB_DIR/overmounts.bash"
+# shellcheck source=prewarm.bash disable=SC1091
+source "$_STACK_LIB_DIR/prewarm.bash"
 
 # _stack_compose PROJECT COMPOSE OVERRIDE OVERMOUNTS CMD... — every compose call goes
 # through here so the project name and file set can never drift between up/exec/down. The
@@ -275,14 +277,23 @@ _stack_deliver_secrets() {
 # corrupt the file / split into bogus KEY lines) is refused loudly.
 _stack_write_env_delivery() {
   local workload="$1" envfile="$2" override="$3"
+  _stack_write_env_file "$workload" "$envfile" || return 1
+  jq -n --arg ef "$envfile" '{services: {workload: {env_file: [$ef]}}}' >"$override"
+}
+
+# _stack_write_env_file WORKLOAD_JSON ENVFILE — write the workload's env map as a
+# 0600 KEY=VALUE env-file: the shared value-shaping half of env delivery, consumed
+# by compose `env_file` at a cold up and by `docker exec --env-file` on an adopted
+# spare. env-file is line-based, so a value containing a newline (which would
+# corrupt the file / split into bogus KEY lines) is refused loudly. Values are
+# literal (neither consumer interpolates env-file content), so no `$` escaping.
+_stack_write_env_file() {
+  local workload="$1" envfile="$2"
   if jq -e '[(.env // {})[] | select(contains("\n"))] | length > 0' "$workload" >/dev/null; then
     as_error "workload.env values must be single-line (a value contains a newline); env is delivered via a line-based env-file"
     return 1
   fi
-  # env-file values are literal (compose does no interpolation over env_file), so —
-  # unlike the compose override above — no `$` escaping is applied.
   (umask 077 && jq -r '(.env // {}) | to_entries[] | "\(.key)=\(.value)"' "$workload" >"$envfile") || return 1
-  jq -n --arg ef "$envfile" '{services: {workload: {env_file: [$ef]}}}' >"$override"
 }
 
 # _stack_export_egress_log PROJECT COMPOSE OVERRIDE OVERMOUNTS STATE_DIR — copy squid's
@@ -385,6 +396,42 @@ _stack_down_ephemeral() {
   stack_verify_no_volumes "$project"
 }
 
+# _stack_export_launch_env WORKLOAD_JSON RUNTIME — export everything compose
+# interpolates for this launch's `up` (and its later ps/logs/down): the workload
+# identity vars, the partitioned allowlist tiers, the validated control-plane
+# grants, and the profile activation. Reads SANDBOX_IP from the caller. Shared by
+# the cold bring-up and by spare adoption (which re-enters `up` under the same
+# env so compose reconciles instead of recreating).
+_stack_export_launch_env() {
+  local workload="$1" runtime="$2"
+  WORKLOAD_IMAGE="$(jq -r '.image' "$workload")"
+  WORKLOAD_USER="$(jq -r '.user // "1000"' "$workload")"
+  WORKLOAD_RUNTIME="$runtime"
+  WORKLOAD_IP="${SANDBOX_IP%.*}.3"
+  export WORKLOAD_IMAGE WORKLOAD_USER WORKLOAD_RUNTIME WORKLOAD_IP
+  # The seed/extract execs must run as the same user the workload writes as.
+  export AGENT_SANDBOX_WORKLOAD_USER="$WORKLOAD_USER"
+
+  stack_partition_allowlist "$workload"
+  # Grants must be validated and exported BEFORE `up`: compose passes
+  # CONTROL_PLANE_EGRESS_GRANTS through to the firewall service's environment,
+  # and a malformed grant refuses the launch before anything comes up.
+  stack_export_control_plane_grants "$workload" || return 1
+  # The default library services (hardener, audit) are profile-gated in the
+  # compose: compose cannot REMOVE a service via an override, so a workload
+  # opt-out (hardener:false / audit:false) is expressed by not activating the
+  # profile. The workload's depends_on entries carry required:false, so a
+  # deactivated profile drops the gate instead of failing `up`.
+  local _profiles=()
+  jq -e '.hardener == false' "$workload" >/dev/null || _profiles+=("hardener")
+  jq -e '.audit == false' "$workload" >/dev/null || _profiles+=("audit")
+  COMPOSE_PROFILES="$(
+    IFS=,
+    printf '%s' "${_profiles[*]-}"
+  )"
+  export COMPOSE_PROFILES
+}
+
 # The bring-up/serve seam: stack_bring_up publishes the session's identity and
 # container handles here for stack_serve_workload (and consumers like the prewarm
 # verb, which brings a stack up and stops before serving).
@@ -400,6 +447,13 @@ _STACK_EPHEMERAL=""
 _STACK_WANT_TTY=false
 _STACK_PRIOR_BASE_COMMIT=""
 _STACK_PRIOR_REVIEW_BRANCH=""
+# 1: the session runs on an adopted prewarm spare (env/secret delivery moves to
+# exec time, teardown releases the spare's claim).
+_STACK_ADOPTED=0
+# 0: skip the up-time env staging AND the post-create secret delivery in
+# stack_bring_up. Set by stack_prewarm — a spare must never bake a workload's
+# env/secret_env (both are delivered at adoption exec time).
+_STACK_STAGE_ENV=1
 
 # stack_bring_up WORKLOAD_JSON COMPOSE RUNTIME — the workload-agnostic half of a
 # session: resolve identity, partition the allowlist, activate profiles, ensure
@@ -433,32 +487,7 @@ stack_bring_up() {
   state="$(_stack_state_dir "$project")"
   worktree_secure_mkdir "$state" || return 1
 
-  WORKLOAD_IMAGE="$(jq -r '.image' "$workload")"
-  WORKLOAD_USER="$(jq -r '.user // "1000"' "$workload")"
-  WORKLOAD_RUNTIME="$runtime"
-  WORKLOAD_IP="${SANDBOX_IP%.*}.3"
-  export WORKLOAD_IMAGE WORKLOAD_USER WORKLOAD_RUNTIME WORKLOAD_IP
-  # The seed/extract execs must run as the same user the workload writes as.
-  export AGENT_SANDBOX_WORKLOAD_USER="$WORKLOAD_USER"
-
-  stack_partition_allowlist "$workload"
-  # Grants must be validated and exported BEFORE `up`: compose passes
-  # CONTROL_PLANE_EGRESS_GRANTS through to the firewall service's environment,
-  # and a malformed grant refuses the launch before anything comes up.
-  stack_export_control_plane_grants "$workload" || return 1
-  # The default library services (hardener, audit) are profile-gated in the
-  # compose: compose cannot REMOVE a service via an override, so a workload
-  # opt-out (hardener:false / audit:false) is expressed by not activating the
-  # profile. The workload's depends_on entries carry required:false, so a
-  # deactivated profile drops the gate instead of failing `up`.
-  local _profiles=()
-  jq -e '.hardener == false' "$workload" >/dev/null || _profiles+=("hardener")
-  jq -e '.audit == false' "$workload" >/dev/null || _profiles+=("audit")
-  COMPOSE_PROFILES="$(
-    IFS=,
-    printf '%s' "${_profiles[*]-}"
-  )"
-  export COMPOSE_PROFILES
+  _stack_export_launch_env "$workload" "$runtime" || return 1
   stack_ensure_firewall_image "$sandbox_dir" || return 1
 
   local override="$state/workload-override.json"
@@ -544,7 +573,7 @@ stack_bring_up() {
   # via `docker inspect`; credentials belong in secret_env (file-delivered, invisible
   # to inspect — _stack_deliver_secrets below).
   local env_file="" env_override="" env_idx=-1
-  if [[ "$(jq '(.env // {}) | length' "$workload")" -gt 0 ]]; then
+  if [[ "$_STACK_STAGE_ENV" == 1 && "$(jq '(.env // {}) | length' "$workload")" -gt 0 ]]; then
     env_file="$state/workload.env"
     env_override="$state/workload-env-override.json"
     _stack_write_env_delivery "$workload" "$env_file" "$env_override" || {
@@ -581,7 +610,7 @@ stack_bring_up() {
 
   # Stream secret_env files into the container's /run/secrets tmpfs BEFORE anything
   # else runs in it (the entrypoint idles), so the workload always sees its secrets.
-  if [[ "$(jq '(.secret_env // {}) | length' "$workload")" -gt 0 ]]; then
+  if [[ "$_STACK_STAGE_ENV" == 1 && "$(jq '(.secret_env // {}) | length' "$workload")" -gt 0 ]]; then
     if ! _stack_deliver_secrets "$workload" "$cid" "$WORKLOAD_USER"; then
       as_error "secret delivery failed — refusing to hand over the sandbox"
       _stack_compose "$project" "$compose" "$override" "$overmounts" down --volumes --timeout 30 || true # allow-exit-suppress: best-effort cleanup of a stack refused at secret delivery; the launch already failed loudly
@@ -674,6 +703,32 @@ stack_serve_workload() {
   if ! _stack_wait_control_plane_ready "$cid" "$workload"; then
     _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
     return 1
+  fi
+
+  # Adopted spare: the workload's env/secret_env were deliberately NOT baked at
+  # prewarm (a spare is workload-agnostic), so both arrive now — secrets before
+  # seeding (the cold path's delivered-before-anything-runs guarantee, same
+  # stdin-only machinery), env as an exec-time --env-file staged just below.
+  local adopt_env_file=""
+  local -a adopt_env_flags=()
+  if [[ "$_STACK_ADOPTED" == 1 ]]; then
+    if [[ "$(jq '(.env // {}) | length' "$workload")" -gt 0 ]]; then
+      adopt_env_file="$state/workload.env"
+      if ! _stack_write_env_file "$workload" "$adopt_env_file"; then
+        as_error "could not prepare the workload env-file for the adopted spare"
+        _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
+        return 1
+      fi
+      adopt_env_flags=(--env-file "$adopt_env_file")
+    fi
+    if [[ "$(jq '(.secret_env // {}) | length' "$workload")" -gt 0 ]]; then
+      if ! _stack_deliver_secrets "$workload" "$cid" "$WORKLOAD_USER"; then
+        as_error "secret delivery failed — refusing to hand over the sandbox"
+        [[ -n "$adopt_env_file" ]] && rm -f "$adopt_env_file"
+        _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup of a stack refused at secret delivery; the launch already failed loudly
+        return 1
+      fi
+    fi
   fi
 
   # Seed the workspace from git BEFORE the entrypoint runs, so the workload never
@@ -838,11 +893,15 @@ stack_serve_workload() {
     argv+=("$(jq -r ".entrypoint[$_i]" "$workload")")
   done
   local -a exec_flags=(-u "$WORKLOAD_USER" -w /workspace)
+  exec_flags+=(${adopt_env_flags[@]+"${adopt_env_flags[@]}"})
   # tty:true attaches an interactive terminal (validated against a real stdin at the
   # top of stack_run); the default is a plain non-interactive exec.
   [[ "$want_tty" == true ]] && exec_flags+=(-it)
   local workload_rc=0
   docker exec "${exec_flags[@]}" "$cid" "${argv[@]}" || workload_rc=$?
+  # The exec consumed the adopted-path env-file at its start; drop it now so the
+  # 0600 staging file never outlives the entrypoint.
+  [[ -n "$adopt_env_file" ]] && rm -f "$adopt_env_file"
   if [[ "$workload_rc" -ne 0 ]]; then
     as_warn "workload exited with status $workload_rc"
   fi
@@ -872,6 +931,9 @@ stack_serve_workload() {
   [[ "$seeded" == 1 ]] && extracted=true
   _stack_update_manifest "$state" "$workload_rc" "$extracted" || true # allow-exit-suppress: manifest bookkeeping already warns; it must not block teardown
 
+  # Adopted spare: release the claim ahead of BOTH teardown branches — the work is
+  # extracted, so even a failed teardown's leftovers are safe for gc to reap.
+  _stack_release_adopted_claim
   if [[ "$ephemeral" == "true" ]]; then
     _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || return 1
   else
@@ -884,10 +946,180 @@ stack_serve_workload() {
   return "$workload_rc"
 }
 
+# _stack_release_adopted_claim — release the adopted spare's claim lock (a no-op
+# for cold-booted sessions).
+_stack_release_adopted_claim() {
+  [[ "$_STACK_ADOPTED" == 1 ]] || return 0
+  _prewarm_release "$_STACK_PROJECT"
+}
+
+# _stack_adoption_eligible WORKLOAD_JSON — 0 iff this launch may adopt a spare:
+# seed mode, ephemeral, and no deterministic identity (session_id, resume_from,
+# and AGENT_SANDBOX_PROJECT_NAME all absent). Deterministic-identity sessions
+# always cold-boot: their pre-up probes, kept volumes, and manifest lifecycles
+# assume a stack this launch created under its own name.
+_stack_adoption_eligible() {
+  local workload="$1"
+  [[ -z "${AGENT_SANDBOX_PROJECT_NAME:-}" ]] || return 1
+  jq -e 'has("seed_from_git") and .ephemeral == true and ((has("session_id") or has("resume_from")) | not)' "$workload" >/dev/null
+}
+
+# _stack_abandon_candidate PROJECT STATE EXTRA_IDX — undo a partially-adopted
+# candidate so the loop can try the next spare (or fall back to cold): drop the
+# spare's prewarm override from the compose file set (EXTRA_IDX < 0 = never
+# appended), remove the adopted marker, release the claim.
+_stack_abandon_candidate() {
+  local project="$1" state="$2" extra_idx="$3"
+  [[ "$extra_idx" -ge 0 ]] && unset "_STACK_EXTRA_COMPOSE[$extra_idx]"
+  rm -f "$state/prewarm-adopted"
+  _prewarm_release "$project"
+}
+
+# _stack_try_adopt WORKLOAD_JSON COMPOSE RUNTIME — run this launch on a prewarmed
+# spare when one matches: compute the spec hash, discover running spares carrying
+# it (labels are discovery only), claim one atomically, take over its project name
+# + state dir as this session's identity, re-enter `up -d --wait` through the same
+# compose choke point (idempotent — re-proves firewall/hardener/audit health under
+# this launch's live env), and verify /workspace is EMPTY (a non-empty spare is
+# corrupt). 0 = adopted, with the _STACK_* seam globals set for
+# stack_serve_workload. Every failure — no hash, no candidate, lost claim race,
+# broken re-up, corrupt workspace — returns 1 so the caller cold-boots: adoption
+# must never block a launch.
+_stack_try_adopt() {
+  local workload="$1" compose="$2" runtime="$3"
+  local sandbox_dir spec_hash
+  sandbox_dir="$(cd "$(dirname "$compose")" && pwd)"
+  # The spec hash digests both image Ids, so the firewall image must exist first.
+  stack_ensure_firewall_image "$sandbox_dir" || return 1
+  spec_hash="$(prewarm_spec_hash "$workload" "$compose" "$runtime" ${_STACK_EXTRA_COMPOSE[@]+"${_STACK_EXTRA_COMPOSE[@]}"})" || return 1
+  local -a candidates=()
+  local cand
+  while IFS= read -r cand; do
+    [[ -n "$cand" ]] && candidates+=("$cand")
+  done < <(docker ps -q --filter label=agent-sandbox.prewarm=ready --filter "label=agent-sandbox.prewarm-spec=$spec_hash" 2>/dev/null)
+  ((${#candidates[@]})) || return 1
+  # Adoption swaps this launch's fresh subnet for the spare's (the spare's network
+  # is already up under it); keep the fresh one restorable for the cold fallback.
+  local orig_subnet="$SANDBOX_SUBNET" orig_ip="$SANDBOX_IP"
+  local project state cid probe subnet ip
+  for cand in "${candidates[@]}"; do
+    project="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$cand" 2>/dev/null)" || continue
+    # The project rides into docker filters and state paths — accept only the
+    # launcher's own prewarm naming.
+    [[ "$project" =~ ^agent-sandbox-prewarm-[0-9a-f]{8}$ ]] || continue
+    _prewarm_claim "$project" || continue
+    state="$(_stack_state_dir "$project")"
+    # The adopted marker keeps gc off this stack even after the claim goes stale:
+    # a crashed adopter's kept-for-rescue volumes must not be reaped as a spare.
+    if ! touch "$state/prewarm-adopted" 2>/dev/null ||
+      ! subnet="$(jq -er '.subnet' "$state/prewarm.json" 2>/dev/null)" ||
+      ! ip="$(jq -er '.ip' "$state/prewarm.json" 2>/dev/null)" ||
+      [[ ! -f "$state/workload-override.json" || ! -f "$state/overmount-override.json" || ! -f "$state/prewarm-override.json" ]]; then
+      _stack_abandon_candidate "$project" "$state" -1
+      continue
+    fi
+    SANDBOX_SUBNET="$subnet"
+    SANDBOX_IP="$ip"
+    export SANDBOX_SUBNET SANDBOX_IP
+    if ! _stack_export_launch_env "$workload" "$runtime"; then
+      _stack_abandon_candidate "$project" "$state" -1
+      SANDBOX_SUBNET="$orig_subnet" SANDBOX_IP="$orig_ip"
+      continue
+    fi
+    local extra_idx=${#_STACK_EXTRA_COMPOSE[@]}
+    _STACK_EXTRA_COMPOSE+=("$state/prewarm-override.json")
+    local override="$state/workload-override.json" overmounts="$state/overmount-override.json"
+    if ! _stack_compose "$project" "$compose" "$override" "$overmounts" up -d --wait --wait-timeout 240 ||
+      ! cid="$(_stack_compose "$project" "$compose" "$override" "$overmounts" ps -q workload)" ||
+      [[ -z "$cid" ]]; then
+      _stack_abandon_candidate "$project" "$state" "$extra_idx"
+      SANDBOX_SUBNET="$orig_subnet" SANDBOX_IP="$orig_ip"
+      continue
+    fi
+    # A spare's contract is an EMPTY workspace about to be seeded. The probe must
+    # POSITIVELY prove emptiness (echo EMPTY) — a failed exec printing nothing
+    # must read as corrupt, not as empty.
+    probe="$(docker exec -u "$WORKLOAD_USER" "$cid" sh -c 'if [ -n "$(ls -A /workspace 2>/dev/null)" ]; then echo NONEMPTY; elif [ -d /workspace ]; then echo EMPTY; fi' 2>/dev/null)"
+    if [[ "$probe" != "EMPTY" ]]; then
+      as_warn "prewarm spare $project has a non-empty or unverifiable /workspace — skipping it as corrupt"
+      _stack_abandon_candidate "$project" "$state" "$extra_idx"
+      SANDBOX_SUBNET="$orig_subnet" SANDBOX_IP="$orig_ip"
+      continue
+    fi
+    _STACK_PROJECT="$project"
+    _STACK_STATE="$state"
+    _STACK_CID="$cid"
+    _STACK_OVERRIDE="$override"
+    _STACK_OVERMOUNTS="$overmounts"
+    _STACK_SESSION_ID=""
+    _STACK_RESUME_FROM=""
+    _STACK_REATTACH=0
+    _STACK_EPHEMERAL="true"
+    _STACK_PRIOR_BASE_COMMIT=""
+    _STACK_PRIOR_REVIEW_BRANCH=""
+    _STACK_ADOPTED=1
+    as_info "adopted prewarmed spare $project"
+    return 0
+  done
+  SANDBOX_SUBNET="$orig_subnet" SANDBOX_IP="$orig_ip"
+  export SANDBOX_SUBNET SANDBOX_IP
+  return 1
+}
+
+# stack_prewarm WORKLOAD_JSON COMPOSE RUNTIME [EXTRA_COMPOSE...] — bring a stack
+# up to just before serving (firewall healthy, hardener done, guardrails held,
+# /workspace empty) and LEAVE it running as an adoptable spare: labeled with the
+# spec hash for discovery, its subnet recorded for the adopter's idempotent
+# re-up, no workload env/secret_env baked (both are delivered at adoption exec
+# time). Prints the spare's compose project name on success.
+stack_prewarm() {
+  local workload="$1" compose="$2" runtime="$3"
+  shift 3
+  _STACK_EXTRA_COMPOSE=("$@")
+  local sandbox_dir spec_hash project state created
+  sandbox_dir="$(cd "$(dirname "$compose")" && pwd)"
+  # The spec hash digests both image Ids, so the firewall image must exist first.
+  stack_ensure_firewall_image "$sandbox_dir" || return 1
+  if ! spec_hash="$(prewarm_spec_hash "$workload" "$compose" "$runtime" "$@")"; then
+    as_error "could not compute the prewarm spec hash — is the workload image ($(jq -r '.image' "$workload")) present on this docker engine?"
+    return 1
+  fi
+  project="agent-sandbox-prewarm-$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n')"
+  state="$(_stack_state_dir "$project")"
+  worktree_secure_mkdir "$state" || return 1
+  created="$(date +%s)"
+  prewarm_write_override "$spec_hash" "$created" "$state/prewarm-override.json" || {
+    as_error "could not generate the prewarm labels override"
+    return 1
+  }
+  _STACK_EXTRA_COMPOSE+=("$state/prewarm-override.json")
+  # A spare bakes NO workload env/secret_env; its identity rides the project-name
+  # seam so every compose call of this bring-up lands on the spare's stack.
+  _STACK_STAGE_ENV=0
+  AGENT_SANDBOX_PROJECT_NAME="$project"
+  export AGENT_SANDBOX_PROJECT_NAME
+  if ! stack_bring_up "$workload" "$compose" "$runtime"; then
+    _STACK_STAGE_ENV=1
+    return 1
+  fi
+  _STACK_STAGE_ENV=1
+  # The adoption manifest records the subnet/ip the spare's network came up under:
+  # an adopting launch re-enters `up` with THESE (not its own fresh allocation) so
+  # compose reconciles the running stack instead of recreating its network.
+  if ! (umask 077 && jq -n --arg project "$project" --arg spec "$spec_hash" --arg subnet "$SANDBOX_SUBNET" --arg ip "$SANDBOX_IP" --argjson created "$created" '{project: $project, spec: $spec, subnet: $subnet, ip: $ip, created: $created}' >"$state/prewarm.json"); then
+    as_error "could not write the prewarm manifest $state/prewarm.json — tearing the unusable spare down"
+    _stack_down_ephemeral "$project" "$compose" "$_STACK_OVERRIDE" "$_STACK_OVERMOUNTS" || true # allow-exit-suppress: best-effort cleanup of a spare refused at manifest write; the prewarm already failed loudly
+    return 1
+  fi
+  as_info "prewarm spare ready: $project (spec $spec_hash)"
+  printf '%s\n' "$project"
+}
+
 # stack_run WORKLOAD_JSON COMPOSE RUNTIME [EXTRA_COMPOSE...] — the whole session:
-# bring the stack up (stack_bring_up), then seed → exec → extract → export →
-# teardown (stack_serve_workload). Returns the workload's exit status when the
-# session machinery succeeded; machinery failures return non-zero themselves.
+# bring the stack up (adopting a matching prewarmed spare when eligible, else
+# stack_bring_up), then seed → exec → extract → export → teardown
+# (stack_serve_workload). Returns the workload's exit status when the session
+# machinery succeeded; machinery failures return non-zero themselves.
 # Reads SANDBOX_IP/SANDBOX_SUBNET from the caller (export_sandbox_subnet).
 # EXTRA_COMPOSE files are consumer overlays merged after the library's file set on
 # EVERY compose invocation of this session (see _stack_compose). The compose project
@@ -897,6 +1129,8 @@ stack_run() {
   local workload="$1" compose="$2" runtime="$3"
   shift 3
   _STACK_EXTRA_COMPOSE=("$@")
+  _STACK_STAGE_ENV=1
+  _STACK_ADOPTED=0
 
   # tty is a runtime precondition, not a file field: an interactive entrypoint needs a
   # real terminal on the launcher's stdin. Check it BEFORE bringing anything up so we
@@ -912,6 +1146,14 @@ stack_run() {
     _STACK_WANT_TTY=true
   fi
 
-  stack_bring_up "$workload" "$compose" "$runtime" || return 1
+  local adopted=0
+  if _stack_adoption_eligible "$workload"; then
+    if _stack_try_adopt "$workload" "$compose" "$runtime"; then
+      adopted=1
+    fi
+  fi
+  if [[ "$adopted" == 0 ]]; then
+    stack_bring_up "$workload" "$compose" "$runtime" || return 1
+  fi
   stack_serve_workload "$workload" "$compose"
 }

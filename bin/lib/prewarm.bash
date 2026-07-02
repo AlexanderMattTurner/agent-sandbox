@@ -43,6 +43,29 @@ _prewarm_claim_is_stale() {
   ! kill -0 "$pid" 2>/dev/null
 }
 
+# prewarm_write_override SPEC_HASH CREATED_EPOCH OUT — generate the compose
+# override that marks a bring-up as an adoptable spare: the discovery labels
+# (ready + spec hash + creation epoch; labels are immutable post-create, so
+# they can never be the claim) and the /run/secrets tmpfs, declared VALUE-FREE
+# and unconditionally — an adopter's secret_env is delivered at exec time, and
+# a tmpfs can only be mounted at create, so every spare must carry the mount
+# (a harmless empty dir for adopters without secrets).
+prewarm_write_override() {
+  local spec_hash="$1" created="$2" out="$3"
+  jq -n --arg spec "$spec_hash" --arg created "$created" '{
+    services: {
+      workload: {
+        labels: {
+          "agent-sandbox.prewarm": "ready",
+          "agent-sandbox.prewarm-spec": $spec,
+          "agent-sandbox.prewarm-created": $created
+        },
+        tmpfs: ["/run/secrets:mode=0755,size=1m"]
+      }
+    }
+  }' >"$out"
+}
+
 # _prewarm_sha256 — sha256-hex of stdin (GNU sha256sum, or BSD/macOS shasum).
 _prewarm_sha256() {
   if command -v sha256sum >/dev/null 2>&1; then

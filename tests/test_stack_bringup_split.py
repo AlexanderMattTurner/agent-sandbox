@@ -9,9 +9,15 @@ captured from the pre-split stack_run with this same harness; the test fails on
 any drift — an added, dropped, or reordered docker invocation is a behavior
 change, not a refactor.
 
+The eligible cold run opens with the spare-adoption probe (spec-hash image
+inspects + the labeled `ps`); with no spare on offer everything after it must
+be the pre-split cold boot, unchanged.
+
 Normalized (the only run-to-run variance): absolute paths, the random project
-suffix, the fixture repo's HEAD sha, and trailing whitespace (multi-line exec
-scripts carry a trailing space the repo's hooks would strip from a literal).
+suffix, the spec hash (it digests the compose file's content, which this pin
+must not re-pin), the fixture repo's HEAD sha, and trailing whitespace
+(multi-line exec scripts carry a trailing space the repo's hooks would strip
+from a literal).
 """
 
 import json
@@ -48,6 +54,10 @@ WORKLOAD = {
 
 GOLDEN = """\
 network ls -q
+image inspect agent-sandbox-firewall:local
+image inspect -f {{.Id}} debian:stable-slim
+image inspect -f {{.Id}} agent-sandbox-firewall:local
+ps -q --filter label=agent-sandbox.prewarm=ready --filter label=agent-sandbox.prewarm-spec=<SPEC>
 image inspect agent-sandbox-firewall:local
 compose -p <PROJECT> -f <SANDBOX>/docker-compose.yml -f <STATE>/workload-override.json -f <STATE>/overmount-override.json up -d --wait --wait-timeout 240
 compose -p <PROJECT> -f <SANDBOX>/docker-compose.yml -f <STATE>/workload-override.json -f <STATE>/overmount-override.json ps -q workload
@@ -92,6 +102,7 @@ def _normalize(log: str, tmp_path, head: str) -> str:
     state_root = str(tmp_path / "state" / "sessions")
     out = re.sub(re.escape(state_root) + r"/agent-sandbox-[0-9a-f]{8}", "<STATE>", out)
     out = re.sub(r"agent-sandbox-[0-9a-f]{8}", "<PROJECT>", out)
+    out = re.sub(r"prewarm-spec=[0-9a-f]{16}", "prewarm-spec=<SPEC>", out)
     out = out.replace(head, "<SHA>")
     return re.sub(r"[ \t]+$", "", out, flags=re.MULTILINE)
 
