@@ -109,9 +109,7 @@ def test_default_project_name_is_randomized_per_session(tmp_path):
 
 
 def test_extra_compose_missing_file_refuses_the_launch(tmp_path):
-    r, calls = _run(
-        tmp_path, argv_tail=["--extra-compose", str(tmp_path / "nope.yml")]
-    )
+    r, calls = _run(tmp_path, argv_tail=["--extra-compose", str(tmp_path / "nope.yml")])
     assert r.returncode != 0
     assert "extra compose file not found" in r.stderr
     assert calls == []  # refused before anything was launched
@@ -158,7 +156,13 @@ def test_two_workload_files_refuse(tmp_path):
 def _run_hooks(tmp_path, hooks_dir: Path):
     body = slice_bash_function(INIT_FIREWALL, "run_firewall_hooks")
     return subprocess.run(
-        ["bash", "-c", f'set -Eeuo pipefail; {body}; run_firewall_hooks "$1"', "_", str(hooks_dir)],
+        [
+            "bash",
+            "-c",
+            f'set -Eeuo pipefail; {body}; run_firewall_hooks "$1"',
+            "_",
+            str(hooks_dir),
+        ],
         capture_output=True,
         text=True,
     )
