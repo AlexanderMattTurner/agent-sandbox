@@ -237,10 +237,11 @@ you assemble is validated against the schema at `run`.
 
 ## B. Running a Workload
 
-`agent-sandbox` has four verbs:
+`agent-sandbox` has five verbs:
 
 ```
 agent-sandbox run [--extra-compose FILE]... [--reseed] <workload.json>
+agent-sandbox prewarm [--extra-compose FILE]... <workload.json>
 agent-sandbox expand <host>[:ro|rw] [--project NAME]
 agent-sandbox gc [--dry-run]
 agent-sandbox down <project>
@@ -346,6 +347,33 @@ worktree/mbox for seed runs.
 If the extract fails, the session's containers and volumes are **kept** (the
 workload's work is never destroyed with them) and the launch returns non-zero.
 
+### `prewarm` — warm-start pool
+
+```bash
+agent-sandbox prewarm workloads/demo-bash.json   # prints the spare's project name
+agent-sandbox run workloads/demo-bash.json       # adopts it: no cold boot
+```
+
+`prewarm` runs the multi-second bring-up ahead of time — firewall healthy,
+hardener done, guardrails verified, `/workspace` empty — and **leaves the stack
+running** as an adoptable spare, labeled with a spec hash of everything that
+shaped the boot (image digests, runtime, allowlist, `user`/`hardener`/`audit`/
+`backend`, control-plane grants, the compose file set).
+
+A later `run` adopts a spare only when its own spec hash matches **and** the run
+is seed-mode, ephemeral, and carries no `session_id`/`resume_from` (deterministic
+identities always cold-boot). Adoption claims the spare atomically, re-proves the
+stack's health, verifies `/workspace` is empty, seeds into the already-running
+container, and serves as normal; the spare's stack is torn down as the session's
+own. Any mismatch or hiccup falls back to a cold boot — adoption never blocks a
+launch.
+
+The prewarm record's `entrypoint` never runs; `env`/`secret_env` are accepted but
+**not** baked into the spare — the adopting run delivers its own at exec time.
+`workspace_mount` can't be prewarmed (a bind source is fixed at container
+create). Spares are reaped by `gc` once older than
+`AGENT_SANDBOX_PREWARM_MAX_AGE` seconds (default 86400).
+
 ### `expand` — widen a running session's allowlist
 
 ```bash
@@ -366,8 +394,11 @@ agent-sandbox gc --dry-run   # preview
 agent-sandbox gc             # reclaim
 ```
 
-Prunes sandbox networks with no live containers, reclaiming dead sessions' subnets.
-`--dry-run` previews what a real run would remove.
+Prunes sandbox networks with no live containers, reclaiming dead sessions' subnets;
+reaps prewarm spares older than `AGENT_SANDBOX_PREWARM_MAX_AGE` seconds (default
+86400 — spares whose spec no longer matches anything simply age out; adoption's
+hash equality already routes around them); and removes prewarm claims whose owning
+process died. `--dry-run` previews what a real run would remove.
 
 ### `down` — tear down one session
 

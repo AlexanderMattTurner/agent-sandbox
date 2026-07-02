@@ -22,6 +22,26 @@ the prose from the release's commits.
 
 ### Added
 
+- Warm-start pool (issue #34): `agent-sandbox prewarm <workload.json>` runs the
+  multi-second bring-up ahead of time and leaves the stack running as an
+  adoptable spare (firewall healthy, guardrails verified, empty workspace),
+  labeled with a spec hash of everything that shaped the boot.
+  - A later seed-mode, ephemeral `run` without `session_id`/`resume_from`
+    whose spec hash matches adopts the spare: claims it atomically (mkdir
+    claim locks — labels are discovery-only), re-proves the stack's health
+    through the same compose choke point, verifies the workspace is empty,
+    seeds into the already-running container, and serves as normal. Any
+    mismatch or failure falls back to a cold boot — adoption never blocks a
+    launch.
+  - The prewarm record's `env`/`secret_env` are accepted but never baked into
+    the spare; the adopting run delivers its own env at exec time
+    (`docker exec --env-file`, 0600, unlinked after) and secrets over the
+    same stdin-only machinery as a cold boot. `workspace_mount`,
+    `session_id`, and `resume_from` are refused by `prewarm`.
+  - `agent-sandbox gc` now also reaps spares older than
+    `AGENT_SANDBOX_PREWARM_MAX_AGE` seconds (default 86400) with volumes
+    verified gone, and removes claim locks whose owning process died;
+    `--dry-run` previews both.
 - Persistent sessions (issue #33): `ephemeral: false` is now a real lifecycle.
   - `session_id` Workload field: a stable identity making the compose project
     name the deterministic `agent-sandbox-<session_id>` (mutually exclusive with
