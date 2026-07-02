@@ -32,12 +32,12 @@ VALID = {
 }
 
 
-def _run(tmp_path, *, argv_tail, extra_env=None):
+def _run(tmp_path, *, argv_tail, extra_env=None, workload=None):
     stub = tmp_path / "stub"
     stub.mkdir(exist_ok=True)
     write_exe(stub / "docker", RECORDING_DOCKER)
     wl = tmp_path / "workload.json"
-    wl.write_text(json.dumps(VALID))
+    wl.write_text(json.dumps(workload if workload is not None else VALID))
     log = tmp_path / "docker-argv.log"
     log.touch()
     env = {
@@ -99,6 +99,32 @@ def test_project_name_override_pins_every_compose_invocation(tmp_path):
     for call in calls:
         args = call.split()
         assert args[args.index("-p") + 1] == "cg-session-42", call
+
+
+def test_session_id_derives_the_project_name_on_every_compose_invocation(tmp_path):
+    """workload.session_id makes the identity deterministic: every compose call runs
+    under agent-sandbox-<session_id>, so a later `run` (or down/expand) can find this
+    session's stack by name instead of a random per-launch suffix."""
+    r, calls = _run(tmp_path, argv_tail=[], workload={**VALID, "session_id": "alpha-1"})
+    assert r.returncode != 0  # fake docker: no workload container => fail closed
+    assert calls, "no compose invocations recorded"
+    for call in calls:
+        args = call.split()
+        assert args[args.index("-p") + 1] == "agent-sandbox-alpha-1", call
+
+
+def test_session_id_and_project_name_env_conflict_refuses(tmp_path):
+    """One identity per session: session_id and AGENT_SANDBOX_PROJECT_NAME both name
+    the compose project, so setting both is refused before anything comes up."""
+    r, calls = _run(
+        tmp_path,
+        argv_tail=[],
+        workload={**VALID, "session_id": "alpha-1"},
+        extra_env={"AGENT_SANDBOX_PROJECT_NAME": "cg-session-42"},
+    )
+    assert r.returncode != 0
+    assert "exactly one identity" in r.stderr
+    assert calls == []  # refused before any compose invocation
 
 
 def test_default_project_name_is_randomized_per_session(tmp_path):

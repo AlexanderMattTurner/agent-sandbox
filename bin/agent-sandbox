@@ -22,7 +22,7 @@ source "$_AS_DIR/lib/stack.bash"
 
 usage() {
   cat >&2 <<'EOF'
-Usage: agent-sandbox run [--extra-compose FILE]... <workload.json>
+Usage: agent-sandbox run [--extra-compose FILE]... [--reseed] <workload.json>
        agent-sandbox expand <host>[:ro|rw] [--project NAME]
        agent-sandbox gc [--dry-run]
        agent-sandbox down <project>
@@ -34,6 +34,15 @@ name-level-allowlist firewall, waits for its health, then execs the workload.
   --extra-compose FILE   Merge FILE (repeatable, in order) after the library's compose
                          file set on every compose invocation of the session — the seam
                          for consumer-owned companion services and service extensions.
+  --reseed               When re-attaching to a stopped persistent session (workload
+                         session_id + ephemeral:false), DISCARD its seeded workspace and
+                         re-seed from the current checkout. Destructive, per-invocation.
+
+A workload with `session_id` gets the deterministic compose project name
+agent-sandbox-<session_id>; running it again against its stopped stack re-attaches
+(same containers/volumes, seed skipped; docs/usage.md "Persistent sessions"). A
+workload with `resume_from` starts FRESH, seeded to reproduce where that prior
+session left off, with its exported audit log mounted read-only for continuity.
 
 `expand` widens a RUNNING session's egress allowlist by one host without resetting
 the firewall (default access ro = GET/HEAD only). The grant is session-scoped; make
@@ -70,9 +79,13 @@ cmd_run() {
   # doesn't name a readable file refuses the launch (a consumer overlay silently
   # dropped from the file set would boot the stack without its companion services).
   local -a extra_compose=()
-  local workload=""
+  local workload="" reseed=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
+    --reseed)
+      reseed=1
+      shift
+      ;;
     --extra-compose)
       [[ -n "${2:-}" ]] || {
         as_error "--extra-compose needs a file argument"
@@ -163,6 +176,30 @@ cmd_run() {
     }
   fi
 
+  # session_id / resume_from become compose project names (label filters, volume name
+  # prefixes), so both are gated by the schema's strict compose-safe charset at runtime
+  # too — a shell-metacharacter-shaped id must never reach a docker filter string.
+  if jq -e 'has("session_id")' "$workload" >/dev/null; then
+    jq -e '.session_id | type == "string" and test("\\A[a-z0-9][a-z0-9_-]{0,40}\\z")' "$workload" >/dev/null || {
+      as_error "workload.session_id must match ^[a-z0-9][a-z0-9_-]{0,40}\$ — it becomes the compose project name agent-sandbox-<session_id>"
+      return 1
+    }
+  fi
+  if jq -e 'has("resume_from")' "$workload" >/dev/null; then
+    jq -e '.resume_from | type == "string" and test("\\A[a-z0-9][a-z0-9_-]{0,40}\\z")' "$workload" >/dev/null || {
+      as_error "workload.resume_from must match ^[a-z0-9][a-z0-9_-]{0,40}\$ — it names a prior session_id"
+      return 1
+    }
+    jq -e 'has("seed_from_git")' "$workload" >/dev/null || {
+      as_error "workload.resume_from requires seed_from_git — a resumed session replays the prior work onto a freshly seeded workspace"
+      return 1
+    }
+    jq -e '.resume_from != .session_id' "$workload" >/dev/null || {
+      as_error "workload.resume_from must name a DIFFERENT session than session_id — a session cannot resume itself"
+      return 1
+    }
+  fi
+
   local backend
   backend="$(jq -r '.backend // "local"' "$workload")"
 
@@ -186,6 +223,10 @@ cmd_run() {
     as_error "the firewall+workload compose stack ($compose) is not present in this build — refusing to launch a workload without the egress boundary"
     return 1
   }
+  # --reseed rides to stack_run's re-attach path as an exported per-invocation flag
+  # (stack_run's positional tail is the open-ended extra-compose list).
+  AGENT_SANDBOX_RESEED="$reseed"
+  export AGENT_SANDBOX_RESEED
   stack_run "$workload" "$compose" "$runtime" ${extra_compose[@]+"${extra_compose[@]}"}
 }
 

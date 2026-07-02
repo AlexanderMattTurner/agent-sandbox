@@ -162,6 +162,69 @@ _stack_export_egress_log() {
   as_info "egress log: $state/egress.log"
 }
 
+# _stack_write_manifest STATE PROJECT SESSION_ID MODE SEED_REF BASE_COMMIT BASE_REF
+# REVIEW_BRANCH REPO_ROOT — record the session's identity and seed provenance in
+# $STATE/session.json (owner-only). This is what a later `run` re-attaches or resumes
+# FROM: the extract base (base_ref/base_commit), the review branch, and the repo the
+# branch lives in all outlive the launcher process here. An empty SESSION_ID is stored
+# as null (the session is only pinned by AGENT_SANDBOX_PROJECT_NAME).
+_stack_write_manifest() {
+  local state="$1" project="$2" session_id="$3" mode="$4" seed_ref="$5"
+  local base_commit="$6" base_ref="$7" review_branch="$8" repo_root="$9"
+  if ! (umask 077 && jq -n --arg project "$project" --arg session_id "$session_id" --arg mode "$mode" --arg seed_ref "$seed_ref" --arg base_commit "$base_commit" --arg base_ref "$base_ref" --arg review_branch "$review_branch" --arg repo_root "$repo_root" --arg created "$(date -u +%FT%TZ)" '{project: $project, session_id: (if $session_id == "" then null else $session_id end), mode: $mode, seed_ref: $seed_ref, base_commit: $base_commit, base_ref: $base_ref, review_branch: $review_branch, repo_root: $repo_root, created: $created}' >"$state/session.json"); then
+    as_error "could not write the session manifest $state/session.json"
+    return 1
+  fi
+}
+
+# _stack_read_manifest_field STATE FIELD — print one manifest field; non-zero when the
+# manifest or the field is absent, so callers fail loud instead of trusting "".
+_stack_read_manifest_field() {
+  local state="$1" field="$2"
+  jq -er --arg f "$field" '.[$f] // empty' "$state/session.json" 2>/dev/null
+}
+
+# _stack_update_manifest STATE LAST_EXIT EXTRACTED — record the session's outcome in the
+# manifest at teardown. Warn-loud, non-blocking bookkeeping: a failed update must never
+# mask the session's real status. No-op when no manifest exists (unseeded session).
+_stack_update_manifest() {
+  local state="$1" last_exit="$2" extracted="$3"
+  local tmp="$state/session.json.tmp"
+  [[ -f "$state/session.json" ]] || return 0
+  if ! (umask 077 && jq --argjson last_exit "$last_exit" --argjson extracted "$extracted" '. + {last_exit: $last_exit, extracted: $extracted}' "$state/session.json" >"$tmp") || ! mv "$tmp" "$state/session.json"; then
+    as_warn "could not update the session manifest $state/session.json"
+    return 1
+  fi
+}
+
+# _stack_export_audit_log PROJECT COMPOSE OVERRIDE OVERMOUNTS STATE_DIR — copy the audit
+# sink's chained log AND its per-session HMAC secret out of the audit container before
+# teardown (the _stack_export_egress_log twin): a later resume mounts the exported log
+# read-only beside the new sink's, and the exported secret keeps the prior chain
+# verifiable. Owner-only on the host (docker cp preserves the source mode, so chmod is
+# explicit). Warn-loud on failure but never block teardown.
+_stack_export_audit_log() {
+  local project="$1" compose="$2" override="$3" overmounts="$4" state="$5" audit_cid
+  audit_cid="$(_stack_compose "$project" "$compose" "$override" "$overmounts" ps -q audit)"
+  if [[ -z "$audit_cid" ]] ||
+    ! docker cp "$audit_cid:/var/log/agent-sandbox/audit.jsonl" "$state/audit.jsonl" >/dev/null 2>&1 ||
+    ! docker cp "$audit_cid:/run/audit-secret/secret" "$state/audit.secret" >/dev/null 2>&1 ||
+    ! chmod 600 "$state/audit.jsonl" "$state/audit.secret" 2>/dev/null; then
+    as_warn "could not export the audit log + HMAC secret from the audit container — this session's audit chain has no host copy (a later resume cannot mount it)"
+    return 1
+  fi
+  as_info "audit log: $state/audit.jsonl"
+}
+
+# _stack_write_audit_prior_override PRIOR_LOG OUT — generate the compose override that
+# binds a prior session's exported audit log read-only at audit.prior.jsonl inside the
+# NEW session's audit container, beside the fresh sink's own log. `$` → `$$` because
+# compose interpolates every file it loads (same escaping as _stack_write_override).
+_stack_write_audit_prior_override() {
+  local prior_log="$1" out="$2"
+  jq -n --arg src "$prior_log" '{services: {audit: {volumes: [{type: "bind", source: ($src | gsub("\\$"; "$$")), target: "/var/log/agent-sandbox/audit.prior.jsonl", read_only: true}]}}}' >"$out"
+}
+
 # stack_verify_no_volumes PROJECT — verify no compose-labeled volume survived a
 # teardown. The guarantee is verified, not assumed: any survivor fails loud so
 # "ephemeral" can never silently mean "persistent".
@@ -197,9 +260,22 @@ stack_run() {
   local workload="$1" compose="$2" runtime="$3"
   shift 3
   _STACK_EXTRA_COMPOSE=("$@")
-  local sandbox_dir project state
+  local sandbox_dir project state session_id resume_from
   sandbox_dir="$(cd "$(dirname "$compose")" && pwd)"
-  project="${AGENT_SANDBOX_PROJECT_NAME:-agent-sandbox-$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n')}"
+  session_id="$(jq -r '.session_id // empty' "$workload")"
+  resume_from="$(jq -r '.resume_from // empty' "$workload")"
+  # One identity per session: the workload's session_id and the consumer env override
+  # both name the compose project, and a silent precedence rule would let lifecycle
+  # tooling target a different stack than the one that booted.
+  if [[ -n "$session_id" && -n "${AGENT_SANDBOX_PROJECT_NAME:-}" ]]; then
+    as_error "workload.session_id ('$session_id') and AGENT_SANDBOX_PROJECT_NAME ('$AGENT_SANDBOX_PROJECT_NAME') are both set — a session has exactly one identity; drop one"
+    return 1
+  fi
+  if [[ -n "$session_id" ]]; then
+    project="agent-sandbox-$session_id"
+  else
+    project="${AGENT_SANDBOX_PROJECT_NAME:-agent-sandbox-$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n')}"
+  fi
   state="$(_stack_state_dir "$project")"
   worktree_secure_mkdir "$state" || return 1
 
@@ -255,6 +331,65 @@ stack_run() {
 
   local ephemeral
   ephemeral="$(jq -r '.ephemeral' "$workload")"
+
+  # A deterministic identity (session_id, or a pinned AGENT_SANDBOX_PROJECT_NAME) can
+  # name an EXISTING stack, so probe before `up`: a running session is refused (never
+  # disturb it), a stopped persistent one is re-attached (compose `up` under the same
+  # project recreates the containers onto the kept volumes) with seeding skipped. The
+  # probe covers containers AND volumes — a persistent teardown removes the containers
+  # but keeps the volumes, so volumes alone mean "stopped session".
+  local reattach=0
+  if [[ -n "$session_id" || -n "${AGENT_SANDBOX_PROJECT_NAME:-}" ]]; then
+    if [[ -n "$(docker ps -q --filter "label=com.docker.compose.project=$project")" ]]; then
+      as_error "session $project is already running — use expand/down (or wait for it to exit) instead of launching it again"
+      return 1
+    fi
+    if [[ -n "$(docker ps -aq --filter "label=com.docker.compose.project=$project")" || -n "$(docker volume ls -q --filter "label=com.docker.compose.project=$project")" ]]; then
+      if [[ -n "$resume_from" ]]; then
+        as_error "resume_from needs a FRESH session, but project $project already has containers or volumes — pick a new session_id, or take the old stack down (agent-sandbox down $project)"
+        return 1
+      fi
+      if [[ "$ephemeral" == "true" ]]; then
+        as_error "project $project has a stopped persistent stack but this workload is ephemeral:true — re-attach needs ephemeral:false (or take the stack down first: agent-sandbox down $project)"
+        return 1
+      fi
+      reattach=1
+      as_info "re-attaching to the stopped session $project (kept volumes; seeding skipped)"
+    fi
+  fi
+
+  # Resume: resolve the prior session's manifest and exported artifacts BEFORE `up`,
+  # so its audit log can ride into the compose file set as a read-only bind.
+  local prior_state="" prior_base_commit="" prior_review_branch=""
+  if [[ -n "$resume_from" ]]; then
+    prior_state="$(_stack_state_dir "agent-sandbox-$resume_from")"
+    if [[ ! -f "$prior_state/session.json" ]]; then
+      as_error "nothing to resume: no session manifest at $prior_state/session.json (did session '$resume_from' run with session_id set and reach its seed?)"
+      return 1
+    fi
+    if ! prior_base_commit="$(_stack_read_manifest_field "$prior_state" base_commit)" ||
+      ! prior_review_branch="$(_stack_read_manifest_field "$prior_state" review_branch)"; then
+      as_error "the prior session's manifest $prior_state/session.json is missing base_commit/review_branch — cannot resume from it"
+      return 1
+    fi
+    if [[ "$(jq -r '.seed_from_git.review_branch' "$workload")" == "$prior_review_branch" ]]; then
+      as_error "seed_from_git.review_branch must differ from the prior session's ('$prior_review_branch') — a resumed session extracts onto its own review branch"
+      return 1
+    fi
+    if [[ ",${COMPOSE_PROFILES}," == *,audit,* ]]; then
+      if [[ -s "$prior_state/audit.jsonl" ]]; then
+        local audit_prior_override="$state/audit-prior-override.json"
+        _stack_write_audit_prior_override "$prior_state/audit.jsonl" "$audit_prior_override" || {
+          as_error "could not generate the prior-audit-log compose override"
+          return 1
+        }
+        _STACK_EXTRA_COMPOSE+=("$audit_prior_override")
+        as_info "audit continuity: the prior session's log rides read-only at /var/log/agent-sandbox/audit.prior.jsonl"
+      else
+        as_warn "the prior session exported no audit log ($prior_state/audit.jsonl) — audit.prior.jsonl will not be mounted"
+      fi
+    fi
+  fi
 
   # env delivery: a 0600 env-file consumed ONLY by `up` (staged as an up-only
   # override appended last to the compose file set), then unlinked once the container
@@ -330,34 +465,152 @@ stack_run() {
   fi
 
   # Seed the workspace from git BEFORE the entrypoint runs, so the workload never
-  # sees a half-seeded tree. A seed failure keeps nothing: no work exists yet, so
-  # tear the stack down and refuse.
-  local seeded=0 base_ref="" base_commit="" review_branch="" repo_root="" wip_patch=""
+  # sees a half-seeded tree. A cold-seed failure keeps nothing (no work exists yet,
+  # so tear the stack down and refuse); a RE-ATTACH failure instead stops the
+  # containers but KEEPS the volumes — they hold a prior leg's work.
+  local seeded=0 base_ref="" base_commit="" review_branch="" repo_root="" wip_patch="" seed_ref=""
   if jq -e '.seed_from_git' "$workload" >/dev/null; then
-    local ref
-    ref="$(jq -r '.seed_from_git.ref' "$workload")"
+    seed_ref="$(jq -r '.seed_from_git.ref' "$workload")"
     review_branch="$(jq -r '.seed_from_git.review_branch' "$workload")"
-    if [[ "$ref" != "HEAD" ]]; then
-      as_error "seed_from_git.ref: only HEAD (the current checkout's tracked tree + uncommitted delta) is supported by this build"
-      _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
-      return 1
-    fi
-    if ! repo_root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
-      as_error "seed_from_git needs to run from inside a git checkout (no repo at $PWD)"
-      _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
-      return 1
-    fi
-    base_commit="$(git -C "$repo_root" rev-parse HEAD)"
     wip_patch="$state/wip.patch"
-    if ! (umask 077 && worktree_capture_wip_patch "$repo_root" >"$wip_patch") ||
-      ! worktree_seed_tar "$repo_root" | worktree_seed_into_container "$cid" ||
-      ! base_ref="$(worktree_container_init_repo "$cid" "$review_branch")"; then
-      as_error "could not seed the workspace into the sandbox"
-      _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
-      return 1
+    if [[ "$reattach" == 1 ]]; then
+      # Trust the manifest + an in-container probe; the only destructive path is the
+      # explicit --reseed flag.
+      local manifest_mode
+      manifest_mode="$(_stack_read_manifest_field "$state" mode)" || manifest_mode=""
+      if [[ "$manifest_mode" != "seed" ]] ||
+        ! docker exec -u "$WORKLOAD_USER" "$cid" test -d /workspace/.git; then
+        as_error "re-attach: $project's manifest/workspace is not a seeded session (manifest mode '${manifest_mode:-absent}') — take the stack down (agent-sandbox down $project) and start fresh"
+        _stack_compose "$project" "$compose" "$override" "$overmounts" down --timeout 30 || true # allow-exit-suppress: best-effort stop of a stack refused at re-attach; volumes are deliberately kept
+        return 1
+      fi
+      if ! base_commit="$(_stack_read_manifest_field "$state" base_commit)" ||
+        ! review_branch="$(_stack_read_manifest_field "$state" review_branch)" ||
+        ! repo_root="$(_stack_read_manifest_field "$state" repo_root)"; then
+        as_error "re-attach: the session manifest $state/session.json is missing base_commit/review_branch/repo_root — cannot extract this leg's work; take the stack down and start fresh"
+        _stack_compose "$project" "$compose" "$override" "$overmounts" down --timeout 30 || true # allow-exit-suppress: best-effort stop of a stack refused at re-attach; volumes are deliberately kept
+        return 1
+      fi
+      if [[ "${AGENT_SANDBOX_RESEED:-0}" == 1 ]]; then
+        as_warn "--reseed: discarding $project's seeded workspace and re-seeding from the current checkout"
+        if ! repo_root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+          as_error "--reseed needs to run from inside a git checkout (no repo at $PWD)"
+          _stack_compose "$project" "$compose" "$override" "$overmounts" down --timeout 30 || true # allow-exit-suppress: best-effort stop of a stack refused at re-seed; volumes are deliberately kept
+          return 1
+        fi
+        base_commit="$(git -C "$repo_root" rev-parse HEAD)"
+        if ! (umask 077 && worktree_capture_wip_patch "$repo_root" >"$wip_patch") ||
+          ! worktree_seed_tar "$repo_root" | worktree_reseed_container "$cid" ||
+          ! base_ref="$(worktree_container_init_repo "$cid" "$review_branch")" ||
+          ! worktree_stamp_seed_fingerprint "$cid" "$repo_root" ||
+          ! _stack_write_manifest "$state" "$project" "$session_id" "seed" "HEAD" "$base_commit" "$base_ref" "$review_branch" "$repo_root"; then
+          as_error "could not re-seed the workspace"
+          _stack_compose "$project" "$compose" "$override" "$overmounts" down --timeout 30 || true # allow-exit-suppress: best-effort stop of a stack refused mid-re-seed; volumes are deliberately kept
+          return 1
+        fi
+        as_info "workspace re-seeded from $repo_root (HEAD + uncommitted delta); review branch: $review_branch"
+      else
+        if [[ "$(_stack_read_manifest_field "$state" seed_ref)" == "HEAD" ]] &&
+          ! worktree_seed_fingerprint_matches "$cid" "$repo_root"; then
+          as_warn "the re-attached workspace was seeded from an older state of $repo_root — continuing with the session's tree as-is; pass --reseed to discard it and re-seed from your current checkout"
+        fi
+        # This leg extracts only ITS OWN commits: the extract base is the container's
+        # current HEAD — the prior legs' work is already on the review branch.
+        if ! base_ref="$(worktree_container_seed_head "$cid")"; then
+          as_error "re-attach: could not read the workspace repo HEAD"
+          _stack_compose "$project" "$compose" "$override" "$overmounts" down --timeout 30 || true # allow-exit-suppress: best-effort stop of a stack refused at re-attach; volumes are deliberately kept
+          return 1
+        fi
+      fi
+    else
+      if ! repo_root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+        as_error "seed_from_git needs to run from inside a git checkout (no repo at $PWD)"
+        _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
+        return 1
+      fi
+      if [[ -n "$resume_from" ]]; then
+        # Resume: seed the prior session's recorded base commit, then replay its
+        # review branch on top — the workload's seed_from_git.ref is deliberately
+        # ignored (the prior manifest is the provenance).
+        as_info "resume: seeding from session '$resume_from' (base $prior_base_commit); seed_from_git.ref '$seed_ref' is ignored on resume"
+        if ! git -C "$repo_root" rev-parse --verify --quiet "$prior_base_commit^{commit}" >/dev/null; then
+          as_error "the prior session's base commit $prior_base_commit is not in $repo_root — cannot resume"
+          _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
+          return 1
+        fi
+        local resume_mbox="$state/resume.mbox"
+        if ! (umask 077 && : >"$wip_patch") ||
+          ! (umask 077 && git -C "$repo_root" format-patch --stdout --binary "$prior_base_commit..$prior_review_branch" >"$resume_mbox") ||
+          ! worktree_seed_tar_ref "$repo_root" "$prior_base_commit" | worktree_seed_into_container "$cid" ||
+          ! base_ref="$(worktree_container_init_repo "$cid" "$review_branch")"; then
+          as_error "could not seed the resumed workspace into the sandbox"
+          _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
+          return 1
+        fi
+        base_commit="$prior_base_commit"
+        if [[ -s "$resume_mbox" ]]; then
+          # The new session's extract must branch the host review branch from the
+          # prior work's tip — patches formatted against the post-replay tree only
+          # apply there. A tip that is the extract's uncommitted-changes fold is
+          # soft-reset back into an UNCOMMITTED overlay (and the host base steps to
+          # its parent), so the agent resumes with it uncommitted, as it was left.
+          if ! worktree_container_apply_mbox "$cid" <"$resume_mbox"; then
+            _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
+            return 1
+          fi
+          base_commit="$(git -C "$repo_root" rev-parse "$prior_review_branch")"
+          if worktree_tip_is_wip_fold "$repo_root" "$prior_review_branch"; then
+            if ! worktree_container_soft_reset_tip "$cid"; then
+              _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
+              return 1
+            fi
+            base_commit="$(git -C "$repo_root" rev-parse "$prior_review_branch~1")"
+          fi
+          if ! base_ref="$(worktree_container_seed_head "$cid")"; then
+            as_error "resume: could not read the post-replay workspace HEAD"
+            _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
+            return 1
+          fi
+        fi
+        # The manifest records the ACTUAL seed provenance (the prior base commit),
+        # not the ignored workload ref — so a later re-attach of this session never
+        # runs the HEAD-only staleness check against a seed that wasn't HEAD.
+        seed_ref="$prior_base_commit"
+        as_info "workspace resumed from session '$resume_from' ($prior_review_branch replayed); review branch: $review_branch"
+      elif [[ "$seed_ref" == "HEAD" ]]; then
+        base_commit="$(git -C "$repo_root" rev-parse HEAD)"
+        if ! (umask 077 && worktree_capture_wip_patch "$repo_root" >"$wip_patch") ||
+          ! worktree_seed_tar "$repo_root" | worktree_seed_into_container "$cid" ||
+          ! base_ref="$(worktree_container_init_repo "$cid" "$review_branch")" ||
+          ! worktree_stamp_seed_fingerprint "$cid" "$repo_root"; then
+          as_error "could not seed the workspace into the sandbox"
+          _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
+          return 1
+        fi
+        as_info "workspace seeded from $repo_root (HEAD + uncommitted delta); review branch: $review_branch"
+      else
+        # An arbitrary committed ref: seed its committed tree only; the wip patch is
+        # written EMPTY (its emptiness means "nothing uncommitted" downstream).
+        if ! base_commit="$(git -C "$repo_root" rev-parse --verify --quiet "$seed_ref^{commit}")"; then
+          as_error "seed_from_git.ref '$seed_ref' does not resolve to a commit in $repo_root"
+          _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
+          return 1
+        fi
+        if ! (umask 077 && : >"$wip_patch") ||
+          ! worktree_seed_tar_ref "$repo_root" "$base_commit" | worktree_seed_into_container "$cid" ||
+          ! base_ref="$(worktree_container_init_repo "$cid" "$review_branch")"; then
+          as_error "could not seed the workspace into the sandbox"
+          _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
+          return 1
+        fi
+        as_info "workspace seeded from $seed_ref ($base_commit, committed tree only); review branch: $review_branch"
+      fi
+      _stack_write_manifest "$state" "$project" "$session_id" "seed" "$seed_ref" "$base_commit" "$base_ref" "$review_branch" "$repo_root" || {
+        _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
+        return 1
+      }
     fi
     seeded=1
-    as_info "workspace seeded from $repo_root (HEAD + uncommitted delta); review branch: $review_branch"
   fi
 
   # Run the Workload's entrypoint. Its env rode in on the override, so a plain
@@ -388,6 +641,7 @@ stack_run() {
     local wt_dir="$state/review-worktree" agent_mbox="$state/agent.mbox"
     if ! worktree_extract_to_host "$cid" "$base_ref" "$repo_root" "$base_commit" \
       "$review_branch" "$wt_dir" "$wip_patch" "$agent_mbox"; then
+      _stack_update_manifest "$state" "$workload_rc" false || true # allow-exit-suppress: manifest bookkeeping already warns; it must not mask the extract failure
       as_error "extract failed — keeping the session's containers and volumes (compose project $project) so the workload's work is not lost"
       return 1
     fi
@@ -399,6 +653,12 @@ stack_run() {
   fi
 
   _stack_export_egress_log "$project" "$compose" "$override" "$overmounts" "$state" || true # allow-exit-suppress: the export already warned loudly; a lost audit copy must not block teardown of an otherwise-complete session
+  if [[ ",${COMPOSE_PROFILES}," == *,audit,* ]]; then
+    _stack_export_audit_log "$project" "$compose" "$override" "$overmounts" "$state" || true # allow-exit-suppress: the export already warned loudly; a lost audit copy must not block teardown of an otherwise-complete session
+  fi
+  local extracted=false
+  [[ "$seeded" == 1 ]] && extracted=true
+  _stack_update_manifest "$state" "$workload_rc" "$extracted" || true # allow-exit-suppress: manifest bookkeeping already warns; it must not block teardown
 
   if [[ "$ephemeral" == "true" ]]; then
     _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || return 1

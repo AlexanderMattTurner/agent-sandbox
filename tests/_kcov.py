@@ -129,6 +129,7 @@ KCOV_TEST_FILES = [
     "tests/test_expand_cli.py",
     "tests/test_launcher.py",
     "tests/test_lifecycle_verbs.py",
+    "tests/test_persistent_sessions.py",
     "tests/test_stack_seams.py",
     "tests/test_stack_secrets_tty.py",
 ]
