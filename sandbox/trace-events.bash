@@ -1,12 +1,11 @@
 # shellcheck shell=bash
 # shellcheck disable=SC2034  # consumed by as_trace (trace.bash) via the maps below, not here.
-# GENERATED from config/trace-events.json by scripts/gen-trace-events.mjs — do not edit by hand.
+# Hand-maintained event map — edit the constants and maps below directly.
 #
-# Sourced by bin/lib/trace.bash (co-located, copied into the container beside it).
+# Sourced by sandbox/trace.bash (co-located, copied into the container beside it).
 # as_trace looks an event's layer and level up in the maps below to label and gate
-# its line. The JS/Python producers read those manifest fields straight from the JSON
-# SSOT, but as_trace runs in-container with no JSON to read, so they are generated
-# here from the SAME manifest and kept fresh by gen-trace-events.test.mjs.
+# its line. as_trace runs in-container with no JSON manifest to read, so the map
+# lives here as plain bash.
 
 # Idempotent: a re-source returns early rather than redefining.
 [[ -n "${TRACE_EVENTS_LOADED:-}" ]] && return 0
