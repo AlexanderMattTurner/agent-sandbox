@@ -23,6 +23,7 @@ source "$_AS_DIR/lib/stack.bash"
 usage() {
   cat >&2 <<'EOF'
 Usage: agent-sandbox run [--extra-compose FILE]... <workload.json>
+       agent-sandbox expand <host>[:ro|rw] [--project NAME]
        agent-sandbox gc [--dry-run]
        agent-sandbox down <project>
 
@@ -33,6 +34,11 @@ name-level-allowlist firewall, waits for its health, then execs the workload.
   --extra-compose FILE   Merge FILE (repeatable, in order) after the library's compose
                          file set on every compose invocation of the session — the seam
                          for consumer-owned companion services and service extensions.
+
+`expand` widens a RUNNING session's egress allowlist by one host without resetting
+the firewall (default access ro = GET/HEAD only). The grant is session-scoped; make
+it permanent in the Workload record's egress_allowlist. With several sessions up,
+name one via --project (or AGENT_SANDBOX_PROJECT_NAME).
 
 gc prunes stale sandbox networks (no live containers), reclaiming dead sessions'
 subnets; --dry-run previews what a real run would remove. down tears down one
@@ -166,6 +172,77 @@ cmd_run() {
   stack_run "$workload" "$compose" "$runtime" ${extra_compose[@]+"${extra_compose[@]}"}
 }
 
+# cmd_expand HOST[:ro|rw] [--project NAME] — widen a running session's firewall
+# allowlist live. Resolves the session's firewall container by its compose labels and
+# execs the in-container writer (sandbox/expand-allowlist.bash), which validates the
+# domain, records it in the tmpfs overlay, and reloads dnsmasq/squid. Fails closed at
+# every step: no host, a bad access tier, no (or an ambiguous) firewall container, or
+# a failed in-container apply all refuse rather than half-widen.
+cmd_expand() {
+  local project="${AGENT_SANDBOX_PROJECT_NAME:-}" spec=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --project)
+      [[ -n "${2:-}" ]] || {
+        as_error "--project needs a compose project name"
+        return 1
+      }
+      project="$2"
+      shift 2
+      ;;
+    *)
+      [[ -z "$spec" ]] || {
+        as_error "expand takes exactly one <host>[:ro|rw] (got '$spec' and '$1')"
+        return 1
+      }
+      spec="$1"
+      shift
+      ;;
+    esac
+  done
+  [[ -n "$spec" ]] || {
+    as_error "no host given"
+    usage
+    return 1
+  }
+  local host="$spec" access="ro"
+  if [[ "$spec" == *:* ]]; then
+    host="${spec%%:*}"
+    access="${spec##*:}"
+  fi
+  [[ -n "$host" ]] || {
+    as_error "empty host in '$spec'"
+    return 1
+  }
+  [[ "$access" == "ro" || "$access" == "rw" ]] || {
+    as_error "invalid access '$access' in '$spec' (expected ro or rw)"
+    return 1
+  }
+
+  # The session's firewall container carries compose's own service/project labels
+  # (stack.bash launches project agent-sandbox-<id>); resolve it by those so the exec
+  # can never land in an unrelated container.
+  local -a filter=(--filter label=com.docker.compose.service=firewall)
+  [[ -n "$project" ]] && filter+=(--filter "label=com.docker.compose.project=$project")
+  local cids
+  cids="$(docker ps -q "${filter[@]}")" || {
+    as_error "could not list containers — is the docker daemon running?"
+    return 1
+  }
+  [[ -n "$cids" ]] || {
+    as_error "no running firewall container found${project:+ for project $project} — nothing to expand into (is a sandbox session up?)"
+    return 1
+  }
+  [[ "$(wc -l <<<"$cids")" -le 1 ]] || {
+    as_error "several sessions have a running firewall — name one with --project NAME (or AGENT_SANDBOX_PROJECT_NAME)"
+    return 1
+  }
+  docker exec "$cids" expand-allowlist.bash "$host:$access" || {
+    as_error "live allowlist expansion failed inside the firewall container (see its output above)"
+    return 1
+  }
+}
+
 # cmd_gc [--dry-run] — prune stale sandbox networks (no live containers), reclaiming
 # dead sessions' subnets. --dry-run previews what a real run would remove.
 cmd_gc() {
@@ -213,6 +290,10 @@ main() {
   run)
     shift
     cmd_run "$@"
+    ;;
+  expand)
+    shift
+    cmd_expand "$@"
     ;;
   gc)
     shift
