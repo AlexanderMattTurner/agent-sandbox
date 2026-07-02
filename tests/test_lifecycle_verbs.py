@@ -132,6 +132,19 @@ def test_gc_keeps_a_fresh_spare(tmp_path):
     assert " down " not in f" {log} "
 
 
+def test_gc_never_downs_a_non_prewarm_project_carrying_the_ready_label(tmp_path):
+    """The project-name guard is what keeps gc's `down --volumes` away from a
+    non-prewarm stack that (maliciously or accidentally) carries the ready
+    label — an over-age candidate with a foreign project name must be skipped."""
+    r, log = _run(
+        tmp_path,
+        ["gc"],
+        {**_spare_env(created=1), "FAKE_SPARE_PROJECT": "my-production-stack"},
+    )
+    assert r.returncode == 0, r.stderr
+    assert " down " not in f" {log} "
+
+
 def test_gc_age_threshold_is_env_tunable(tmp_path):
     recent = int(time.time()) - 5
     r, log = _run(

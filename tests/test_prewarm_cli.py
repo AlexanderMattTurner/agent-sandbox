@@ -293,6 +293,11 @@ def test_prewarm_leaves_a_labeled_spare_up_and_prints_its_project(tmp_path):
     assert override["services"]["workload"]["tmpfs"] == [
         "/run/secrets:mode=0755,size=1m"
     ]
+    # The tmpfs is declared ONCE, by the prewarm override: the per-session
+    # workload override must not repeat it (two override files emitting the same
+    # destination is daemon-reconciliation behavior the launcher refuses to bet on).
+    wl_override = json.loads((state / "workload-override.json").read_text())
+    assert "tmpfs" not in wl_override["services"].get("workload", {})
 
     manifest = json.loads((state / "prewarm.json").read_text())
     assert manifest["project"] == project

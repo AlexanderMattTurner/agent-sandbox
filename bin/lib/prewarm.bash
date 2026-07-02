@@ -96,6 +96,10 @@ _prewarm_sha256() {
 #     container's environment at create)
 #   - the compose file's content, and each extra-compose overlay's content in
 #     argument order (they shape every service compose renders)
+#   - each seccomp profile the compose file references (security_opt applies
+#     the profile's CONTENT at container-create, but compose only stores the
+#     path — an edited profile would neither move the compose hash nor force
+#     a recreate at the adoption re-up)
 #
 # Deliberately NOT hashed (nothing here is baked into the spare's bring-up):
 #   - entrypoint, tty: exec-time — the spare's container idles until serve
@@ -122,6 +126,13 @@ prewarm_spec_hash() {
   grants="$(jq -cS '.control_plane.egress_grants // []' "$workload")" || return 1
   compose_sha="$(_prewarm_sha256 <"$compose")" || return 1
   local -a lines=("$wl_id" "$fw_id" "$runtime" "$allow" "$fields" "$grants" "$compose_sha")
+  # seccomp:./<file> paths resolve relative to the compose file's directory.
+  local seccomp_rel seccomp_path
+  while IFS= read -r seccomp_rel; do
+    [[ -n "$seccomp_rel" ]] || continue
+    seccomp_path="$(dirname "$compose")/$seccomp_rel"
+    lines+=("$(_prewarm_sha256 <"$seccomp_path")") || return 1
+  done < <(sed -n 's/^[[:space:]]*-[[:space:]]*seccomp:\.\///p' "$compose" | sort -u)
   for extra in "$@"; do
     lines+=("$(_prewarm_sha256 <"$extra")") || return 1
   done

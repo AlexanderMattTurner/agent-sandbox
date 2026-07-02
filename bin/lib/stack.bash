@@ -215,8 +215,11 @@ stack_ensure_firewall_image() {
 # the secret_env VALUES (only the value-free tmpfs declaration does), so secrets never
 # persist in this on-disk override. JSON is valid YAML, so compose consumes it
 # directly. With neither field the workload object is `{}`, a valid no-op override.
+# WITH_TMPFS=0 (a prewarm bring-up) omits the secret_env tmpfs: every spare already
+# carries that mount via prewarm_write_override, and emitting it from two override
+# files at the same destination is daemon-reconciliation behavior we refuse to bet on.
 _stack_write_override() {
-  local workload="$1" out="$2"
+  local workload="$1" out="$2" with_tmpfs="${3:-1}"
   # `$` → `$$`: compose runs variable interpolation over every file it loads, so a
   # literal dollar in a mount path must be escaped or it would be expanded against
   # the LAUNCHER's environment.
@@ -225,11 +228,11 @@ _stack_write_override() {
       workload: ((if .workspace_mount
                   then {volumes: [{type: "bind", source: (.workspace_mount | gsub("\\$"; "$$")), target: "/workspace"}]}
                   else {} end)
-                 + (if ((.secret_env // {}) | length) > 0
+                 + (if $with_tmpfs == "1" and ((.secret_env // {}) | length) > 0
                     then {tmpfs: ["/run/secrets:mode=0755,size=1m"]}
                     else {} end))
     }
-  }' "$workload" >"$out"
+  }' --arg with_tmpfs "$with_tmpfs" "$workload" >"$out"
 }
 
 # _stack_deliver_secrets WORKLOAD_JSON CID USER — stream each secret_env value into
@@ -491,7 +494,7 @@ stack_bring_up() {
   stack_ensure_firewall_image "$sandbox_dir" || return 1
 
   local override="$state/workload-override.json"
-  _stack_write_override "$workload" "$override" || {
+  _stack_write_override "$workload" "$override" "$_STACK_STAGE_ENV" || {
     as_error "could not generate the per-session compose override"
     return 1
   }

@@ -248,6 +248,32 @@ def test_spec_hash_moves_with_compose_file_content(tmp_path):
     assert before != _hash(tmp_path, BASE_WORKLOAD)
 
 
+def test_spec_hash_moves_with_referenced_seccomp_profile_content(tmp_path):
+    """security_opt applies the profile's CONTENT at container-create, but compose
+    only stores the path — so the profile files must be hashed themselves, or an
+    edited profile would be invisible to the adoption gate."""
+    compose = tmp_path / "compose.yml"
+    seccomp = tmp_path / "seccomp-default.json"
+    compose.write_text(
+        "services:\n  workload:\n    security_opt:\n      - seccomp:./seccomp-default.json\n"
+    )
+    seccomp.write_text('{"defaultAction": "SCMP_ACT_ERRNO"}\n')
+    before = _hash(tmp_path, dict(BASE_WORKLOAD))
+    seccomp.write_text('{"defaultAction": "SCMP_ACT_ALLOW"}\n')
+    assert _hash(tmp_path, dict(BASE_WORKLOAD)) != before
+
+
+def test_spec_hash_fails_closed_on_a_missing_referenced_seccomp_profile(tmp_path):
+    compose = tmp_path / "compose.yml"
+    compose.write_text(
+        "services:\n  workload:\n    security_opt:\n      - seccomp:./absent.json\n"
+    )
+    wl = tmp_path / "wl-missing-seccomp.json"
+    wl.write_text(json.dumps(BASE_WORKLOAD))
+    r = _bash(tmp_path, 'prewarm_spec_hash "$@"', str(wl), str(compose), "runc")
+    assert r.returncode != 0
+
+
 def test_spec_hash_covers_extra_compose_content_and_order(tmp_path):
     a = tmp_path / "a.json"
     b = tmp_path / "b.json"
