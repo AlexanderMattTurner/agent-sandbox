@@ -63,3 +63,13 @@ diffed against its agent-sandbox counterpart. Ported vs. recorded-only:
 - **Cosmetic-only divergence** (comment/message de-claude wording; no logic delta):
   `bin/lib/{runtime-detect,sandbox-runtime,msg}.bash`. `bin/lib/{flock,sandbox-net}.bash`
   are identical to their origins modulo the de-claude renames.
+
+## Downstream consumption
+
+`agent-sandbox` is consumed back by [`claude-guard`](https://github.com/alexandermattturner/claude-guard)
+— the same repo it was extracted from — as a **pinned, vendored library**: claude-guard
+vendors a specific commit of this substrate and layers its Claude/inference-specific
+_adapter_ (the blocks stripped during the de-claude transform above) on top. The pin is
+what keeps the extraction honest — the enforcement core lives here as the single source
+of truth, and claude-guard tracks it by an explicit revision rather than diverging a
+private copy.

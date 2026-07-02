@@ -1,48 +1,46 @@
-# Claude Automation Template
+# agent-sandbox
 
-A GitHub template that makes [Claude Code](https://docs.anthropic.com/en/docs/claude-code) work reliably on your repositories. It wires up git hooks, CI workflows, and Claude session hooks so that Claude can autonomously fix code, create PRs, and respond to `@claude` mentions—with safeguards to prevent broken code from shipping.
+A library for running an **untrusted Workload** — an arbitrary container image and
+command — inside a hardware-isolated, deny-all-egress sandbox. You describe the
+workload as a small JSON record; the launcher selects a runtime, allocates a private
+subnet, brings up a **name-level-allowlist firewall** in front of it, waits for the
+firewall to be healthy, then execs the workload. The workload sits on an
+`internal` Docker network with no route off it — its only path out is the firewall's
+forward proxy — so the allowlist is unbypassable and the proxy's access log is a
+complete, **tamper-evident egress log** of everything the workload sent.
 
-## Why Use This
+The isolation is layered: a runtime ladder that auto-downgrades **Kata → gVisor →
+runc** (strongest available wins), a firewall that boots **deny-all** and admits only
+the hostnames the Workload declares (with a per-host `ro` GET/HEAD tier), and an
+**ephemeral** teardown whose "everything is gone" guarantee is _verified_ — teardown
+fails loud on any surviving volume. The workspace is either **seeded from git** (the
+workload's commits are extracted onto a review branch, never onto your working tree)
+or **bind-mounted** from a host path (with dangerous paths held read-only). No
+workload-specific logic lives in the library.
 
-**Without this template**, using Claude Code on a repo requires manually configuring hooks, writing CI workflows, and building guardrails against common failure modes (infinite retry loops, pushing broken code, inconsistent formatting).
+- **Authoring and running a Workload:** [`docs/usage.md`](docs/usage.md)
+- **The Workload contract (every field):** [`schema/workload.schema.json`](schema/workload.schema.json)
+- **How the isolation is built as topology:** the header comment of
+  [`sandbox/docker-compose.yml`](sandbox/docker-compose.yml)
+- **Lineage from `claude-guard`:** [`PROVENANCE.md`](PROVENANCE.md)
 
-**With this template**, you get all of that out of the box:
+```bash
+agent-sandbox run workloads/demo-bash.json     # run a Workload record
+agent-sandbox down <project>                    # tear one session down (verified)
+```
 
-- **A solid starting CLAUDE.md**—upholds high code quality standards, including a self-critique loop that catches bugs before they leave the editor
-- **Pre-push verification**—build, lint, type checks, and tests run automatically before every `git push` or `gh pr create`
-- **Deadlock-proof session hooks**—every hook is syntax-checked at session start, wrapped in a launcher that degrades to “ask” on parse failure, and commits with conflict markers are rejected up front
-- **Skill-driven PR flow**—the `pr-creation` skill runs an iterative compress-critique-fix loop on the diff, then watches CI and fixes failures before reporting back
-- **Enforced code quality**—Conventional Commits (via commitlint), Prettier formatting, and lint-staged run on every commit
-- **`@claude` GitHub integration**—mention Claude in issues or PR comments and it responds with full repo context
-- **Weekly security sweeps**—a scheduled workflow collects Dependabot, code-scanning, secret-scanning, and `pnpm audit` alerts, then hands them to Claude to open a rollup fix PR
-- **Automatic template sync**—downstream repos receive improvements daily via PR, with 3-way merge that preserves your customizations
-- **Multi-language support**—Node.js (pnpm), Python (uv/ruff/pytest), and shell (shfmt/shellcheck) work out of the box
+---
+
+The rest of this README documents the **repository automation** this project is built
+on (the Claude Code automation template: git hooks, CI workflows, and session hooks).
+It is contributor-facing scaffolding, not part of the agent-sandbox library itself.
 
 ## Prerequisites
 
 - [Node.js](https://nodejs.org/) (see `.nvmrc` for the pinned version)
-- [pnpm](https://pnpm.io/) (`npm install -g pnpm` if you don’t have it—`setup.sh` handles this automatically)
+- [pnpm](https://pnpm.io/) (`npm install -g pnpm` if you don’t have it)
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated
 - (Optional) [uv](https://docs.astral.sh/uv/) for Python projects
-
-## Quick Start
-
-1. **Create your repo**—click **“Use this template”** on GitHub.
-2. **Clone and set up:**
-
-   ```bash
-   git clone <your-repo-url>
-   cd <your-repo>
-   ./setup.sh
-   ```
-
-   This installs dependencies and configures git hooks. Verify the output ends with `✓ Setup complete!`.
-
-3. **Install the [Claude GitHub App](https://github.com/apps/claude)** to enable `@claude` mentions in issues and PRs.
-
-4. **Customize for your project:**
-   - Edit **`CLAUDE.md`**—add project-specific context, architecture notes, and conventions for Claude.
-   - Edit **`package.json`**—wire up your `dev`, `build`, `test`, `lint`, and `check` scripts. Unconfigured scripts are detected and skipped gracefully, so nothing breaks on first push.
 
 ## What’s Included
 
