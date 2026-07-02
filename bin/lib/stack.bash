@@ -45,6 +45,89 @@ stack_partition_allowlist() {
   export WORKLOAD_ALLOWED_DOMAINS_RO WORKLOAD_ALLOWED_DOMAINS_RW
 }
 
+# stack_export_control_plane_grants WORKLOAD_JSON — validate the Workload's
+# control_plane.egress_grants and export CONTROL_PLANE_EGRESS_GRANTS as the compact
+# JSON array the firewall renders (compose env passthrough). Every uid must be an
+# integer >= 1 (uid 0 would carve out the firewall's own root-owned daemons) and
+# every host must be a hostname, never an IP literal — the same doctrine as the
+# egress_allowlist IP rejection in bin/agent-sandbox. No grants exports the EMPTY
+# STRING (not "[]") so the firewall's render path is a clean no-op.
+stack_export_control_plane_grants() {
+  local workload="$1" grants
+  grants="$(jq -c '.control_plane.egress_grants // []' "$workload")"
+  if [[ "$grants" == "[]" ]]; then
+    CONTROL_PLANE_EGRESS_GRANTS=""
+    export CONTROL_PLANE_EGRESS_GRANTS
+    return 0
+  fi
+  jq -e '[.[] | (.uid | type == "number" and . == floor and . >= 1)] | all' <<<"$grants" >/dev/null || {
+    as_error "control_plane.egress_grants: every uid must be an integer >= 1 (a uid-0 grant would carve out the firewall's own root-owned traffic)"
+    return 1
+  }
+  jq -e '[.[] | .hosts | type == "array" and length > 0 and ([.[] | type == "string" and test("^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$")] | all)] | all' <<<"$grants" >/dev/null || {
+    as_error "control_plane.egress_grants: every entry needs a non-empty hosts list of hostname-shaped strings"
+    return 1
+  }
+  if jq -e '[.[].hosts[] | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$"))] | length > 0' <<<"$grants" >/dev/null; then
+    as_error "control_plane.egress_grants must name HOSTNAMES, not IPs — grants are resolved by name at the firewall, like the egress allowlist"
+    return 1
+  fi
+  # One entry per uid: the firewall builds each grant's ipset fresh, so a second
+  # entry for the same uid would silently wipe the first one's resolved IPs.
+  jq -e 'map(.uid) | length == (unique | length)' <<<"$grants" >/dev/null || {
+    as_error "control_plane.egress_grants: duplicate uid — merge each uid's hosts into one entry"
+    return 1
+  }
+  CONTROL_PLANE_EGRESS_GRANTS="$grants"
+  export CONTROL_PLANE_EGRESS_GRANTS
+}
+
+# _stack_wait_control_plane_ready CID WORKLOAD_JSON — block until every consumer
+# service named in control_plane.require has published its readiness marker
+# (/run/control-plane/<name>.ready on the shared control-plane volume, probed via
+# the workload container's read-only mount). Returns 0 immediately when nothing is
+# required; polls at 1s up to AGENT_SANDBOX_READY_TIMEOUT seconds (default 60),
+# then fails closed naming the missing marker(s) — a workload must never start
+# against a control plane the Workload record says it depends on but that isn't up.
+_stack_wait_control_plane_ready() {
+  local cid="$1" workload="$2" name
+  local -a required=()
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    # The name lands in the probed path; a traversal-shaped value from an
+    # untrusted workload record must not walk out of /run/control-plane.
+    if [[ ! "$name" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+      as_error "control_plane.require name '$name' is not a valid marker name (want [a-z0-9][a-z0-9-]*, the schema's pattern)"
+      return 1
+    fi
+    required+=("$name")
+  done < <(jq -r '.control_plane.require // [] | .[]' "$workload")
+  ((${#required[@]})) || return 0
+  local timeout="${AGENT_SANDBOX_READY_TIMEOUT:-60}"
+  # A non-numeric timeout would break the deadline arithmetic and turn the
+  # barrier into an unbounded poll — fail loud instead (same doctrine as
+  # init-firewall's DNS_BATCH_SIZE guard).
+  if [[ ! "$timeout" =~ ^[0-9]+$ ]]; then
+    as_error "AGENT_SANDBOX_READY_TIMEOUT must be a whole number of seconds, got '$timeout'"
+    return 1
+  fi
+  local deadline=$((SECONDS + timeout))
+  local -a missing=()
+  while true; do
+    missing=()
+    for name in "${required[@]}"; do
+      if ! docker exec "$cid" test -f "/run/control-plane/$name.ready"; then
+        missing+=("$name")
+      fi
+    done
+    ((${#missing[@]} == 0)) && return 0
+    ((SECONDS >= deadline)) && break
+    sleep 1
+  done
+  as_error "control-plane readiness timed out after ${timeout}s — missing marker(s): ${missing[*]} (each required service must create /run/control-plane/<name>.ready on the shared volume)"
+  return 1
+}
+
 # _stack_state_root — the library's own host state base dir (per-session dirs live
 # under it). The one place the AGENT_SANDBOX_STATE_DIR/XDG default chain is spelled.
 _stack_state_root() {
@@ -275,6 +358,10 @@ stack_run() {
   fi
 
   stack_partition_allowlist "$workload"
+  # Grants must be validated and exported BEFORE `up`: compose passes
+  # CONTROL_PLANE_EGRESS_GRANTS through to the firewall service's environment,
+  # and a malformed grant refuses the launch before anything comes up.
+  stack_export_control_plane_grants "$workload" || return 1
   # The default library services (hardener, audit) are profile-gated in the
   # compose: compose cannot REMOVE a service via an override, so a workload
   # opt-out (hardener:false / audit:false) is expressed by not activating the
@@ -406,6 +493,14 @@ stack_run() {
       # the workload can write anywhere under /workspace, directly onto the host.
       as_info "bind mode: no overmount guardrails apply — nothing under /workspace is mounted read-only this session"
     fi
+  fi
+
+  # Control-plane readiness barrier, BEFORE seeding: a consumer gate that never
+  # comes up must fail the launch while there is still nothing to lose — no
+  # seeded work, no running entrypoint the consumer believed was supervised.
+  if ! _stack_wait_control_plane_ready "$cid" "$workload"; then
+    _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
+    return 1
   fi
 
   # Seed the workspace from git BEFORE the entrypoint runs, so the workload never
