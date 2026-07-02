@@ -200,6 +200,30 @@ cmd_run() {
     }
   fi
 
+  # Bind mode (workspace_mount) and seed mode (seed_from_git) are mutually exclusive:
+  # bind writes land directly on the host, seed writes are quarantined onto a review
+  # branch — a record carrying both has no coherent write path, so refuse loudly
+  # rather than silently pick a precedence.
+  if jq -e 'has("workspace_mount") and has("seed_from_git")' "$workload" >/dev/null; then
+    as_error "workload sets BOTH workspace_mount (bind mode: writes land directly on the host) AND seed_from_git (seed mode: writes are quarantined onto a review branch) — the modes are mutually exclusive; pick one (see docs/bind-mode.md)"
+    return 1
+  fi
+  # Bind mode: validate the host source before anything is launched (stack.bash).
+  if jq -e 'has("workspace_mount")' "$workload" >/dev/null; then
+    stack_validate_workspace_mount "$workload" || return 1
+  fi
+
+  # overmount_paths is the sole kernel-enforced guard in bind mode, so a malformed
+  # value must refuse rather than degrade: a non-array (or non-string entry) would
+  # make overmount_paths_for's jq iteration error out and yield ZERO guard paths,
+  # silently handing over a fully-writable host bind.
+  if jq -e 'has("overmount_paths")' "$workload" >/dev/null; then
+    jq -e '.overmount_paths | type == "array" and ([.[] | type == "string" and length > 0] | all)' "$workload" >/dev/null || {
+      as_error "workload.overmount_paths must be an array of non-empty relative path strings (e.g. [\".git/hooks\", \"node_modules\"])"
+      return 1
+    }
+  fi
+
   local backend
   backend="$(jq -r '.backend // "local"' "$workload")"
 

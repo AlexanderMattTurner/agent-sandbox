@@ -6,6 +6,10 @@
   "type": "object",
   "additionalProperties": false,
   "required": ["image", "entrypoint", "egress_allowlist", "ephemeral"],
+  "not": {
+    "required": ["workspace_mount", "seed_from_git"],
+    "$comment": "Bind mode (workspace_mount) and seed mode (seed_from_git) are mutually exclusive: bind writes land directly on the host, seed writes are quarantined onto a review branch — a record carrying both has no coherent write path. See docs/bind-mode.md."
+  },
   "properties": {
     "image": {
       "type": "string",
@@ -41,7 +45,7 @@
     },
     "workspace_mount": {
       "type": "string",
-      "description": "Host path bound to the container's /workspace. Omitted when seed_from_git is set (the workspace is seeded from git into a volume instead of bound)."
+      "description": "BIND MODE: absolute host path bound READ-WRITE to the container's /workspace — the workload's writes land directly on the host, with no review-branch quarantine; the read-only overmount_paths binds are the only kernel-enforced guard (contract: docs/bind-mode.md). Mutually exclusive with seed_from_git (top-level `not`). The launcher refuses a relative, missing, non-directory, or symlinked source, and one resolving inside the library's own state dir."
     },
     "overmount_paths": {
       "type": "array",
@@ -90,7 +94,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["ref", "review_branch"],
-      "description": "worktree-seed: seed the workspace from a git ref inside the sandbox; the workload's writes are extracted onto review_branch on the host, never onto the host working tree.",
+      "description": "SEED MODE: seed the workspace from a git ref inside the sandbox; the workload's writes are extracted onto review_branch on the host, never onto the host working tree. Mutually exclusive with workspace_mount (top-level `not`).",
       "properties": {
         "ref": {
           "type": "string",
@@ -111,6 +115,44 @@
       "type": "boolean",
       "default": true,
       "description": "Run the tamper-evident append-only audit sink service (default true). It mints a per-session HMAC secret and chains appended records so edits, reordering, or interior drops are detectable; the workload mounts neither the log nor the secret. false opts the service out of the stack entirely."
+    },
+    "control_plane": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Consumer control-plane attachment (docs/control-plane.md): services a consumer brings via --extra-compose that must be ready before the workload runs, plus per-uid direct-egress carve-outs for them. The workload itself gains nothing from either field.",
+      "properties": {
+        "require": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+          "description": "Names of consumer control-plane services that must signal readiness — by creating /run/control-plane/<name>.ready in the shared control-plane volume — before the workload's entrypoint runs. The launch fails closed on timeout (AGENT_SANDBOX_READY_TIMEOUT seconds, default 60)."
+        },
+        "egress_grants": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["uid", "hosts"],
+            "properties": {
+              "uid": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "The uid the consumer service runs as inside the firewall's network namespace (network_mode: service:firewall). Never 0 — a root grant would carve out the firewall's own daemons."
+              },
+              "hosts": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "format": "hostname",
+                  "not": { "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$" }
+                },
+                "minItems": 1,
+                "description": "Destinations as HOSTNAMES, never IPs — same doctrine as egress_allowlist (an IP grant over/under-blocks rotating CDN addresses and breaks the name-level audit trail)."
+              }
+            }
+          },
+          "description": "Per-uid direct-egress carve-outs for consumer services that share the firewall's network namespace (network_mode: service:firewall). Packets from that uid to those hosts' resolved IPs on 443 are ACCEPTed at the packet layer; everything else about the deny-all posture is unchanged. The workload gains nothing: its uid carries no grant, and grant hosts are NOT added to squid's allowlist (resolution is not reachability)."
+        }
+      }
     },
     "backend": {
       "type": "string",

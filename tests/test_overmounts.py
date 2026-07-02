@@ -214,6 +214,87 @@ def test_compose_rejects_traversal_entry(tmp_path: Path, bad: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# overmount_missing_declared_paths — the complement of applicability.
+# ---------------------------------------------------------------------------
+
+
+def _missing(wl: Path):
+    return _run(f"overmount_missing_declared_paths {shlex.quote(str(wl))}")
+
+
+def test_missing_reports_absent_default_paths(tmp_path: Path) -> None:
+    """Field absent => the DEFAULT set is what was declared; the member not on the
+    host is reported missing, the present one is not."""
+    ws = tmp_path / "ws"
+    (ws / "node_modules").mkdir(parents=True)  # .git/hooks absent
+    wl = _workload(tmp_path, workspace_mount=str(ws))
+    r = _missing(wl)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.splitlines() == [".git/hooks"]
+
+
+def test_missing_reports_absent_explicit_paths(tmp_path: Path) -> None:
+    ws = tmp_path / "ws"
+    (ws / "present").mkdir(parents=True)
+    wl = _workload(
+        tmp_path, workspace_mount=str(ws), overmount_paths=["present", "absent/dir"]
+    )
+    r = _missing(wl)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.splitlines() == ["absent/dir"]
+
+
+def test_missing_empty_when_all_declared_paths_exist(tmp_path: Path) -> None:
+    ws = tmp_path / "ws"
+    (ws / ".git" / "hooks").mkdir(parents=True)
+    (ws / "node_modules").mkdir()
+    wl = _workload(tmp_path, workspace_mount=str(ws))
+    r = _missing(wl)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == ""
+
+
+def test_missing_empty_for_explicit_empty_list(tmp_path: Path) -> None:
+    """[] declares nothing, so nothing can be missing."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    wl = _workload(tmp_path, workspace_mount=str(ws), overmount_paths=[])
+    r = _missing(wl)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == ""
+
+
+def test_missing_empty_in_seed_mode(tmp_path: Path) -> None:
+    wl = _workload(tmp_path)  # no workspace_mount
+    r = _missing(wl)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == ""
+
+
+def test_missing_fails_loud_on_traversal_entry(tmp_path: Path) -> None:
+    """Shares overmount_paths_for, so a hostile entry fails here too instead of being
+    silently classified as merely 'missing'."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    wl = _workload(tmp_path, workspace_mount=str(ws), overmount_paths=["../escape"])
+    r = _missing(wl)
+    assert r.returncode != 0
+    assert "refusing" in r.stderr.lower()
+
+
+def test_missing_dangling_symlink_counts_as_missing(tmp_path: Path) -> None:
+    """A dangling symlink does not apply (overmount_applies follows the link), so it
+    must be REPORTED missing — the bind that would guard it will not exist."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "guard").symlink_to(ws / "nonexistent-target")
+    wl = _workload(tmp_path, workspace_mount=str(ws), overmount_paths=["guard"])
+    r = _missing(wl)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.splitlines() == ["guard"]
+
+
+# ---------------------------------------------------------------------------
 # _overmount_write_atomic — refuse-empty, atomic, no leftovers.
 # ---------------------------------------------------------------------------
 

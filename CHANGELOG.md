@@ -47,6 +47,24 @@ the prose from the release's commits.
 - `seed_from_git.ref` now accepts any commit-ish (branch, tag, sha), seeding that
   ref's committed tree (no WIP capture); `HEAD` keeps its tracked-tree +
   uncommitted-delta behavior. An unresolvable ref refuses the launch.
+- Bind mode (`workspace_mount`) is now a first-class, guarded consumer path:
+  - `workspace_mount` and `seed_from_git` are mutually exclusive — a record
+    carrying both is rejected by the schema and refused loudly by the launcher
+    (bind writes land directly on the host; seed writes are quarantined onto a
+    review branch — both at once has no coherent write path).
+  - The bind source is validated fail-closed before anything comes up: a
+    relative path, a symlinked source (dangling included), a missing or
+    non-directory path, and a source resolving to or under the library's own
+    state dir all refuse the launch.
+  - Missing-overmount policy: a declared guardrail path absent from the host
+    workspace gets no read-only bind, so an **explicitly** declared missing path
+    now refuses the launch (and tears the stack down), a missing **default**
+    path warns per path, and a bind session where no overmount applies prints a
+    marker naming that nothing under `/workspace` is mounted read-only — the
+    absence of protection is never silent.
+  - The bind-mode contract (what is and isn't protected, the `.git/hooks`
+    host-breakout rationale, the missing-path policy) is documented in
+    `docs/bind-mode.md`.
 - `secret_env` Workload field: credentials delivered as files at
   `/run/secrets/<name>` (mode 0400, owned by the workload user) instead of
   environment variables. Values are streamed over an exec's stdin into a

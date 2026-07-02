@@ -72,10 +72,14 @@ seed/extract steps run as this same user so the review branch is authored correc
 
 ### `workspace_mount` (string)
 
-Host path bound to the container's `/workspace` (**bind mode**). Omit it when
-`seed_from_git` is set — in seed mode `/workspace` is a named volume seeded from
-git, not a host bind. Setting both is not the intended shape; pick one (see
-[Seed vs. bind](#seed-vs-bind) below).
+**Absolute** host path bound read-write to the container's `/workspace` (**bind
+mode**) — the workload's writes land directly on the host, with no review-branch
+quarantine; see [`docs/bind-mode.md`](bind-mode.md) for exactly what is and isn't
+protected. Mutually exclusive with `seed_from_git`: a record carrying both is
+rejected by the schema and refused by the launcher (see
+[Seed vs. bind](#seed-vs-bind) below). The launcher also refuses a relative,
+missing, non-directory, or symlinked source, and one resolving inside the
+library's own state dir.
 
 ### `overmount_paths` (array of strings, default `[".git/hooks", "node_modules"]`)
 
@@ -95,7 +99,9 @@ even in-container root cannot write it.
 
 In bind mode the launcher **proves** the overmounts are truly read-only for the
 workload user before handing over; an unverifiable or writable guardrail refuses the
-launch.
+launch. A declared path that doesn't exist under the host workspace gets no bind at
+all: a missing **explicit** entry refuses the launch, a missing **default** path only
+warns (see [`docs/bind-mode.md`](bind-mode.md) for the full policy).
 
 ### `egress_allowlist` (required, array)
 

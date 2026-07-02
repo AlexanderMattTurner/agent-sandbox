@@ -78,6 +78,44 @@ def test_seed_from_git_requires_review_branch():
         jsonschema.validate(bad, SCHEMA)
 
 
+def test_bind_mode_workload_validates():
+    ok = {
+        "image": "x",
+        "entrypoint": ["bash"],
+        "egress_allowlist": [],
+        "ephemeral": True,
+        "workspace_mount": "/tmp/checkout",
+    }
+    jsonschema.validate(ok, SCHEMA)
+
+
+def test_seed_mode_workload_validates():
+    ok = {
+        "image": "x",
+        "entrypoint": ["bash"],
+        "egress_allowlist": [],
+        "ephemeral": True,
+        "seed_from_git": {"ref": "HEAD", "review_branch": "sandbox/review"},
+    }
+    jsonschema.validate(ok, SCHEMA)
+
+
+def test_workspace_mount_and_seed_from_git_are_mutually_exclusive():
+    """Bind writes land directly on the host; seed writes are quarantined onto a
+    review branch. A record carrying both has no coherent write path — the schema's
+    top-level `not` rejects it (mirrored by the launcher's own refusal)."""
+    bad = {
+        "image": "x",
+        "entrypoint": ["bash"],
+        "egress_allowlist": [],
+        "ephemeral": True,
+        "workspace_mount": "/tmp/checkout",
+        "seed_from_git": {"ref": "HEAD", "review_branch": "sandbox/review"},
+    }
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(bad, SCHEMA)
+
+
 def _with_allowlist(entries):
     return {
         "image": "x",
@@ -260,6 +298,68 @@ def test_overmount_paths_accepts_string_lists(paths):
 def test_overmount_paths_rejects_malformed(paths):
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate({**_with_allowlist([]), "overmount_paths": paths}, SCHEMA)
+
+
+_GRANT = {"uid": 7777, "hosts": ["gate.example.com"]}
+
+
+@pytest.mark.parametrize(
+    "cp",
+    [
+        {},
+        {"require": ["gate"]},
+        {"require": ["gate", "audit-relay2"]},
+        {"egress_grants": [_GRANT]},
+        {"require": ["gate"], "egress_grants": [_GRANT]},
+        {"egress_grants": [{"uid": 1, "hosts": ["a.example", "b.example"]}]},
+    ],
+    ids=[
+        "empty",
+        "require-one",
+        "require-two",
+        "grants-only",
+        "both",
+        "grant-two-hosts",
+    ],
+)
+def test_control_plane_accepts_require_and_grants(cp):
+    jsonschema.validate({**_with_allowlist([]), "control_plane": cp}, SCHEMA)
+
+
+@pytest.mark.parametrize(
+    "cp",
+    [
+        {"require": ["Gate"]},  # marker names are lowercase
+        {"require": ["-gate"]},  # must start alnum
+        {"require": ["ga te"]},  # no whitespace
+        {"require": [""]},  # empty name
+        {"egress_grants": [{"uid": 0, "hosts": ["gate.example.com"]}]},  # root
+        {"egress_grants": [{"uid": "7777", "hosts": ["g.example"]}]},  # string uid
+        {"egress_grants": [{"uid": 7777, "hosts": ["10.0.0.1"]}]},  # IP literal
+        {"egress_grants": [{"uid": 7777, "hosts": []}]},  # empty hosts
+        {"egress_grants": [{"uid": 7777}]},  # hosts required
+        {"egress_grants": [{"hosts": ["g.example"]}]},  # uid required
+        {"egress_grants": [{**_GRANT, "port": 443}]},  # no undeclared grant keys
+        {"markers": ["gate"]},  # no undeclared control_plane keys
+    ],
+    ids=[
+        "uppercase-marker",
+        "leading-hyphen-marker",
+        "whitespace-marker",
+        "empty-marker",
+        "uid-zero",
+        "uid-string",
+        "ip-literal-host",
+        "empty-hosts",
+        "missing-hosts",
+        "missing-uid",
+        "grant-extra-key",
+        "control-plane-extra-key",
+    ],
+)
+def test_control_plane_rejects_malformed(cp):
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({**_with_allowlist([]), "control_plane": cp}, SCHEMA)
 
 
 @pytest.mark.parametrize(

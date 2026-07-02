@@ -78,6 +78,24 @@ overmount_applicable_paths() {
   return 0
 }
 
+# overmount_missing_declared_paths WORKLOAD_JSON — emit the declared paths that do NOT
+# exist under the workload's host workspace_mount (so no read-only bind will guard them),
+# one per line. Empty in seed mode (no workspace_mount). The complement of
+# overmount_applicable_paths over the same overmount_paths_for/overmount_applies pair, so
+# the compose generator and the missing-path policy can never disagree about what was
+# declared. Fails loud (non-zero) when overmount_paths_for rejects an entry.
+overmount_missing_declared_paths() {
+  local workload="$1" workspace rel paths_out
+  workspace="$(jq -r '.workspace_mount // empty' "$workload")"
+  [[ -n "$workspace" ]] || return 0
+  paths_out="$(overmount_paths_for "$workload")" || return 1
+  while IFS= read -r rel; do
+    [[ -n "$rel" ]] || continue
+    overmount_applies "$workspace" "$rel" || printf '%s\n' "$rel"
+  done <<<"$paths_out"
+  return 0
+}
+
 # Write stdin to <out> atomically (temp file in the same dir, then rename), REFUSING to
 # install an empty result. A failed generator pipeline or an empty file must NOT replace an
 # existing read-only-guardrail override: a truncated override silently drops the :ro binds,

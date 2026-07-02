@@ -45,11 +45,148 @@ stack_partition_allowlist() {
   export WORKLOAD_ALLOWED_DOMAINS_RO WORKLOAD_ALLOWED_DOMAINS_RW
 }
 
+# stack_export_control_plane_grants WORKLOAD_JSON — validate the Workload's
+# control_plane.egress_grants and export CONTROL_PLANE_EGRESS_GRANTS as the compact
+# JSON array the firewall renders (compose env passthrough). Every uid must be an
+# integer >= 1 (uid 0 would carve out the firewall's own root-owned daemons) and
+# every host must be a hostname, never an IP literal — the same doctrine as the
+# egress_allowlist IP rejection in bin/agent-sandbox. No grants exports the EMPTY
+# STRING (not "[]") so the firewall's render path is a clean no-op.
+stack_export_control_plane_grants() {
+  local workload="$1" grants
+  grants="$(jq -c '.control_plane.egress_grants // []' "$workload")"
+  if [[ "$grants" == "[]" ]]; then
+    CONTROL_PLANE_EGRESS_GRANTS=""
+    export CONTROL_PLANE_EGRESS_GRANTS
+    return 0
+  fi
+  jq -e '[.[] | (.uid | type == "number" and . == floor and . >= 1)] | all' <<<"$grants" >/dev/null || {
+    as_error "control_plane.egress_grants: every uid must be an integer >= 1 (a uid-0 grant would carve out the firewall's own root-owned traffic)"
+    return 1
+  }
+  jq -e '[.[] | .hosts | type == "array" and length > 0 and ([.[] | type == "string" and test("^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$")] | all)] | all' <<<"$grants" >/dev/null || {
+    as_error "control_plane.egress_grants: every entry needs a non-empty hosts list of hostname-shaped strings"
+    return 1
+  }
+  if jq -e '[.[].hosts[] | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$"))] | length > 0' <<<"$grants" >/dev/null; then
+    as_error "control_plane.egress_grants must name HOSTNAMES, not IPs — grants are resolved by name at the firewall, like the egress allowlist"
+    return 1
+  fi
+  # One entry per uid: the firewall builds each grant's ipset fresh, so a second
+  # entry for the same uid would silently wipe the first one's resolved IPs.
+  jq -e 'map(.uid) | length == (unique | length)' <<<"$grants" >/dev/null || {
+    as_error "control_plane.egress_grants: duplicate uid — merge each uid's hosts into one entry"
+    return 1
+  }
+  CONTROL_PLANE_EGRESS_GRANTS="$grants"
+  export CONTROL_PLANE_EGRESS_GRANTS
+}
+
+# _stack_wait_control_plane_ready CID WORKLOAD_JSON — block until every consumer
+# service named in control_plane.require has published its readiness marker
+# (/run/control-plane/<name>.ready on the shared control-plane volume, probed via
+# the workload container's read-only mount). Returns 0 immediately when nothing is
+# required; polls at 1s up to AGENT_SANDBOX_READY_TIMEOUT seconds (default 60),
+# then fails closed naming the missing marker(s) — a workload must never start
+# against a control plane the Workload record says it depends on but that isn't up.
+_stack_wait_control_plane_ready() {
+  local cid="$1" workload="$2" name
+  local -a required=()
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    # The name lands in the probed path; a traversal-shaped value from an
+    # untrusted workload record must not walk out of /run/control-plane.
+    if [[ ! "$name" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+      as_error "control_plane.require name '$name' is not a valid marker name (want [a-z0-9][a-z0-9-]*, the schema's pattern)"
+      return 1
+    fi
+    required+=("$name")
+  done < <(jq -r '.control_plane.require // [] | .[]' "$workload")
+  ((${#required[@]})) || return 0
+  local timeout="${AGENT_SANDBOX_READY_TIMEOUT:-60}"
+  # A non-numeric timeout would break the deadline arithmetic and turn the
+  # barrier into an unbounded poll — fail loud instead (same doctrine as
+  # init-firewall's DNS_BATCH_SIZE guard).
+  if [[ ! "$timeout" =~ ^[0-9]+$ ]]; then
+    as_error "AGENT_SANDBOX_READY_TIMEOUT must be a whole number of seconds, got '$timeout'"
+    return 1
+  fi
+  local deadline=$((SECONDS + timeout))
+  local -a missing=()
+  while true; do
+    missing=()
+    for name in "${required[@]}"; do
+      if ! docker exec "$cid" test -f "/run/control-plane/$name.ready"; then
+        missing+=("$name")
+      fi
+    done
+    ((${#missing[@]} == 0)) && return 0
+    ((SECONDS >= deadline)) && break
+    sleep 1
+  done
+  as_error "control-plane readiness timed out after ${timeout}s — missing marker(s): ${missing[*]} (each required service must create /run/control-plane/<name>.ready on the shared volume)"
+  return 1
+}
+
+# _stack_state_root — the library's own host state base dir (per-session dirs live
+# under it). The one place the AGENT_SANDBOX_STATE_DIR/XDG default chain is spelled.
+_stack_state_root() {
+  printf '%s' "${AGENT_SANDBOX_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-sandbox}"
+}
+
 # _stack_state_dir PROJECT — this session's owner-only host dir for the artifacts
 # that outlive the containers: the WIP patch, the agent's mbox, the egress log.
 _stack_state_dir() {
-  printf '%s/sessions/%s' \
-    "${AGENT_SANDBOX_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-sandbox}" "$1"
+  printf '%s/sessions/%s' "$(_stack_state_root)" "$1"
+}
+
+# stack_validate_workspace_mount WORKLOAD_JSON — fail-closed pre-launch validation of
+# the bind-mode workspace source (called by the launcher before anything comes up).
+# Refuses: a non-absolute path (compose resolves a relative bind against the compose
+# FILE's directory, not the caller's $PWD — a silent foot-gun); a symlinked source,
+# dangling included (the bind would mount the TARGET, so the record's path and the
+# mounted path diverge — and a dangling one would surface as a confusing failure at
+# `up`); a missing or non-directory source (Docker would fabricate a root-owned dir at
+# that host path); and a source resolving to or under the library's own state root
+# (the workload could then rewrite session artifacts: the egress log copy, WIP patches).
+stack_validate_workspace_mount() {
+  local workload="$1" src resolved state_root
+  src="$(jq -r '.workspace_mount // empty' "$workload")"
+  # Strip trailing slashes first: `[[ -L "/path/link/" ]]` is FALSE for a symlink
+  # written with a trailing slash, which would slip it past the refusal below.
+  while [[ "$src" == */ && "$src" != "/" ]]; do src="${src%/}"; done
+  [[ "$src" == /* ]] || {
+    as_error "workspace_mount must be an absolute host path (got '$src') — compose resolves a relative bind against the compose file's directory, not your working directory"
+    return 1
+  }
+  # Deliberately final-component-only: a symlinked PARENT (/alias/project) is
+  # tolerated because the containment check below runs on the fully-resolved
+  # pwd -P path, so it cannot be used to sneak inside the state root.
+  [[ ! -L "$src" ]] || {
+    as_error "workspace_mount '$src' is a symlink — the bind would mount its target, so the record's path and the mounted path diverge; bind the resolved directory itself"
+    return 1
+  }
+  [[ -d "$src" ]] || {
+    as_error "workspace_mount '$src' does not exist or is not a directory — Docker would fabricate a root-owned directory at that host path; create the directory first"
+    return 1
+  }
+  resolved="$(cd "$src" && pwd -P)" || {
+    as_error "could not resolve workspace_mount '$src' (cd/pwd failed — check its permissions)"
+    return 1
+  }
+  state_root="$(_stack_state_root)"
+  # Compare resolved-to-resolved: the state root may not exist yet (first run), in
+  # which case nothing can resolve under it and the literal path is the right compare.
+  if [[ -d "$state_root" ]]; then
+    state_root="$(cd "$state_root" && pwd -P)" || {
+      as_error "could not resolve the state dir '$state_root'"
+      return 1
+    }
+  fi
+  if [[ "$resolved" == "$state_root" || "$resolved" == "$state_root"/* ]]; then
+    as_error "workspace_mount '$src' resolves inside the library's own state dir ($state_root) — the workload could rewrite session artifacts (egress log, WIP patches); bind a directory outside it"
+    return 1
+  fi
 }
 
 # stack_ensure_firewall_image SANDBOX_DIR — make sure $FIREWALL_IMAGE exists,
@@ -300,6 +437,10 @@ stack_run() {
   fi
 
   stack_partition_allowlist "$workload"
+  # Grants must be validated and exported BEFORE `up`: compose passes
+  # CONTROL_PLANE_EGRESS_GRANTS through to the firewall service's environment,
+  # and a malformed grant refuses the launch before anything comes up.
+  stack_export_control_plane_grants "$workload" || return 1
   # The default library services (hardener, audit) are profile-gated in the
   # compose: compose cannot REMOVE a service via an override, so a workload
   # opt-out (hardener:false / audit:false) is expressed by not activating the
@@ -443,14 +584,38 @@ stack_run() {
     fi
   fi
 
-  # Fail-closed guardrail verify (BIND MODE only): the read-only overmounts are a security
-  # control, so prove the workload user truly cannot write them before handing over. Seed
-  # mode has no host ro-binds (workspace is a named volume) and its writes are gated by the
-  # review-branch extract, so it is not probed. Run before seeding/exec so a guardrail that
-  # isn't actually read-only never gets a chance to be bypassed.
+  # Fail-closed guardrail gate (BIND MODE only): bind mode has no review-branch
+  # quarantine — the read-only overmounts are the ONLY kernel-enforced guard between the
+  # workload and the host checkout — so this block ALWAYS runs when workspace_mount is
+  # set. Seed mode has no host ro-binds (workspace is a named volume) and its writes are
+  # gated by the review-branch extract, so it is not probed. Runs before seeding/exec so
+  # a guardrail that isn't actually read-only never gets a chance to be bypassed.
   if jq -e '.workspace_mount' "$workload" >/dev/null 2>&1; then
+    # A declared path missing under the host workspace gets NO bind at all. An EXPLICIT
+    # overmount_paths declaration is the consumer stating a security requirement, so a
+    # missing explicit path refuses the launch; a missing DEFAULT path only warns (most
+    # checkouts ship without e.g. node_modules, and the default must stay launchable).
+    local _rel _missing_out
+    local -a _missing=()
+    if ! _missing_out="$(overmount_missing_declared_paths "$workload")"; then
+      as_error "could not resolve the workload's overmount paths — refusing to hand over the sandbox"
+      _stack_compose "$project" "$compose" "$override" "$overmounts" down --volumes --timeout 30 || true # allow-exit-suppress: best-effort cleanup of a stack refused at the guardrail gate; the launch already failed loudly
+      return 1
+    fi
+    while IFS= read -r _rel; do
+      [[ -n "$_rel" ]] && _missing+=("$_rel")
+    done <<<"$_missing_out"
+    if ((${#_missing[@]})); then
+      if jq -e 'has("overmount_paths")' "$workload" >/dev/null; then
+        as_error "explicitly declared overmount_paths do not exist under the host workspace, so NO read-only bind would protect them: ${_missing[*]} — create them on the host or drop them from overmount_paths"
+        _stack_compose "$project" "$compose" "$override" "$overmounts" down --volumes --timeout 30 || true # allow-exit-suppress: best-effort cleanup of a stack refused at the guardrail gate; the launch already failed loudly
+        return 1
+      fi
+      for _rel in "${_missing[@]}"; do
+        as_warn "default guardrail path '$_rel' does not exist under the host workspace — it is NOT mounted read-only this session"
+      done
+    fi
     local -a _cpaths=()
-    local _rel
     while IFS= read -r _rel; do
       [[ -n "$_rel" ]] && _cpaths+=("/workspace/$_rel")
     done < <(overmount_applicable_paths "$workload")
@@ -461,7 +626,19 @@ stack_run() {
         return 1
       fi
       as_info "overmounts verified read-only (${#_cpaths[@]} paths)"
+    else
+      # Non-vacuous marker: bind mode ran the gate and found NOTHING to hold read-only —
+      # the workload can write anywhere under /workspace, directly onto the host.
+      as_info "bind mode: no overmount guardrails apply — nothing under /workspace is mounted read-only this session"
     fi
+  fi
+
+  # Control-plane readiness barrier, BEFORE seeding: a consumer gate that never
+  # comes up must fail the launch while there is still nothing to lose — no
+  # seeded work, no running entrypoint the consumer believed was supervised.
+  if ! _stack_wait_control_plane_ready "$cid" "$workload"; then
+    _stack_down_ephemeral "$project" "$compose" "$override" "$overmounts" || true # allow-exit-suppress: best-effort cleanup; the launch already failed loudly
+    return 1
   fi
 
   # Seed the workspace from git BEFORE the entrypoint runs, so the workload never
