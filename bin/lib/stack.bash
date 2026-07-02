@@ -975,6 +975,17 @@ _stack_abandon_candidate() {
   _prewarm_release "$project"
 }
 
+# _stack_export_session_net BASE — export the per-session address family derived
+# from a /24's base (BASE = e.g. 172.30.9): the subnet, firewall .2, app .3,
+# audit .4, and the .128/25 dynamic range — the same layout export_sandbox_subnet
+# lays down. Adoption swaps the WHOLE family to the spare's: any member left at
+# the fresh allocation (a .4 outside the spare's /24) would make compose reject
+# the service's static claim at the re-up.
+_stack_export_session_net() {
+  local b="$1"
+  export SANDBOX_SUBNET="$b.0/24" SANDBOX_IP="$b.2" SANDBOX_IP_APP="$b.3" SANDBOX_IP_AUDIT="$b.4" SANDBOX_IP_RANGE="$b.128/25"
+}
+
 # _stack_try_adopt WORKLOAD_JSON COMPOSE RUNTIME — run this launch on a prewarmed
 # spare when one matches: compute the spec hash, discover running spares carrying
 # it (labels are discovery only), claim one atomically, take over its project name
@@ -1000,8 +1011,8 @@ _stack_try_adopt() {
   ((${#candidates[@]})) || return 1
   # Adoption swaps this launch's fresh subnet for the spare's (the spare's network
   # is already up under it); keep the fresh one restorable for the cold fallback.
-  local orig_subnet="$SANDBOX_SUBNET" orig_ip="$SANDBOX_IP"
-  local project state cid probe subnet ip
+  local orig_base="${SANDBOX_SUBNET%.*}"
+  local project state cid probe subnet
   for cand in "${candidates[@]}"; do
     project="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$cand" 2>/dev/null)" || continue
     # The project rides into docker filters and state paths — accept only the
@@ -1013,17 +1024,15 @@ _stack_try_adopt() {
     # a crashed adopter's kept-for-rescue volumes must not be reaped as a spare.
     if ! touch "$state/prewarm-adopted" 2>/dev/null ||
       ! subnet="$(jq -er '.subnet' "$state/prewarm.json" 2>/dev/null)" ||
-      ! ip="$(jq -er '.ip' "$state/prewarm.json" 2>/dev/null)" ||
+      [[ ! "$subnet" =~ ^172\.[0-9]+\.[0-9]+\.0/24$ ]] ||
       [[ ! -f "$state/workload-override.json" || ! -f "$state/overmount-override.json" || ! -f "$state/prewarm-override.json" ]]; then
       _stack_abandon_candidate "$project" "$state" -1
       continue
     fi
-    SANDBOX_SUBNET="$subnet"
-    SANDBOX_IP="$ip"
-    export SANDBOX_SUBNET SANDBOX_IP
+    _stack_export_session_net "${subnet%.*}"
     if ! _stack_export_launch_env "$workload" "$runtime"; then
       _stack_abandon_candidate "$project" "$state" -1
-      SANDBOX_SUBNET="$orig_subnet" SANDBOX_IP="$orig_ip"
+      _stack_export_session_net "$orig_base"
       continue
     fi
     # Count-as-index is safe here (same idiom as bring-up's env_idx): only the
@@ -1035,7 +1044,7 @@ _stack_try_adopt() {
       ! cid="$(_stack_compose "$project" "$compose" "$override" "$overmounts" ps -q workload)" ||
       [[ -z "$cid" ]]; then
       _stack_abandon_candidate "$project" "$state" "$extra_idx"
-      SANDBOX_SUBNET="$orig_subnet" SANDBOX_IP="$orig_ip"
+      _stack_export_session_net "$orig_base"
       continue
     fi
     # A spare's contract is an EMPTY workspace about to be seeded. The probe must
@@ -1045,7 +1054,7 @@ _stack_try_adopt() {
     if [[ "$probe" != "EMPTY" ]]; then
       as_warn "prewarm spare $project has a non-empty or unverifiable /workspace — skipping it as corrupt"
       _stack_abandon_candidate "$project" "$state" "$extra_idx"
-      SANDBOX_SUBNET="$orig_subnet" SANDBOX_IP="$orig_ip"
+      _stack_export_session_net "$orig_base"
       continue
     fi
     _STACK_PROJECT="$project"
@@ -1063,8 +1072,7 @@ _stack_try_adopt() {
     as_info "adopted prewarmed spare $project"
     return 0
   done
-  SANDBOX_SUBNET="$orig_subnet" SANDBOX_IP="$orig_ip"
-  export SANDBOX_SUBNET SANDBOX_IP
+  _stack_export_session_net "$orig_base"
   return 1
 }
 

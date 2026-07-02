@@ -58,7 +58,7 @@ case "$*" in
     # `-` not `:-`: an explicitly EMPTY value models a broken probe printing nothing.
     echo "${FAKE_WORKSPACE_PROBE-EMPTY}" ;;
   "compose "*" up -d --wait --wait-timeout 240")
-    printf 'UPENV SANDBOX_SUBNET=%s\\n' "${SANDBOX_SUBNET:-}" >>"$DOCKER_ARGV_LOG"
+    printf 'UPENV SANDBOX_SUBNET=%s SANDBOX_IP_AUDIT=%s\\n' "${SANDBOX_SUBNET:-}" "${SANDBOX_IP_AUDIT:-}" >>"$DOCKER_ARGV_LOG"
     for p in ${FAKE_UP_FAIL_PROJECTS:-}; do
       [[ "$*" == *"-p $p "* ]] && exit 1
     done ;;
@@ -317,8 +317,9 @@ def test_run_adopts_a_matching_spare(tmp_path):
     # The whole session runs under the SPARE's project — no second cold `up`
     # under a fresh random identity.
     assert _projects(log) == {SPARE_PROJECT}
-    # The re-up ran under the spare's recorded subnet, not this launch's fresh one.
-    assert "UPENV SANDBOX_SUBNET=172.30.9.0/24" in log
+    # The re-up ran under the spare's recorded subnet — the WHOLE address family,
+    # not just the /24: a stale audit .4 outside it would fail the static claim.
+    assert "UPENV SANDBOX_SUBNET=172.30.9.0/24 SANDBOX_IP_AUDIT=172.30.9.4" in log
     # The spare's prewarm override rode the adoption re-up.
     up = next(c for c in log.splitlines() if " up -d " in c)
     assert str(state / "prewarm-override.json") in up
