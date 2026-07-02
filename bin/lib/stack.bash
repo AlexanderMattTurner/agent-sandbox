@@ -343,8 +343,8 @@ _stack_update_manifest() {
 # When THIS session resumed from another, an audit.prior.jsonl is mounted; we fold that
 # prior chain BEFORE the live one into the exported audit.jsonl, so the export — and thus
 # the NEXT resume's mounted prior — carries the full kill-chain across EVERY resume hop,
-# not just one back (claude-guard's cumulative archive fold). The in-container live
-# audit.jsonl is never mutated; the export is a host-side cumulative VIEW.
+# not just one back (a cumulative archive fold). The in-container live audit.jsonl is
+# never mutated; the export is a host-side cumulative VIEW.
 #
 # Note on the exported secret: it lets an offline reader re-check the LIVE tail's HMAC,
 # but a folded export concatenates chains signed by different per-session secrets and is
