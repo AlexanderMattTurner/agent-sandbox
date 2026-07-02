@@ -366,7 +366,9 @@ def _resume_fixture(tmp_path, *, tip_is_wip_fold):
         review_branch="sandbox/old-rb",
         repo_root=str(repo),
     )
-    (state / "audit.jsonl").write_text('{"rec":1}\n')
+    # Deliberately EMPTY: a quiet prior session exports an empty chain, and the
+    # resume mount must key on existence, not size (the -s regression class).
+    (state / "audit.jsonl").write_text("")
     return repo, base, tip
 
 

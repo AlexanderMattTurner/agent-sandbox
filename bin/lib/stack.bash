@@ -518,7 +518,9 @@ stack_run() {
       return 1
     fi
     if [[ ",${COMPOSE_PROFILES}," == *,audit,* ]]; then
-      if [[ -s "$prior_state/audit.jsonl" ]]; then
+      # -f, not -s: a quiet prior session legitimately exported an EMPTY chain,
+      # and continuity means mounting whatever record exists.
+      if [[ -f "$prior_state/audit.jsonl" ]]; then
         local audit_prior_override="$state/audit-prior-override.json"
         _stack_write_audit_prior_override "$prior_state/audit.jsonl" "$audit_prior_override" || {
           as_error "could not generate the prior-audit-log compose override"
