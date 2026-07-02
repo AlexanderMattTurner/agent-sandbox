@@ -81,6 +81,16 @@
         }
       }
     },
+    "hardener": {
+      "type": "boolean",
+      "default": true,
+      "description": "Run the transient root hardener init service (default true). It executes every executable in the read-only /run/hardener-hooks.d mount (empty by default = no-op success) to write hardened config into a volume the workload mounts read-only at /run/hardened-config; any hook failure aborts the launch before the workload starts. false opts the service out of the stack entirely."
+    },
+    "audit": {
+      "type": "boolean",
+      "default": true,
+      "description": "Run the tamper-evident append-only audit sink service (default true). It mints a per-session HMAC secret and chains appended records so edits, reordering, or interior drops are detectable; the workload mounts neither the log nor the secret. false opts the service out of the stack entirely."
+    },
     "backend": {
       "type": "string",
       "enum": ["local", "hosted"],

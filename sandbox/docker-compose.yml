@@ -86,6 +86,99 @@ services:
       # workload-unwritable placement is load-bearing).
       - dns-cache:/var/cache/agent-sandbox
 
+  # Transient root init service: runs every executable in the read-only
+  # /run/hardener-hooks.d mount (the /dev/null default = no hooks = no-op
+  # success), writing hardened config into the shared hardened-config volume the
+  # workload mounts read-only. Fail closed: a failing hook exits the service
+  # non-zero and the workload's service_completed_successfully gate never opens.
+  # Profile-gated (default-on via COMPOSE_PROFILES from stack_run) because
+  # compose cannot REMOVE a service through an override — absence is expressed
+  # by not activating the profile.
+  hardener:
+    image: ${FIREWALL_IMAGE:-agent-sandbox-firewall:local}
+    profiles: ["hardener"]
+    user: root
+    init: true
+    # No network at all: the hooks' contract is config-writing, not fetching —
+    # and a netns-less hardener can never race a sibling's static IP claim.
+    network_mode: none
+    cap_drop:
+      - ALL
+    # CHOWN/DAC_OVERRIDE: hooks run as root and may hand hardened files in the
+    # shared volume to the (arbitrary-uid) workload user.
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+    security_opt:
+      - no-new-privileges:true
+      - seccomp:./seccomp-default.json
+    pids_limit: 64
+    environment:
+      AGENT_SANDBOX_TRACE: ${AGENT_SANDBOX_TRACE:-}
+      HARDENED_CONFIG_DIR: /run/hardened-config
+    command:
+      - bash
+      - /usr/local/bin/hardener-entrypoint.bash
+    volumes:
+      # The hooks the hardener executes, read-only so a hook can never rewrite
+      # its siblings. /dev/null when the launcher wires no hooks dir — the
+      # entrypoint treats a non-directory as "no hooks" (no-op success).
+      - ${HARDENER_HOOKS_DIR:-/dev/null}:/run/hardener-hooks.d:ro
+      # Writable HERE only; the workload mounts the same volume read-only, so
+      # it can consume hardened config but never forge it.
+      - hardened-config:/run/hardened-config
+
+  # Tamper-evident append-only audit sink (sandbox/audit_sink.py): owns the
+  # per-session HMAC secret and the chained audit log on volumes the workload
+  # never mounts, so the workload can neither forge nor rewrite the record.
+  # Profile-gated default-on, same mechanism as the hardener.
+  audit:
+    image: ${FIREWALL_IMAGE:-agent-sandbox-firewall:local}
+    profiles: ["audit"]
+    user: root
+    # tini as PID 1 so SIGTERM reaches the server instead of being ignored by a
+    # bare PID-1 python and SIGKILLed at the stop timeout.
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+      - seccomp:./seccomp-default.json
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    pids_limit: 64
+    networks:
+      sandbox:
+        # Static .4 (firewall .2, workload .3): the sink pins its own address so
+        # a client reaches it at a fixed IP independent of attach order.
+        ipv4_address: ${SANDBOX_IP_AUDIT:-172.30.0.4}
+    environment:
+      AUDIT_LOG: /var/log/agent-sandbox/audit.jsonl
+      AUDIT_SECRET_PATH: /run/audit-secret/secret
+      AUDIT_SINK_PORT: ${AUDIT_SINK_PORT:-9198}
+      AGENT_SANDBOX_TRACE: ${AGENT_SANDBOX_TRACE:-}
+    command:
+      - python3
+      - /usr/local/bin/audit_sink.py
+    healthcheck:
+      # Ready = the HMAC secret is minted AND the sink's port is bound, so a
+      # consumer gating on audit health knows records can be authenticated.
+      test:
+        - CMD-SHELL
+        - test -f /run/audit-secret/secret && python3 -c "import os, socket; socket.create_connection(('127.0.0.1', int(os.environ['AUDIT_SINK_PORT'])), timeout=2).close()"
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
+      start_interval: 250ms
+    volumes:
+      # The chained audit log and the HMAC secret, writable ONLY here — the
+      # workload mounts neither, which is what makes the chain tamper-evident
+      # against the workload rather than merely tamper-evident in general.
+      - audit-log:/var/log/agent-sandbox
+      - audit-secret:/run/audit-secret
+
   workload:
     image: ${WORKLOAD_IMAGE:?the launcher must export WORKLOAD_IMAGE from the Workload record}
     user: ${WORKLOAD_USER:-1000}
@@ -94,6 +187,16 @@ services:
     depends_on:
       firewall:
         condition: service_healthy
+      # required:false is the profile escape hatch: when a workload opts out
+      # (its profile inactive, so the service does not exist in the rendered
+      # model) compose ignores the dependency instead of failing `up`. With the
+      # profile active the full fail-closed gate applies.
+      hardener:
+        condition: service_completed_successfully
+        required: false
+      audit:
+        condition: service_healthy
+        required: false
     # The container idles; the launcher seeds /workspace, then execs the Workload's
     # entrypoint argv, so the workload never runs against a half-seeded tree.
     entrypoint: ["sleep", "infinity"]
@@ -130,6 +233,10 @@ services:
         ipv4_address: ${WORKLOAD_IP:-172.30.0.3}
     volumes:
       - workspace:/workspace
+      # Hardened config the hardener produced, read-only: the workload consumes
+      # it but can never rewrite it. An empty volume when the hardener profile
+      # is off (or no hooks ran) — a harmless empty dir.
+      - hardened-config:/run/hardened-config:ro
 
 networks:
   sandbox:
@@ -146,3 +253,8 @@ volumes:
   egress-log:
   dns-cache:
   workspace:
+  hardened-config:
+  # The audit sink's log + HMAC secret. Only the audit service mounts them;
+  # keeping the workload off both is the tamper-evidence boundary.
+  audit-log:
+  audit-secret:

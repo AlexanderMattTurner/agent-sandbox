@@ -100,20 +100,27 @@ _stack_export_egress_log() {
   as_info "egress log: $state/egress.log"
 }
 
-# _stack_down_ephemeral PROJECT COMPOSE OVERRIDE OVERMOUNTS — remove containers, networks AND
-# volumes, then verify no volume survived. The guarantee is verified, not assumed:
-# any survivor fails loud so "ephemeral" can never silently mean "persistent".
-_stack_down_ephemeral() {
-  local project="$1" compose="$2" override="$3" overmounts="$4" leftovers
-  _stack_compose "$project" "$compose" "$override" "$overmounts" down --volumes --timeout 30 || {
-    as_error "ephemeral teardown failed (compose project $project) — session containers/volumes may survive"
-    return 1
-  }
+# stack_verify_no_volumes PROJECT — verify no compose-labeled volume survived a
+# teardown. The guarantee is verified, not assumed: any survivor fails loud so
+# "ephemeral" can never silently mean "persistent".
+stack_verify_no_volumes() {
+  local project="$1" leftovers
   leftovers="$(docker volume ls -q --filter "label=com.docker.compose.project=$project")"
   [[ -z "$leftovers" ]] || {
     as_error "ephemeral teardown left volumes behind (fail-loud): $leftovers"
     return 1
   }
+}
+
+# _stack_down_ephemeral PROJECT COMPOSE OVERRIDE OVERMOUNTS — remove containers, networks AND
+# volumes, then verify no volume survived (stack_verify_no_volumes fails loud on any).
+_stack_down_ephemeral() {
+  local project="$1" compose="$2" override="$3" overmounts="$4"
+  _stack_compose "$project" "$compose" "$override" "$overmounts" down --volumes --timeout 30 || {
+    as_error "ephemeral teardown failed (compose project $project) — session containers/volumes may survive"
+    return 1
+  }
+  stack_verify_no_volumes "$project"
 }
 
 # stack_run WORKLOAD_JSON COMPOSE RUNTIME [EXTRA_COMPOSE...] — the whole session:
@@ -142,6 +149,19 @@ stack_run() {
   # The seed/extract execs must run as the same user the workload writes as.
   export AGENT_SANDBOX_WORKLOAD_USER="$WORKLOAD_USER"
   stack_partition_allowlist "$workload"
+  # The default library services (hardener, audit) are profile-gated in the
+  # compose: compose cannot REMOVE a service via an override, so a workload
+  # opt-out (hardener:false / audit:false) is expressed by not activating the
+  # profile. The workload's depends_on entries carry required:false, so a
+  # deactivated profile drops the gate instead of failing `up`.
+  local _profiles=()
+  jq -e '.hardener == false' "$workload" >/dev/null || _profiles+=("hardener")
+  jq -e '.audit == false' "$workload" >/dev/null || _profiles+=("audit")
+  COMPOSE_PROFILES="$(
+    IFS=,
+    printf '%s' "${_profiles[*]-}"
+  )"
+  export COMPOSE_PROFILES
   stack_ensure_firewall_image "$sandbox_dir" || return 1
 
   local override="$state/workload-override.json"
