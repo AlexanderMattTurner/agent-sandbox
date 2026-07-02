@@ -38,7 +38,7 @@ collect() {
   # that fail the shard — the ordinary pytest job enforces behavior; this phase only
   # produces rundirs, and the gate enforces 100% on their union.
   AGENT_SANDBOX_KCOV_OUT="$outdir" \
-    uv run --extra dev python -m pytest "$@" -q -n auto --dist=worksteal || true
+    uv run --extra dev python -m pytest "$@" -q -n auto --dist=worksteal || true # allow-exit-suppress: coverage-only phase — a kcov-timeout-killed test (see tests/_kcov.py) reports the wrong exit code but its coverage was still written; the ordinary pytest job enforces behavior, the gate enforces 100% on the union
 }
 
 # merge-gate <runs-dir> — union every rundir under <runs-dir> (kcov re-applies the
