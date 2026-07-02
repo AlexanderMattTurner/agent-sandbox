@@ -96,6 +96,44 @@
       "default": true,
       "description": "Run the tamper-evident append-only audit sink service (default true). It mints a per-session HMAC secret and chains appended records so edits, reordering, or interior drops are detectable; the workload mounts neither the log nor the secret. false opts the service out of the stack entirely."
     },
+    "control_plane": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Consumer control-plane attachment (docs/control-plane.md): services a consumer brings via --extra-compose that must be ready before the workload runs, plus per-uid direct-egress carve-outs for them. The workload itself gains nothing from either field.",
+      "properties": {
+        "require": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+          "description": "Names of consumer control-plane services that must signal readiness — by creating /run/control-plane/<name>.ready in the shared control-plane volume — before the workload's entrypoint runs. The launch fails closed on timeout (AGENT_SANDBOX_READY_TIMEOUT seconds, default 60)."
+        },
+        "egress_grants": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["uid", "hosts"],
+            "properties": {
+              "uid": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "The uid the consumer service runs as inside the firewall's network namespace (network_mode: service:firewall). Never 0 — a root grant would carve out the firewall's own daemons."
+              },
+              "hosts": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "format": "hostname",
+                  "not": { "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$" }
+                },
+                "minItems": 1,
+                "description": "Destinations as HOSTNAMES, never IPs — same doctrine as egress_allowlist (an IP grant over/under-blocks rotating CDN addresses and breaks the name-level audit trail)."
+              }
+            }
+          },
+          "description": "Per-uid direct-egress carve-outs for consumer services that share the firewall's network namespace (network_mode: service:firewall). Packets from that uid to those hosts' resolved IPs on 443 are ACCEPTed at the packet layer; everything else about the deny-all posture is unchanged. The workload gains nothing: its uid carries no grant, and grant hosts are NOT added to squid's allowlist (resolution is not reachability)."
+        }
+      }
+    },
     "backend": {
       "type": "string",
       "enum": ["local", "hosted"],

@@ -55,6 +55,7 @@ services:
       AGENT_SANDBOX_TRACE: ${AGENT_SANDBOX_TRACE:-}
       DANGEROUSLY_SKIP_FIREWALL: ${DANGEROUSLY_SKIP_FIREWALL:-}
       EGRESS_QUOTA_MB: ${EGRESS_QUOTA_MB:-}
+      CONTROL_PLANE_EGRESS_GRANTS: ${CONTROL_PLANE_EGRESS_GRANTS:-}
     # The sentinel gates everything: init-firewall runs set -Eeuo pipefail and
     # exits non-zero on any failure, so /tmp/firewall-ready never appears, the
     # healthcheck never flips, and the workload (depends_on: service_healthy)
@@ -226,6 +227,9 @@ services:
       # A writable HOME on the read-only rootfs: the workload user is an
       # arbitrary uid with no passwd entry, and git (among others) needs one.
       HOME: /tmp
+      # Where the read-only control-plane rendezvous surface is mounted, so
+      # in-workload hook clients need no hardcoded path.
+      CONTROL_PLANE_DIR: /run/control-plane
     dns:
       - ${SANDBOX_IP:-172.30.0.2}
     networks:
@@ -237,6 +241,10 @@ services:
       # it but can never rewrite it. An empty volume when the hardener profile
       # is off (or no hooks ran) — a harmless empty dir.
       - hardened-config:/run/hardened-config:ro
+      # Control-plane rendezvous surface: consumers mount this same volume
+      # read-write in their --extra-compose services to publish ready markers
+      # (<name>.ready) and rendezvous config; the workload can read, never write.
+      - control-plane:/run/control-plane:ro
 
 networks:
   sandbox:
@@ -258,3 +266,6 @@ volumes:
   # keeping the workload off both is the tamper-evidence boundary.
   audit-log:
   audit-secret:
+  # Consumer control-plane rendezvous: ready markers + config, rw in consumer
+  # overlay services, ro in the workload (docs/control-plane.md).
+  control-plane:
