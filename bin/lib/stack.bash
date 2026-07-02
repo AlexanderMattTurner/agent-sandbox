@@ -159,6 +159,9 @@ stack_validate_workspace_mount() {
     as_error "workspace_mount must be an absolute host path (got '$src') — compose resolves a relative bind against the compose file's directory, not your working directory"
     return 1
   }
+  # Deliberately final-component-only: a symlinked PARENT (/alias/project) is
+  # tolerated because the containment check below runs on the fully-resolved
+  # pwd -P path, so it cannot be used to sneak inside the state root.
   [[ ! -L "$src" ]] || {
     as_error "workspace_mount '$src' is a symlink — the bind would mount its target, so the record's path and the mounted path diverge; bind the resolved directory itself"
     return 1

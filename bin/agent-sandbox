@@ -176,6 +176,17 @@ cmd_run() {
     stack_validate_workspace_mount "$workload" || return 1
   fi
 
+  # overmount_paths is the sole kernel-enforced guard in bind mode, so a malformed
+  # value must refuse rather than degrade: a non-array (or non-string entry) would
+  # make overmount_paths_for's jq iteration error out and yield ZERO guard paths,
+  # silently handing over a fully-writable host bind.
+  if jq -e 'has("overmount_paths")' "$workload" >/dev/null; then
+    jq -e '.overmount_paths | type == "array" and ([.[] | type == "string" and length > 0] | all)' "$workload" >/dev/null || {
+      as_error "workload.overmount_paths must be an array of non-empty relative path strings (e.g. [\".git/hooks\", \"node_modules\"])"
+      return 1
+    }
+  fi
+
   local backend
   backend="$(jq -r '.backend // "local"' "$workload")"
 

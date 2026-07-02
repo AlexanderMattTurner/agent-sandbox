@@ -59,10 +59,10 @@ VALID = {
 }
 
 
-def _run(tmp_path, workload_obj, *, state_dir=None):
+def _run(tmp_path, workload_obj, *, state_dir=None, docker_body=FAKE_DOCKER):
     stub = tmp_path / "stub"
     stub.mkdir(exist_ok=True)
-    write_exe(stub / "docker", FAKE_DOCKER)
+    write_exe(stub / "docker", docker_body)
     wl = tmp_path / "workload.json"
     wl.write_text(json.dumps(workload_obj))
     state = Path(state_dir) if state_dir else tmp_path / "state"
@@ -283,6 +283,41 @@ def test_missing_default_paths_warn_and_proceed_with_marker(tmp_path):
     assert "default guardrail path 'node_modules' does not exist" in r.stderr
     assert "nothing under /workspace is mounted read-only" in r.stderr
     assert _ups(calls)
+
+
+def test_malformed_overmount_paths_is_refused_before_bringup(tmp_path):
+    """overmount_paths is the sole kernel-enforced guard in bind mode; a non-array
+    value would make the jq iteration yield ZERO guard paths and hand over a
+    fully-writable bind, so the launcher refuses it before anything comes up."""
+    ws = _bind_ws(tmp_path)
+    wl = {**VALID, "workspace_mount": str(ws), "overmount_paths": ".git/hooks"}
+    r, calls, _ = _run(tmp_path, wl)
+    assert r.returncode != 0
+    assert "overmount_paths must be an array of non-empty" in r.stderr, r.stderr
+    assert not _ups(calls), calls
+
+
+def test_writable_guardrail_refuses_tears_down_and_never_execs_entrypoint(tmp_path):
+    """The security-critical branch: a guardrail the write-probe proves WRITABLE
+    must refuse the hand-over, tear the stack down, and never run the entrypoint."""
+    ws = _bind_ws(tmp_path)
+    breach_docker = FAKE_DOCKER.replace(
+        'if [[ "$1" == "exec" ]]; then',
+        'if [[ "$1" == "exec" && "$*" == */workspace/.git/hooks* ]]; then\n'
+        '  printf \'%s\\n\' "$*" >>"$DOCKER_LOG.exec"\n'
+        "  exit 1\n"
+        "fi\n"
+        'if [[ "$1" == "exec" ]]; then',
+    )
+    wl = {**VALID, "workspace_mount": str(ws)}
+    r, calls, _ = _run(tmp_path, wl, docker_body=breach_docker)
+    assert r.returncode != 0
+    assert "read-only guardrail is writable or unverifiable" in r.stderr, r.stderr
+    down = [c for c in calls if " down " in f" {c} "]
+    assert down and all("--volumes" in c for c in down), calls
+    exec_log = tmp_path / "docker.log.exec"
+    execs = exec_log.read_text().splitlines() if exec_log.exists() else []
+    assert not any("bash -lc echo hi" in e for e in execs), execs
 
 
 def test_explicit_empty_overmounts_prints_marker_without_warns(tmp_path):

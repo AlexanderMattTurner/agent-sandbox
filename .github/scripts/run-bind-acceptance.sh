@@ -88,7 +88,7 @@ fi
 
 # 5. A literal `$` in the bind path: the launcher escapes it to `$$` for compose's
 #    interpolation pass, so the bind still resolves and writes still land on the host.
-ws_dollar='/tmp/agent-sandbox-bind-$lit'
+ws_dollar="/tmp/agent-sandbox-bind-\$lit"
 rm -rf "$ws_dollar"
 install -d -m 0777 "$ws_dollar" "$ws_dollar/.git/hooks" "$ws_dollar/node_modules"
 jq --arg ws "$ws_dollar" '.workspace_mount = $ws
