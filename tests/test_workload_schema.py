@@ -78,6 +78,44 @@ def test_seed_from_git_requires_review_branch():
         jsonschema.validate(bad, SCHEMA)
 
 
+def test_bind_mode_workload_validates():
+    ok = {
+        "image": "x",
+        "entrypoint": ["bash"],
+        "egress_allowlist": [],
+        "ephemeral": True,
+        "workspace_mount": "/tmp/checkout",
+    }
+    jsonschema.validate(ok, SCHEMA)
+
+
+def test_seed_mode_workload_validates():
+    ok = {
+        "image": "x",
+        "entrypoint": ["bash"],
+        "egress_allowlist": [],
+        "ephemeral": True,
+        "seed_from_git": {"ref": "HEAD", "review_branch": "sandbox/review"},
+    }
+    jsonschema.validate(ok, SCHEMA)
+
+
+def test_workspace_mount_and_seed_from_git_are_mutually_exclusive():
+    """Bind writes land directly on the host; seed writes are quarantined onto a
+    review branch. A record carrying both has no coherent write path — the schema's
+    top-level `not` rejects it (mirrored by the launcher's own refusal)."""
+    bad = {
+        "image": "x",
+        "entrypoint": ["bash"],
+        "egress_allowlist": [],
+        "ephemeral": True,
+        "workspace_mount": "/tmp/checkout",
+        "seed_from_git": {"ref": "HEAD", "review_branch": "sandbox/review"},
+    }
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(bad, SCHEMA)
+
+
 def _with_allowlist(entries):
     return {
         "image": "x",

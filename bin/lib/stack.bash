@@ -128,11 +128,65 @@ _stack_wait_control_plane_ready() {
   return 1
 }
 
+# _stack_state_root — the library's own host state base dir (per-session dirs live
+# under it). The one place the AGENT_SANDBOX_STATE_DIR/XDG default chain is spelled.
+_stack_state_root() {
+  printf '%s' "${AGENT_SANDBOX_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-sandbox}"
+}
+
 # _stack_state_dir PROJECT — this session's owner-only host dir for the artifacts
 # that outlive the containers: the WIP patch, the agent's mbox, the egress log.
 _stack_state_dir() {
-  printf '%s/sessions/%s' \
-    "${AGENT_SANDBOX_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-sandbox}" "$1"
+  printf '%s/sessions/%s' "$(_stack_state_root)" "$1"
+}
+
+# stack_validate_workspace_mount WORKLOAD_JSON — fail-closed pre-launch validation of
+# the bind-mode workspace source (called by the launcher before anything comes up).
+# Refuses: a non-absolute path (compose resolves a relative bind against the compose
+# FILE's directory, not the caller's $PWD — a silent foot-gun); a symlinked source,
+# dangling included (the bind would mount the TARGET, so the record's path and the
+# mounted path diverge — and a dangling one would surface as a confusing failure at
+# `up`); a missing or non-directory source (Docker would fabricate a root-owned dir at
+# that host path); and a source resolving to or under the library's own state root
+# (the workload could then rewrite session artifacts: the egress log copy, WIP patches).
+stack_validate_workspace_mount() {
+  local workload="$1" src resolved state_root
+  src="$(jq -r '.workspace_mount // empty' "$workload")"
+  # Strip trailing slashes first: `[[ -L "/path/link/" ]]` is FALSE for a symlink
+  # written with a trailing slash, which would slip it past the refusal below.
+  while [[ "$src" == */ && "$src" != "/" ]]; do src="${src%/}"; done
+  [[ "$src" == /* ]] || {
+    as_error "workspace_mount must be an absolute host path (got '$src') — compose resolves a relative bind against the compose file's directory, not your working directory"
+    return 1
+  }
+  # Deliberately final-component-only: a symlinked PARENT (/alias/project) is
+  # tolerated because the containment check below runs on the fully-resolved
+  # pwd -P path, so it cannot be used to sneak inside the state root.
+  [[ ! -L "$src" ]] || {
+    as_error "workspace_mount '$src' is a symlink — the bind would mount its target, so the record's path and the mounted path diverge; bind the resolved directory itself"
+    return 1
+  }
+  [[ -d "$src" ]] || {
+    as_error "workspace_mount '$src' does not exist or is not a directory — Docker would fabricate a root-owned directory at that host path; create the directory first"
+    return 1
+  }
+  resolved="$(cd "$src" && pwd -P)" || {
+    as_error "could not resolve workspace_mount '$src' (cd/pwd failed — check its permissions)"
+    return 1
+  }
+  state_root="$(_stack_state_root)"
+  # Compare resolved-to-resolved: the state root may not exist yet (first run), in
+  # which case nothing can resolve under it and the literal path is the right compare.
+  if [[ -d "$state_root" ]]; then
+    state_root="$(cd "$state_root" && pwd -P)" || {
+      as_error "could not resolve the state dir '$state_root'"
+      return 1
+    }
+  fi
+  if [[ "$resolved" == "$state_root" || "$resolved" == "$state_root"/* ]]; then
+    as_error "workspace_mount '$src' resolves inside the library's own state dir ($state_root) — the workload could rewrite session artifacts (egress log, WIP patches); bind a directory outside it"
+    return 1
+  fi
 }
 
 # stack_ensure_firewall_image SANDBOX_DIR — make sure $FIREWALL_IMAGE exists,
@@ -395,14 +449,38 @@ stack_run() {
     fi
   fi
 
-  # Fail-closed guardrail verify (BIND MODE only): the read-only overmounts are a security
-  # control, so prove the workload user truly cannot write them before handing over. Seed
-  # mode has no host ro-binds (workspace is a named volume) and its writes are gated by the
-  # review-branch extract, so it is not probed. Run before seeding/exec so a guardrail that
-  # isn't actually read-only never gets a chance to be bypassed.
+  # Fail-closed guardrail gate (BIND MODE only): bind mode has no review-branch
+  # quarantine — the read-only overmounts are the ONLY kernel-enforced guard between the
+  # workload and the host checkout — so this block ALWAYS runs when workspace_mount is
+  # set. Seed mode has no host ro-binds (workspace is a named volume) and its writes are
+  # gated by the review-branch extract, so it is not probed. Runs before seeding/exec so
+  # a guardrail that isn't actually read-only never gets a chance to be bypassed.
   if jq -e '.workspace_mount' "$workload" >/dev/null 2>&1; then
+    # A declared path missing under the host workspace gets NO bind at all. An EXPLICIT
+    # overmount_paths declaration is the consumer stating a security requirement, so a
+    # missing explicit path refuses the launch; a missing DEFAULT path only warns (most
+    # checkouts ship without e.g. node_modules, and the default must stay launchable).
+    local _rel _missing_out
+    local -a _missing=()
+    if ! _missing_out="$(overmount_missing_declared_paths "$workload")"; then
+      as_error "could not resolve the workload's overmount paths — refusing to hand over the sandbox"
+      _stack_compose "$project" "$compose" "$override" "$overmounts" down --volumes --timeout 30 || true # allow-exit-suppress: best-effort cleanup of a stack refused at the guardrail gate; the launch already failed loudly
+      return 1
+    fi
+    while IFS= read -r _rel; do
+      [[ -n "$_rel" ]] && _missing+=("$_rel")
+    done <<<"$_missing_out"
+    if ((${#_missing[@]})); then
+      if jq -e 'has("overmount_paths")' "$workload" >/dev/null; then
+        as_error "explicitly declared overmount_paths do not exist under the host workspace, so NO read-only bind would protect them: ${_missing[*]} — create them on the host or drop them from overmount_paths"
+        _stack_compose "$project" "$compose" "$override" "$overmounts" down --volumes --timeout 30 || true # allow-exit-suppress: best-effort cleanup of a stack refused at the guardrail gate; the launch already failed loudly
+        return 1
+      fi
+      for _rel in "${_missing[@]}"; do
+        as_warn "default guardrail path '$_rel' does not exist under the host workspace — it is NOT mounted read-only this session"
+      done
+    fi
     local -a _cpaths=()
-    local _rel
     while IFS= read -r _rel; do
       [[ -n "$_rel" ]] && _cpaths+=("/workspace/$_rel")
     done < <(overmount_applicable_paths "$workload")
@@ -413,6 +491,10 @@ stack_run() {
         return 1
       fi
       as_info "overmounts verified read-only (${#_cpaths[@]} paths)"
+    else
+      # Non-vacuous marker: bind mode ran the gate and found NOTHING to hold read-only —
+      # the workload can write anywhere under /workspace, directly onto the host.
+      as_info "bind mode: no overmount guardrails apply — nothing under /workspace is mounted read-only this session"
     fi
   fi
 

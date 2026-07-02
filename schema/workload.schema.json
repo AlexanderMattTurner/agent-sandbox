@@ -6,6 +6,10 @@
   "type": "object",
   "additionalProperties": false,
   "required": ["image", "entrypoint", "egress_allowlist", "ephemeral"],
+  "not": {
+    "required": ["workspace_mount", "seed_from_git"],
+    "$comment": "Bind mode (workspace_mount) and seed mode (seed_from_git) are mutually exclusive: bind writes land directly on the host, seed writes are quarantined onto a review branch — a record carrying both has no coherent write path. See docs/bind-mode.md."
+  },
   "properties": {
     "image": {
       "type": "string",
@@ -41,7 +45,7 @@
     },
     "workspace_mount": {
       "type": "string",
-      "description": "Host path bound to the container's /workspace. Omitted when seed_from_git is set (the workspace is seeded from git into a volume instead of bound)."
+      "description": "BIND MODE: absolute host path bound READ-WRITE to the container's /workspace — the workload's writes land directly on the host, with no review-branch quarantine; the read-only overmount_paths binds are the only kernel-enforced guard (contract: docs/bind-mode.md). Mutually exclusive with seed_from_git (top-level `not`). The launcher refuses a relative, missing, non-directory, or symlinked source, and one resolving inside the library's own state dir."
     },
     "overmount_paths": {
       "type": "array",
@@ -80,7 +84,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["ref", "review_branch"],
-      "description": "worktree-seed: seed the workspace from a git ref inside the sandbox; the workload's writes are extracted onto review_branch on the host, never onto the host working tree.",
+      "description": "SEED MODE: seed the workspace from a git ref inside the sandbox; the workload's writes are extracted onto review_branch on the host, never onto the host working tree. Mutually exclusive with workspace_mount (top-level `not`).",
       "properties": {
         "ref": {
           "type": "string",

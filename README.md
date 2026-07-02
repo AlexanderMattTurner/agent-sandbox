@@ -19,6 +19,7 @@ or **bind-mounted** from a host path (with dangerous paths held read-only). No
 workload-specific logic lives in the library.
 
 - **Authoring and running a Workload:** [`docs/usage.md`](docs/usage.md)
+- **Bind mode — what is and isn't protected:** [`docs/bind-mode.md`](docs/bind-mode.md)
 - **The Workload contract (every field):** [`schema/workload.schema.json`](schema/workload.schema.json)
 - **How the isolation is built as topology:** the header comment of
   [`sandbox/docker-compose.yml`](sandbox/docker-compose.yml)
