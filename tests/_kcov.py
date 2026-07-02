@@ -127,6 +127,7 @@ KCOV_GATED = KCOV_ENROLLED + list(KCOV_GATED_VIA_VEHICLE.values())
 # then reports them uncovered, naming the wrapper rather than the missing test.
 KCOV_TEST_FILES = [
     "tests/test_launcher.py",
+    "tests/test_lifecycle_verbs.py",
 ]
 
 
