@@ -69,11 +69,13 @@ stack_ensure_firewall_image() {
 
 # _stack_write_override WORKLOAD_JSON OUT — generate the per-session compose
 # override carrying the part of the Workload record a static file can't: (host-mode)
-# its workspace bind, which replaces the named volume by target-path merge. The env
-# map does NOT ride here — it is delivered via a 0600 up-only env-file
-# (_stack_write_env_delivery) so secrets never persist in this on-disk override. JSON
-# is valid YAML, so compose consumes it directly. With no workspace_mount the workload
-# object is `{}`, a valid no-op override.
+# its workspace bind, which replaces the named volume by target-path merge, and (when
+# secret_env is declared) the /run/secrets tmpfs the secret files are streamed into
+# post-create (_stack_deliver_secrets). The env map does NOT ride here — it is
+# delivered via a 0600 up-only env-file (_stack_write_env_delivery) — and neither do
+# the secret_env VALUES (only the value-free tmpfs declaration does), so secrets never
+# persist in this on-disk override. JSON is valid YAML, so compose consumes it
+# directly. With neither field the workload object is `{}`, a valid no-op override.
 _stack_write_override() {
   local workload="$1" out="$2"
   # `$` → `$$`: compose runs variable interpolation over every file it loads, so a
@@ -81,11 +83,50 @@ _stack_write_override() {
   # the LAUNCHER's environment.
   jq '{
     services: {
-      workload: (if .workspace_mount
-                 then {volumes: [{type: "bind", source: (.workspace_mount | gsub("\\$"; "$$")), target: "/workspace"}]}
-                 else {} end)
+      workload: ((if .workspace_mount
+                  then {volumes: [{type: "bind", source: (.workspace_mount | gsub("\\$"; "$$")), target: "/workspace"}]}
+                  else {} end)
+                 + (if ((.secret_env // {}) | length) > 0
+                    then {tmpfs: ["/run/secrets:mode=0755,size=1m"]}
+                    else {} end))
     }
   }' "$workload" >"$out"
+}
+
+# _stack_deliver_secrets WORKLOAD_JSON CID USER — stream each secret_env value into
+# /run/secrets/<name> on the workload container's tmpfs (mode 0400, chowned to the
+# workload user) over the exec's STDIN — never argv, never container env, never the
+# host state dir — so no secret byte is visible to `docker inspect` or ever touches
+# host disk. jq -j delivers the value byte-exact (newlines allowed). The tmpfs dies
+# with the container, so teardown removes the material by construction. Fail-closed:
+# any failed delivery refuses the session. Keys are read by INDEX (like stack_run's
+# entrypoint argv), never by iterating a newline-joined key list — a line-based read
+# would silently deliver zero secrets when the producing jq fails, and would split a
+# newline-carrying key into bogus names.
+_stack_deliver_secrets() {
+  local workload="$1" cid="$2" user="$3" name n i
+  # POSIX sh, not bash: the workload image is arbitrary and may not carry bash.
+  # $1 (name) and $2 (user) ride argv; the secret VALUE rides stdin only.
+  # shellcheck disable=SC2016 # single quotes are the point: $1/$2 expand in the container's sh, never here
+  local deliver='umask 377 && cat >"/run/secrets/$1" && chown -- "$2" "/run/secrets/$1"'
+  # Defense in depth below the launcher gate: stack_run is the documented library
+  # entry point, and an unshaped record must never become a zero-delivery success
+  # (a non-object dies in `keys`, leaving n="" and a 0-iteration loop) or a
+  # root-privileged write at a path of the record's choosing (an unshaped name —
+  # checked in jq, not bash, because command substitution strips the trailing
+  # newline a "NAME\n" key smuggles past a post-substitution [[ =~ ]] test).
+  jq -e '.secret_env | type == "object" and ([.[] | type == "string"] | all) and (keys | all(test("\\A[A-Za-z_][A-Za-z0-9_]*\\z")))' "$workload" >/dev/null || {
+    as_error "secret_env must be a name -> value object of string values with env-var-shaped names — refusing delivery"
+    return 1
+  }
+  n="$(jq '.secret_env | keys | length' "$workload")"
+  for ((i = 0; i < n; i++)); do
+    name="$(jq -r "(.secret_env | keys)[$i]" "$workload")"
+    jq -je --arg k "$name" '.secret_env[$k]' "$workload" | docker exec -i -u root "$cid" sh -c "$deliver" _ "$name" "$user" || {
+      as_error "could not deliver secret '$name' into the sandbox"
+      return 1
+    }
+  done
 }
 
 # _stack_write_env_delivery WORKLOAD_JSON ENVFILE OVERRIDE — stage the workload's env
@@ -215,11 +256,12 @@ stack_run() {
   local ephemeral
   ephemeral="$(jq -r '.ephemeral' "$workload")"
 
-  # Secret env delivery: a 0600 env-file consumed ONLY by `up` (staged as an up-only
+  # env delivery: a 0600 env-file consumed ONLY by `up` (staged as an up-only
   # override appended last to the compose file set), then unlinked once the container
-  # is created — so the workload's secrets never persist in the on-disk override.
-  # Empty env → no file, no override. Residual `docker inspect` visibility on the live
-  # container is documented (compose-secrets is tracked separately).
+  # is created — so the workload's env never persists in the on-disk override.
+  # Empty env → no file, no override. env values remain visible on the live container
+  # via `docker inspect`; credentials belong in secret_env (file-delivered, invisible
+  # to inspect — _stack_deliver_secrets below).
   local env_file="" env_override="" env_idx=-1
   if [[ "$(jq '(.env // {}) | length' "$workload")" -gt 0 ]]; then
     env_file="$state/workload.env"
@@ -254,6 +296,16 @@ stack_run() {
   if [[ -n "$env_file" ]]; then
     [[ "$env_idx" -ge 0 ]] && unset "_STACK_EXTRA_COMPOSE[$env_idx]"
     rm -f "$env_file" "$env_override"
+  fi
+
+  # Stream secret_env files into the container's /run/secrets tmpfs BEFORE anything
+  # else runs in it (the entrypoint idles), so the workload always sees its secrets.
+  if [[ "$(jq '(.secret_env // {}) | length' "$workload")" -gt 0 ]]; then
+    if ! _stack_deliver_secrets "$workload" "$cid" "$WORKLOAD_USER"; then
+      as_error "secret delivery failed — refusing to hand over the sandbox"
+      _stack_compose "$project" "$compose" "$override" "$overmounts" down --volumes --timeout 30 || true # allow-exit-suppress: best-effort cleanup of a stack refused at secret delivery; the launch already failed loudly
+      return 1
+    fi
   fi
 
   # Fail-closed guardrail verify (BIND MODE only): the read-only overmounts are a security
