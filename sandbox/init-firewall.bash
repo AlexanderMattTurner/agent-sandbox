@@ -131,7 +131,12 @@ declare -A DOMAIN_ACCESS
 # ro first, then rw, so an explicit rw escalation wins when a host is in both.
 add_workload_domains ro <<<"${WORKLOAD_ALLOWED_DOMAINS_RO:-}"
 add_workload_domains rw <<<"${WORKLOAD_ALLOWED_DOMAINS_RW:-}"
-if [[ ${#DOMAIN_ACCESS[@]} -eq 0 ]]; then
+# `${DOMAIN_ACCESS[*]+set}` (not `${#DOMAIN_ACCESS[@]}`): bash treats an associative
+# array that never received an element as UNSET, so `${#DOMAIN_ACCESS[@]}` trips
+# `set -u` with "DOMAIN_ACCESS: unbound variable" and kills the firewall on exactly the
+# deny-all default (an empty allowlist). The `+set` form is the nounset-safe emptiness
+# test: it expands to "set" once any key exists, to nothing while the map is empty.
+if [[ -z "${DOMAIN_ACCESS[*]+set}" ]]; then
   echo "Workload declared an empty egress allowlist — booting a deny-all firewall (no egress will resolve or route)."
 fi
 
