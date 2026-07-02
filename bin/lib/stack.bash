@@ -1116,7 +1116,7 @@ stack_prewarm() {
   # The adoption manifest records the subnet/ip the spare's network came up under:
   # an adopting launch re-enters `up` with THESE (not its own fresh allocation) so
   # compose reconciles the running stack instead of recreating its network.
-  if ! (umask 077 && jq -n --arg project "$project" --arg spec "$spec_hash" --arg subnet "$SANDBOX_SUBNET" --arg ip "$SANDBOX_IP" --argjson created "$created" '{project: $project, spec: $spec, subnet: $subnet, ip: $ip, created: $created}' >"$state/prewarm.json"); then
+  if ! (umask 077 && jq -n --arg project "$project" --arg spec "$spec_hash" --arg subnet "$SANDBOX_SUBNET" --argjson created "$created" '{project: $project, spec: $spec, subnet: $subnet, created: $created}' >"$state/prewarm.json"); then
     as_error "could not write the prewarm manifest $state/prewarm.json — tearing the unusable spare down"
     _stack_down_ephemeral "$project" "$compose" "$_STACK_OVERRIDE" "$_STACK_OVERMOUNTS" || true # allow-exit-suppress: best-effort cleanup of a spare refused at manifest write; the prewarm already failed loudly
     return 1

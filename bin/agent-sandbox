@@ -188,8 +188,7 @@ _validate_workload_record() {
   # Validate the required contract fields up front (image, entrypoint, egress_allowlist,
   # ephemeral). egress_allowlist must be present (even if empty is a deliberate choice);
   # entrypoint must be a non-empty argv.
-  local image
-  image="$(require_field "$workload" '.image' image)" || return 1
+  require_field "$workload" '.image' image >/dev/null || return 1
   jq -e '.entrypoint | type == "array" and length > 0' "$workload" >/dev/null || {
     as_error "workload.entrypoint must be a non-empty array (the argv to exec)"
     return 1

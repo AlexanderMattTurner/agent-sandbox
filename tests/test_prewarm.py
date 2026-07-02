@@ -202,7 +202,9 @@ def test_spec_hash_ignores_allowlist_order_and_spelling(tmp_path):
     ],
 )
 def test_spec_hash_moves_with_each_baked_input(tmp_path, mutate):
-    assert _hash(tmp_path, BASE_WORKLOAD) != _hash(tmp_path, {**BASE_WORKLOAD, **mutate})
+    assert _hash(tmp_path, BASE_WORKLOAD) != _hash(
+        tmp_path, {**BASE_WORKLOAD, **mutate}
+    )
 
 
 def test_spec_hash_defaults_equal_their_explicit_spelling(tmp_path):
@@ -283,7 +285,9 @@ def test_spec_hash_covers_extra_compose_content_and_order(tmp_path):
 def test_spec_hash_ignores_each_exec_or_teardown_time_field(tmp_path, mutate):
     """The excluded set, one case per member: these fields are exec-, adoption-, or
     teardown-time and must not fragment the spare pool."""
-    assert _hash(tmp_path, BASE_WORKLOAD) == _hash(tmp_path, {**BASE_WORKLOAD, **mutate})
+    assert _hash(tmp_path, BASE_WORKLOAD) == _hash(
+        tmp_path, {**BASE_WORKLOAD, **mutate}
+    )
 
 
 def test_spec_hash_fails_closed_when_an_image_is_not_inspectable(tmp_path):

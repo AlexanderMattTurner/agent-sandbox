@@ -91,11 +91,12 @@ if [[ "$rc" -ne 0 ]]; then
 fi
 check "the run adopted the prewarmed spare" "adopted prewarmed spare $spare" run.log
 check "the adopted session ran the workload entrypoint" 'ADOPTED RAN' run.log
-git show sandbox/prewarm-review:adopted.txt >/dev/null || {
+if git show sandbox/prewarm-review:adopted.txt >/dev/null; then
+  echo "PASS: the adopted session's work was extracted to sandbox/prewarm-review"
+else
   echo "FAIL: the adopted session's commit is not on the review branch" >&2
   fail=1
-}
-echo "PASS: the adopted session's work was extracted to sandbox/prewarm-review"
+fi
 leftover_containers="$(docker ps -aq --filter "label=com.docker.compose.project=$spare")"
 leftover_volumes="$(docker volume ls -q --filter "label=com.docker.compose.project=$spare")"
 if [[ -n "$leftover_containers" || -n "$leftover_volumes" ]]; then

@@ -133,7 +133,6 @@ def _stage_spare(tmp_path, project=SPARE_PROJECT, subnet="172.30.9.0/24"):
                 "project": project,
                 "spec": "0" * 16,
                 "subnet": subnet,
-                "ip": subnet.rsplit(".", 1)[0] + ".2",
                 "created": 1700000000,
             }
         )
@@ -239,9 +238,7 @@ def _run_bare(tmp_path, argv):
         "NO_COLOR": "1",
         "DOCKER_ARGV_LOG": str(log),
     }
-    r = subprocess.run(
-        [str(LAUNCHER), *argv], capture_output=True, text=True, env=env
-    )
+    r = subprocess.run([str(LAUNCHER), *argv], capture_output=True, text=True, env=env)
     return r, log.read_text()
 
 
@@ -301,7 +298,6 @@ def test_prewarm_leaves_a_labeled_spare_up_and_prints_its_project(tmp_path):
     assert manifest["project"] == project
     assert manifest["spec"] == labels["agent-sandbox.prewarm-spec"]
     assert re.fullmatch(r"172\.\d+\.\d+\.0/24", manifest["subnet"])
-    assert manifest["ip"].endswith(".2")
     assert (state / "prewarm.json").stat().st_mode & 0o777 == 0o600
 
 
