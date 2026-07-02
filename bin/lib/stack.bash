@@ -19,11 +19,20 @@ source "$_STACK_LIB_DIR/overmounts.bash"
 # _stack_compose PROJECT COMPOSE OVERRIDE OVERMOUNTS CMD... — every compose call goes
 # through here so the project name and file set can never drift between up/exec/down. The
 # overmount override is ALWAYS in the set (a no-op `{"services":{}}` in seed mode), so no
-# call site can accidentally boot the stack without the read-only guardrails.
+# call site can accidentally boot the stack without the read-only guardrails. Consumer
+# overlays (stack_run's extra compose files) ride in via _STACK_EXTRA_COMPOSE, LAST in
+# the -f order so a consumer's service extensions merge on top of the library's stack —
+# through the same choke point, so no call site can see a different file set than `up` did.
+_STACK_EXTRA_COMPOSE=()
 _stack_compose() {
   local project="$1" compose="$2" override="$3" overmounts="$4"
   shift 4
-  docker compose -p "$project" -f "$compose" -f "$override" -f "$overmounts" "$@"
+  local -a files=(-f "$compose" -f "$override" -f "$overmounts")
+  local extra
+  for extra in ${_STACK_EXTRA_COMPOSE[@]+"${_STACK_EXTRA_COMPOSE[@]}"}; do
+    files+=(-f "$extra")
+  done
+  docker compose -p "$project" "${files[@]}" "$@"
 }
 
 # stack_partition_allowlist WORKLOAD_JSON — export the Workload's egress_allowlist
@@ -107,15 +116,21 @@ _stack_down_ephemeral() {
   }
 }
 
-# stack_run WORKLOAD_JSON COMPOSE RUNTIME — the whole session: up → seed → exec →
-# extract → export egress log → down. Returns the workload's exit status when the
-# session machinery succeeded; machinery failures return non-zero themselves.
-# Reads SANDBOX_IP/SANDBOX_SUBNET from the caller (export_sandbox_subnet).
+# stack_run WORKLOAD_JSON COMPOSE RUNTIME [EXTRA_COMPOSE...] — the whole session:
+# up → seed → exec → extract → export egress log → down. Returns the workload's exit
+# status when the session machinery succeeded; machinery failures return non-zero
+# themselves. Reads SANDBOX_IP/SANDBOX_SUBNET from the caller (export_sandbox_subnet).
+# EXTRA_COMPOSE files are consumer overlays merged after the library's file set on
+# EVERY compose invocation of this session (see _stack_compose). The compose project
+# name is randomized per session unless the consumer pins its own identity via
+# AGENT_SANDBOX_PROJECT_NAME (its lifecycle tooling finds the stack by that label).
 stack_run() {
   local workload="$1" compose="$2" runtime="$3"
+  shift 3
+  _STACK_EXTRA_COMPOSE=("$@")
   local sandbox_dir project state
   sandbox_dir="$(cd "$(dirname "$compose")" && pwd)"
-  project="agent-sandbox-$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n')"
+  project="${AGENT_SANDBOX_PROJECT_NAME:-agent-sandbox-$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n')}"
   state="$(_stack_state_dir "$project")"
   worktree_secure_mkdir "$state" || return 1
 

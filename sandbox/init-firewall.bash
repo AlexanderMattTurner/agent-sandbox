@@ -912,3 +912,30 @@ else
   as_trace "${TRACE_FIREWALL_REFRESH_SUPERVISED:-}" interval="$REFRESH_INTERVAL"
 
 fi
+
+# Consumer firewall extensions: run every hook in the (empty-by-default) hooks
+# directory AFTER the base deny-all rules and the supervised refresher are live,
+# and BEFORE this script exits 0 (the compose command only touches firewall-ready
+# on success). Hooks run as root inside the firewall netns, so a consumer can add
+# its own iptables/ipset policy without forking this script. Fail closed on ANY
+# hook problem — a broken policy extension must abort the launch, not silently
+# ship a firewall missing rules the consumer believes are present. A non-executable
+# or non-regular entry is a misconfiguration, not something to skip: the operator
+# mounted it intending it to run.
+run_firewall_hooks() {
+  local dir="$1" hook
+  [[ -d "$dir" ]] || return 0
+  for hook in "$dir"/*; do
+    [[ -e "$hook" ]] || continue # unmatched glob literal
+    if [[ ! -f "$hook" || ! -x "$hook" ]]; then
+      echo "ERROR: firewall hook $hook is not an executable file — refusing to mark the firewall ready (fail closed)." >&2
+      return 1
+    fi
+    echo "firewall hook: running $hook"
+    if ! "$hook"; then
+      echo "ERROR: firewall hook $hook failed — refusing to mark the firewall ready (fail closed)." >&2
+      return 1
+    fi
+  done
+}
+run_firewall_hooks "${FIREWALL_HOOKS_DIR:-/run/firewall-hooks.d}"
