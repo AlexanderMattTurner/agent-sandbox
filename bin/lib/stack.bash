@@ -427,11 +427,12 @@ _STACK_SESSION_CLAIM_DIR="${AGENT_SANDBOX_SESSION_CLAIM_DIR:-${XDG_RUNTIME_DIR:-
 # LIVE holder pid is refused; a stale one (holder dead/missing) is stolen by renaming it
 # aside — rename(2) succeeds for exactly one racer, so no two callers ever both hold it.
 _stack_session_claim() {
-  local project="$1" dir="$_STACK_SESSION_CLAIM_DIR/$project"
-  mkdir -p "$_STACK_SESSION_CLAIM_DIR" 2>/dev/null && chmod 700 "$_STACK_SESSION_CLAIM_DIR" 2>/dev/null || {
+  local project="$1" dir
+  dir="$_STACK_SESSION_CLAIM_DIR/$project"
+  if ! mkdir -p "$_STACK_SESSION_CLAIM_DIR" 2>/dev/null || ! chmod 700 "$_STACK_SESSION_CLAIM_DIR" 2>/dev/null; then
     as_error "could not create the session-claim dir $_STACK_SESSION_CLAIM_DIR"
     return 1
-  }
+  fi
   if mkdir "$dir" 2>/dev/null; then
     printf '%s\n' "$$" >"$dir/pid"
     return 0
@@ -460,7 +461,8 @@ _stack_session_claim() {
 # _stack_session_release PROJECT — drop this session's claim. Best-effort: a claim not
 # released (a crashed launcher) is self-healing, detected as stale on the next claim.
 _stack_session_release() {
-  rm -rf "$_STACK_SESSION_CLAIM_DIR/$1" 2>/dev/null || true # allow-exit-suppress: releasing a claim must never fail a completed session; a leftover is reclaimed as stale
+  # ${var:?} guards against a rm -rf / if the claim dir var is ever empty.
+  rm -rf "${_STACK_SESSION_CLAIM_DIR:?}/$1" 2>/dev/null || true # allow-exit-suppress: releasing a claim must never fail a completed session; a leftover is reclaimed as stale
 }
 
 # stack_run WORKLOAD_JSON COMPOSE RUNTIME [EXTRA_COMPOSE...] — the whole session:
