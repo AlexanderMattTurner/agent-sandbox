@@ -33,7 +33,7 @@ RESIDUE = {
 SHIPPED_DIRS = ["bin", "sandbox", "schema", "workloads", "config", "profiles"]
 
 
-_SHIPPED_SUFFIXES = {".bash", ".sh", ".json"}
+_SHIPPED_SUFFIXES = {".bash", ".sh", ".json", ".py"}
 
 
 def _shipped_files():
@@ -42,7 +42,7 @@ def _shipped_files():
         if not root.exists():
             continue
         for p in sorted(root.rglob("*")):
-            # Shell/JSON source, plus the extensionless launcher (bin/agent-sandbox).
+            # Shell/JSON/Python source, plus the extensionless launcher (bin/agent-sandbox).
             if p.is_file() and (
                 p.suffix in _SHIPPED_SUFFIXES or p.parent.name == "bin"
             ):

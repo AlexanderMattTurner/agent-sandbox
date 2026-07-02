@@ -11,6 +11,11 @@
 # .github/scripts/run-runsc-smoke.sh for the install path).
 set -euo pipefail
 
+# Every probe below launches a short-lived container from one image. Centralize the
+# tag so the pre-pull in run-runsc-smoke.sh and every `docker run` here stay in lockstep
+# (a mismatch would defeat the pre-pull cache warm and re-expose the pull rate limit).
+IMAGE="${SMOKE_IMAGE:-alpine}"
+
 status() { printf ':: %s\n' "$1"; }
 warn() { printf '!! %s\n' "$1" >&2; }
 die() {
@@ -100,13 +105,13 @@ status "Checking runsc registration..."
 runsc_registered 30 || die "runsc not registered — install it first (see run-runsc-smoke.sh)"
 pass "runsc registered with Docker"
 
-kernel=$(docker run --rm --runtime=runsc alpine cat /proc/version) || true
+kernel=$(docker run --rm --runtime=runsc "$IMAGE" cat /proc/version) || true
 status "kernel: ${kernel:-<unavailable>}"
 check_gvisor_kernel "$kernel"
 
 # ── 2. Basic execution ──────────────────────────────────────────────
 status "Running basic container..."
-output=$(docker run --rm --runtime=runsc alpine echo "runsc-smoke-ok" 2>&1) || die "failed to run container with runsc"
+output=$(docker run --rm --runtime=runsc "$IMAGE" echo "runsc-smoke-ok" 2>&1) || die "failed to run container with runsc"
 if [[ "$output" == *"runsc-smoke-ok"* ]]; then
   pass "basic container execution"
 else
@@ -115,7 +120,7 @@ fi
 
 # ── 3. Process isolation ────────────────────────────────────────────
 status "Checking process isolation..."
-proc_count=$(docker run --rm --runtime=runsc alpine sh -c 'ls /proc | grep -cE "^[0-9]+$"' 2>/dev/null) || proc_count=0
+proc_count=$(docker run --rm --runtime=runsc "$IMAGE" sh -c 'ls /proc | grep -cE "^[0-9]+$"' 2>/dev/null) || proc_count=0
 if [[ "$proc_count" -le 5 ]]; then
   pass "process isolation ($proc_count PIDs)"
 else
@@ -124,7 +129,7 @@ fi
 
 # ── 4. Device isolation ─────────────────────────────────────────────
 status "Checking device isolation..."
-host_devices=$(docker run --rm --runtime=runsc alpine sh -c 'ls /dev/sda /dev/kvm /dev/mem 2>/dev/null | wc -l')
+host_devices=$(docker run --rm --runtime=runsc "$IMAGE" sh -c 'ls /dev/sda /dev/kvm /dev/mem 2>/dev/null | wc -l')
 if [[ "$host_devices" -eq 0 ]]; then
   pass "device isolation"
 else
@@ -133,7 +138,7 @@ fi
 
 # ── 5. Host bind mount blocked ──────────────────────────────────────
 status "Checking host mount restrictions..."
-mount_result=$(docker run --rm --runtime=runsc alpine sh -c \
+mount_result=$(docker run --rm --runtime=runsc "$IMAGE" sh -c \
   'mkdir -p /mnt/escape && mount --bind / /mnt/escape 2>&1; echo "exit:$?"') || true
 if echo "$mount_result" | grep -qE "exit:[1-9]|not permitted|denied|Invalid argument|No such device"; then
   pass "bind mount blocked"
@@ -143,7 +148,7 @@ fi
 
 # ── 6. Capability drops ─────────────────────────────────────────────
 status "Checking capability drops..."
-cap_value=$(docker run --rm --runtime=runsc --cap-drop=ALL alpine sh -c \
+cap_value=$(docker run --rm --runtime=runsc --cap-drop=ALL "$IMAGE" sh -c \
   'grep -i capeff /proc/1/status' | awk '{print $2}') || true
 check_cap_drop "$cap_value"
 
@@ -151,7 +156,7 @@ check_cap_drop "$cap_value"
 status "Checking network isolation..."
 NET_NAME="runsc-smoke-internal-$$"
 docker network create --internal "$NET_NAME" >/dev/null || fail "failed to create isolated test network $NET_NAME"
-net_result=$(docker run --rm --runtime=runsc --network="$NET_NAME" alpine sh -c \
+net_result=$(docker run --rm --runtime=runsc --network="$NET_NAME" "$IMAGE" sh -c \
   'wget -q -O /dev/null --timeout=3 http://1.1.1.1 2>&1; echo "exit:$?"') || true
 docker network rm "$NET_NAME" >/dev/null 2>&1 || true
 if echo "$net_result" | grep -qE "exit:[1-9]|timed out|unreachable|refused"; then
@@ -162,7 +167,7 @@ fi
 
 # ── 8. Read-only root filesystem ─────────────────────────────────────
 status "Checking read-only filesystem..."
-ro_result=$(docker run --rm --runtime=runsc --read-only alpine sh -c \
+ro_result=$(docker run --rm --runtime=runsc --read-only "$IMAGE" sh -c \
   'touch /test-file 2>&1; echo "exit:$?"') || true
 if echo "$ro_result" | grep -qE "exit:[1-9]|Read-only|denied"; then
   pass "read-only filesystem enforced"
@@ -174,7 +179,7 @@ fi
 status "Checking volume mount..."
 TMPDIR_MOUNT=$(mktemp -d)
 echo "mount-test-content" >"$TMPDIR_MOUNT/test.txt"
-vol_result=$(docker run --rm --runtime=runsc -v "$TMPDIR_MOUNT:/mnt/test:ro" alpine \
+vol_result=$(docker run --rm --runtime=runsc -v "$TMPDIR_MOUNT:/mnt/test:ro" "$IMAGE" \
   cat /mnt/test/test.txt 2>&1) || true
 rm -rf "$TMPDIR_MOUNT"
 if [[ "$vol_result" == *"mount-test-content"* ]]; then
@@ -185,7 +190,7 @@ fi
 
 # ── 10. Architecture match ──────────────────────────────────────────
 status "Checking architecture..."
-container_arch=$(docker run --rm --runtime=runsc alpine uname -m) || true
+container_arch=$(docker run --rm --runtime=runsc "$IMAGE" uname -m) || true
 host_arch=$(uname -m)
 check_arch_match "$container_arch" "$host_arch"
 

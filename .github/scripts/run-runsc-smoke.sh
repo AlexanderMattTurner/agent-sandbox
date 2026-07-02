@@ -88,5 +88,27 @@ else
   "$registered" || die "runsc not registered after install + restart"
 fi
 
+# Warm the local image cache once before the assertions. The smoke suite launches
+# ~10 short-lived containers from the same image; without a pre-pull each `docker run`
+# can trigger its own unauthenticated Docker Hub pull, and the runner's shared IP
+# routinely trips the anonymous pull rate limit ("toomanyrequests") mid-suite. One
+# cached pull turns every subsequent run into a local hit; the backoff absorbs a
+# transient 429 rather than failing the whole security smoke on a throttle.
+SMOKE_IMAGE="${SMOKE_IMAGE:-alpine}"
+export SMOKE_IMAGE
+status "Pre-pulling smoke image ${SMOKE_IMAGE}..."
+pulled=false
+for delay in 0 5 15 30; do
+  ((delay > 0)) && {
+    status "pull failed (rate limit?); retrying in ${delay}s..."
+    sleep "$delay"
+  }
+  if docker pull "$SMOKE_IMAGE" >/dev/null 2>&1; then
+    pulled=true
+    break
+  fi
+done
+"$pulled" || die "could not pull $SMOKE_IMAGE after retries (Docker Hub rate limit?)"
+
 status "Running gVisor isolation smoke assertions..."
 bash "$SMOKE"
