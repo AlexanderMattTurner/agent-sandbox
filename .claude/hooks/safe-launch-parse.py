@@ -20,10 +20,10 @@ def main() -> int:
     project_dir = sys.argv[1]
     try:
         data = json.loads(sys.stdin.read())
-    except (json.JSONDecodeError, ValueError):
+    except json.JSONDecodeError:
         return 0
-    name = data.get("tool_name", "") or ""
-    tool_input = data.get("tool_input", {}) or {}
+    name = data.get("tool_name") or ""
+    tool_input = data.get("tool_input") or {}
     path = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
     if path and not os.path.isabs(path):
         path = os.path.join(project_dir, path)
@@ -32,5 +32,5 @@ def main() -> int:
     return 0
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no mutate
     sys.exit(main())
