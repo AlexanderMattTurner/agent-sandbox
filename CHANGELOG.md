@@ -12,6 +12,14 @@ the prose from the release's commits.
 
 ## Unreleased
 
+### Changed
+
+- The library's structured trace events now have a single source of truth,
+  `config/trace-events.json`, mirrored by `sandbox/trace-events.bash` and pinned
+  equal to it (with an emitter check) by a contract test. The event set is trimmed
+  to those the library actually emits (firewall, hardener, audit); consumer-only
+  events belong in a consumer overlay, not the library.
+
 ### Added
 
 - `tty` Workload field (default false): run the entrypoint under an interactive
