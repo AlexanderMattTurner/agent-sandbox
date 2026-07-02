@@ -43,3 +43,7 @@ __pycache__/
 *.pyc
 .venv/
 .uv/
+
+# Mutation testing (cosmic-ray session DB + rendered report, CI-only artifacts)
+*.sqlite
+safe-launch-parse-mutation.html
