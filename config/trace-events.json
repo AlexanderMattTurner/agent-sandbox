@@ -25,6 +25,10 @@
       "layer": "firewall",
       "level": "info"
     },
+    "firewall_cp_grant_applied": {
+      "layer": "firewall",
+      "level": "info"
+    },
     "hardener_lockdown_applied": {
       "layer": "hardener",
       "level": "info"

@@ -22,6 +22,7 @@ TRACE_FIREWALL_REFRESH_SUPERVISED="firewall_refresh_supervised"
 TRACE_FIREWALL_ALLOWLIST_EXPANDED="firewall_allowlist_expanded"
 TRACE_FIREWALL_REFRESH_DIED="firewall_refresh_died"
 TRACE_FIREWALL_IPSET_BATCH_FAILED="firewall_ipset_batch_failed"
+TRACE_FIREWALL_CP_GRANT_APPLIED="firewall_cp_grant_applied"
 TRACE_HARDENER_LOCKDOWN_APPLIED="hardener_lockdown_applied"
 TRACE_AUDIT_SINK_STARTED="audit_sink_started"
 
@@ -32,6 +33,7 @@ declare -A TRACE_EVENT_LAYER=(
   ["firewall_allowlist_expanded"]="firewall"
   ["firewall_refresh_died"]="firewall"
   ["firewall_ipset_batch_failed"]="firewall"
+  ["firewall_cp_grant_applied"]="firewall"
   ["hardener_lockdown_applied"]="hardener"
   ["audit_sink_started"]="audit"
 )
@@ -42,6 +44,7 @@ declare -A TRACE_EVENT_LEVEL=(
   ["firewall_allowlist_expanded"]="info"
   ["firewall_refresh_died"]="info"
   ["firewall_ipset_batch_failed"]="info"
+  ["firewall_cp_grant_applied"]="info"
   ["hardener_lockdown_applied"]="info"
   ["audit_sink_started"]="info"
 )

@@ -219,6 +219,68 @@ def test_overmount_paths_rejects_malformed(paths):
         jsonschema.validate({**_with_allowlist([]), "overmount_paths": paths}, SCHEMA)
 
 
+_GRANT = {"uid": 7777, "hosts": ["gate.example.com"]}
+
+
+@pytest.mark.parametrize(
+    "cp",
+    [
+        {},
+        {"require": ["gate"]},
+        {"require": ["gate", "audit-relay2"]},
+        {"egress_grants": [_GRANT]},
+        {"require": ["gate"], "egress_grants": [_GRANT]},
+        {"egress_grants": [{"uid": 1, "hosts": ["a.example", "b.example"]}]},
+    ],
+    ids=[
+        "empty",
+        "require-one",
+        "require-two",
+        "grants-only",
+        "both",
+        "grant-two-hosts",
+    ],
+)
+def test_control_plane_accepts_require_and_grants(cp):
+    jsonschema.validate({**_with_allowlist([]), "control_plane": cp}, SCHEMA)
+
+
+@pytest.mark.parametrize(
+    "cp",
+    [
+        {"require": ["Gate"]},  # marker names are lowercase
+        {"require": ["-gate"]},  # must start alnum
+        {"require": ["ga te"]},  # no whitespace
+        {"require": [""]},  # empty name
+        {"egress_grants": [{"uid": 0, "hosts": ["gate.example.com"]}]},  # root
+        {"egress_grants": [{"uid": "7777", "hosts": ["g.example"]}]},  # string uid
+        {"egress_grants": [{"uid": 7777, "hosts": ["10.0.0.1"]}]},  # IP literal
+        {"egress_grants": [{"uid": 7777, "hosts": []}]},  # empty hosts
+        {"egress_grants": [{"uid": 7777}]},  # hosts required
+        {"egress_grants": [{"hosts": ["g.example"]}]},  # uid required
+        {"egress_grants": [{**_GRANT, "port": 443}]},  # no undeclared grant keys
+        {"markers": ["gate"]},  # no undeclared control_plane keys
+    ],
+    ids=[
+        "uppercase-marker",
+        "leading-hyphen-marker",
+        "whitespace-marker",
+        "empty-marker",
+        "uid-zero",
+        "uid-string",
+        "ip-literal-host",
+        "empty-hosts",
+        "missing-hosts",
+        "missing-uid",
+        "grant-extra-key",
+        "control-plane-extra-key",
+    ],
+)
+def test_control_plane_rejects_malformed(cp):
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({**_with_allowlist([]), "control_plane": cp}, SCHEMA)
+
+
 @pytest.mark.parametrize(
     "entries",
     [

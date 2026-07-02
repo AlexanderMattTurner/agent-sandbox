@@ -446,6 +446,78 @@ echo "Host gateway detected as: $HOST_IP"
 # OUTPUT chain matches the final destination (not the gateway), so the ipset rule
 # handles it; ESTABLISHED,RELATED covers return traffic.
 
+# === Control-plane egress grants ===
+# render_control_plane_grants — per-uid direct-egress carve-outs for consumer
+# control-plane services that share this network namespace (network_mode:
+# service:firewall). CONTROL_PLANE_EGRESS_GRANTS is a JSON array of {uid, hosts}
+# the launcher validated (stack_export_control_plane_grants); empty/unset is a
+# clean no-op. Per grant: resolve the hosts through the SAME batched resolver the
+# allowlist uses (cold_boot_resolve — same CNAME walk, same is_public_ipv4
+# rebinding rejection), populate a per-uid `cp-grant-<uid>` ipset, pin domain->ip
+# in a dnsmasq conf-dir file of its own (the refresh loop rewrites the allowlist
+# conf wholesale, so a pin placed there would be evicted on the first cycle), and
+# ACCEPT that uid's :443 packets to the set. Resolution is not reachability: the
+# pins and sets are NOT added to allowed-domains, DOMAIN_ACCESS, or squid's ACLs,
+# so workload packets to these IPs still hit the final REJECT. Fail closed on any
+# resolution/ipset failure — a grant the consumer believes is live must never be
+# silently absent (same posture as apply_ipset_batch's swap gating).
+render_control_plane_grants() {
+  [[ -n "${CONTROL_PLANE_EGRESS_GRANTS:-}" ]] || return 0
+  local conf="${CP_GRANTS_DNSMASQ_CONF:-/etc/dnsmasq.d/control-plane-grants.conf}"
+  local entry uid set batch host ip
+  while IFS= read -r entry; do
+    uid="$(jq -r '.uid' <<<"$entry")"
+    # The launcher already vetted the uid; re-check here because this value names
+    # an ipset and lands in iptables argv, and the env var can be set directly.
+    if [[ ! "$uid" =~ ^[1-9][0-9]*$ ]]; then
+      echo "ERROR: control-plane grant uid '$uid' is not a positive integer — refusing the grant (fail closed)." >&2
+      return 1
+    fi
+    local -a hosts=()
+    while IFS= read -r host; do
+      [[ -n "$host" ]] && hosts+=("$host")
+    done < <(jq -r '.hosts[]' <<<"$entry")
+    if ((${#hosts[@]} == 0)); then
+      echo "ERROR: control-plane grant uid=$uid names no hosts — refusing an empty grant (fail closed)." >&2
+      return 1
+    fi
+    set="cp-grant-$uid"
+    if ! ensure_fresh_ipset "$set"; then
+      echo "ERROR: could not create the '$set' ipset for control-plane grant uid=$uid (fail closed)." >&2
+      return 1
+    fi
+    batch="$(mktemp /tmp/cp-grant.XXXXXX)"
+    local -A granted=()
+    while IFS=$'\t' read -r host ip; do
+      valid_ipv4 "$ip" || continue
+      printf 'add %s %s\n' "$set" "$ip" >>"$batch"
+      echo "address=/$host/$ip" >>"$conf"
+      granted["$host"]=1
+    done < <(cold_boot_resolve "$DNS_BATCH_SIZE" "${hosts[@]}")
+    # EVERY granted host must have resolved — a partial grant would boot a
+    # control plane whose gate silently cannot reach one of its declared
+    # backends, the exact silent-missing-rule class run_firewall_hooks refuses.
+    for host in "${hosts[@]}"; do
+      if [[ -z "${granted[$host]:-}" ]]; then
+        echo "ERROR: control-plane grant uid=$uid: host '$host' did not resolve — refusing to mark the firewall ready with a dead grant (fail closed)." >&2
+        return 1
+      fi
+    done
+    if ! apply_ipset_batch "$batch" "control-plane grant uid=$uid"; then
+      echo "ERROR: control-plane grant uid=$uid: populating the '$set' ipset failed (fail closed)." >&2
+      return 1
+    fi
+    iptables -A OUTPUT -m owner --uid-owner "$uid" -p tcp --dport 443 -m set --match-set "cp-grant-$uid" dst -j ACCEPT
+    as_trace "${TRACE_FIREWALL_CP_GRANT_APPLIED:-}" uid="$uid" hosts="${#hosts[@]}"
+    echo "control-plane grant applied: uid=$uid -> ${#hosts[@]} host(s), tcp/443 only (ipset $set)"
+  done < <(jq -c '.[]' <<<"$CONTROL_PLANE_EGRESS_GRANTS")
+}
+# Rendered HERE, not beside run_firewall_hooks at the bottom: the ACCEPT must
+# precede install_egress_output_rules' final REJECT (an -A appended after it can
+# never match), the dnsmasq pins must exist before dnsmasq first starts, and the
+# resolve needs the bootstrap :53 window that the DNS lockdown below closes.
+render_control_plane_grants
+
 # === Conntrack hardening ===
 # Cap the conntrack table to prevent exhaustion attacks. 8192 is generous for
 # legitimate use but bounds a workload opening thousands of connections. Each set
