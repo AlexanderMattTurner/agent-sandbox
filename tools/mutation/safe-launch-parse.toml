@@ -1,0 +1,20 @@
+# cosmic-ray session for the PreToolUse payload parser (safe-launch-parse.py).
+#
+# safe-launch.sh feeds this parser attacker-influenced PreToolUse JSON to decide
+# whether an in-flight tool call is a self-repair edit on a hook file; a parse
+# mistake loosens (or needlessly tightens) that gate. The suite drives the parser
+# exactly as the hook does — as a subprocess — so cosmic-ray's in-place mutation
+# is exercised end to end, including the __main__ guard and exit code. CI-only;
+# see .github/workflows/mutation-testing.yaml. Run from the repo root:
+#   cosmic-ray baseline tools/mutation/safe-launch-parse.toml
+#   cosmic-ray init     tools/mutation/safe-launch-parse.toml safe-launch-parse.sqlite
+#   cr-filter-pragma    safe-launch-parse.sqlite
+#   cosmic-ray exec     tools/mutation/safe-launch-parse.toml safe-launch-parse.sqlite
+[cosmic-ray]
+module-path = ".claude/hooks/safe-launch-parse.py"
+timeout = 30.0
+excluded-modules = []
+test-command = "python -m pytest -x -n0 tests/test_safe_launch_parse.py"
+
+[cosmic-ray.distributor]
+name = "local"

@@ -11,6 +11,10 @@ argv and on-disk lifecycle are observable:
   afterwards and that only `up` (never `down`) referenced the env override.
 - **tty**: `tty:true` allocates an interactive `docker exec -it` and is a fail-closed
   runtime precondition — the launch refuses BEFORE bring-up when stdin is not a TTY.
+- **secret_env**: each value is streamed over an exec's STDIN into /run/secrets/<name>
+  on a per-container tmpfs — never argv, never container env, never host disk. The fake
+  docker captures the delivery exec's stdin so byte-exactness is observable, and the
+  argv log proves the value appears in no docker invocation.
 """
 
 import json
@@ -18,6 +22,8 @@ import os
 import pty
 import subprocess
 from pathlib import Path
+
+import pytest
 
 REPO = Path(__file__).resolve()
 while not (REPO / ".git").exists():
@@ -31,11 +37,26 @@ LAUNCHER = REPO / "bin" / "agent-sandbox"
 #   - `compose ... ps -q workload|firewall`: print a fake cid (none for workload under
 #     $FAKE_NO_CID, so the no-container fail-closed branch is exercised).
 #   - `exec ...`: record the exec argv to $DOCKER_LOG.exec so -it can be asserted.
+#     A secret-delivery exec (argv mentions /run/secrets/) drains stdin like real
+#     docker would, captures it to $SECRET_CAPTURE_DIR/<name> when set, and fails
+#     under $FAKE_SECRET_FAIL so the delivery fail-closed branch is exercised.
 # Every invocation's argv is logged (one line) to $DOCKER_LOG.
 FAKE_DOCKER = r"""#!/usr/bin/env bash
 printf '%s\n' "$*" >>"$DOCKER_LOG"
 if [[ "$1" == "exec" ]]; then
   printf '%s\n' "$*" >>"$DOCKER_LOG.exec"
+  if [[ "$*" == *"/run/secrets/"* ]]; then
+    # Always drain stdin like real docker exec would — exiting without reading
+    # races the writer into an EPIPE under the launcher's pipefail.
+    [[ -n "${FAKE_SECRET_FAIL:-}" ]] && { cat >/dev/null; exit 1; }
+    if [[ -n "${SECRET_CAPTURE_DIR:-}" ]]; then
+      mkdir -p "$SECRET_CAPTURE_DIR"
+      # The delivery exec's argv ends `... _ <name> <user>`; its stdin is the value.
+      cat >"$SECRET_CAPTURE_DIR/${*: -2:1}"
+    else
+      cat >/dev/null
+    fi
+  fi
   exit 0
 fi
 if [[ "$1" == "compose" ]]; then
@@ -187,6 +208,153 @@ def test_envfile_removed_when_no_container_starts(tmp_path):
     assert r.returncode != 0
     assert "workload container did not start" in r.stderr, r.stderr
     assert not (sess / "workload.env").exists()
+
+
+# ── secret_env file delivery ────────────────────────────────────────
+
+SECRET_VALUE = "q9X2mN7pK4rT8wY1cV5bZ3dF6gH0jL2e"
+
+
+def _read_all_session_bytes(sess):
+    return b"".join(
+        p.read_bytes() for p in sess.rglob("*") if p.is_file() and not p.is_symlink()
+    )
+
+
+def test_secret_env_streamed_via_stdin_never_argv_env_or_host_disk(tmp_path):
+    cap = tmp_path / "secrets"
+    wl = {**VALID, "secret_env": {"OAUTH_TOKEN": SECRET_VALUE}}
+    r, calls, sess = _run(tmp_path, wl, extra_env={"SECRET_CAPTURE_DIR": str(cap)})
+    assert r.returncode == 0, r.stderr
+    # The value arrived byte-exact over the delivery exec's stdin…
+    assert (cap / "OAUTH_TOKEN").read_text() == SECRET_VALUE
+    # …and appears in NO docker argv (exec included) and NO file the session left
+    # in the host state dir. `env` would fail both: it rides an env-file override.
+    assert all(SECRET_VALUE not in c for c in calls), calls
+    assert SECRET_VALUE.encode() not in _read_all_session_bytes(sess)
+    # No env-file machinery is involved for secrets.
+    assert not any("workload-env-override.json" in c for c in calls)
+
+
+def test_secret_delivery_exec_shape_and_ordering(tmp_path):
+    wl = {**VALID, "secret_env": {"OAUTH_TOKEN": SECRET_VALUE}}
+    r, _, _ = _run(tmp_path, wl)
+    assert r.returncode == 0, r.stderr
+    execs = (tmp_path / "docker.log.exec").read_text().splitlines()
+    delivery = [e for e in execs if "/run/secrets/" in e]
+    assert len(delivery) == 1, execs
+    # Root exec reading stdin, mode 0400 via umask, chowned to the workload user.
+    assert delivery[0].startswith("exec -i -u root "), delivery
+    assert "umask 377" in delivery[0] and "chown" in delivery[0]
+    assert delivery[0].endswith(" _ OAUTH_TOKEN 1000"), delivery
+    # Delivered BEFORE the workload's entrypoint ran.
+    entry = [i for i, e in enumerate(execs) if "bash -lc echo hi" in e]
+    assert entry and execs.index(delivery[0]) < entry[0], execs
+
+
+def test_secret_env_declares_the_run_secrets_tmpfs_in_the_override(tmp_path):
+    wl = {**VALID, "secret_env": {"OAUTH_TOKEN": SECRET_VALUE}}
+    r, _, sess = _run(tmp_path, wl)
+    assert r.returncode == 0, r.stderr
+    override = json.loads((sess / "workload-override.json").read_text())
+    assert override["services"]["workload"]["tmpfs"] == [
+        "/run/secrets:mode=0755,size=1m"
+    ]
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["-----BEGIN KEY-----\nline2\nline3\n-----END KEY-----\n", ""],
+    ids=["multiline", "empty-string"],
+)
+def test_secret_value_is_delivered_byte_exact(tmp_path, value):
+    cap = tmp_path / "secrets"
+    wl = {**VALID, "secret_env": {"SIGNING_KEY": value}}
+    r, _, _ = _run(tmp_path, wl, extra_env={"SECRET_CAPTURE_DIR": str(cap)})
+    assert r.returncode == 0, r.stderr
+    assert (cap / "SIGNING_KEY").read_text() == value
+
+
+def test_several_secrets_are_each_delivered(tmp_path):
+    cap = tmp_path / "secrets"
+    wl = {**VALID, "secret_env": {"ALPHA": "a-value", "BETA": "b-value"}}
+    r, _, _ = _run(tmp_path, wl, extra_env={"SECRET_CAPTURE_DIR": str(cap)})
+    assert r.returncode == 0, r.stderr
+    assert (cap / "ALPHA").read_text() == "a-value"
+    assert (cap / "BETA").read_text() == "b-value"
+    execs = (tmp_path / "docker.log.exec").read_text().splitlines()
+    assert len([e for e in execs if "/run/secrets/" in e]) == 2, execs
+
+
+@pytest.mark.parametrize(
+    "workload", [VALID, {**VALID, "secret_env": {}}], ids=["absent", "empty-object"]
+)
+def test_no_secrets_means_no_tmpfs_and_no_delivery_exec(tmp_path, workload):
+    r, _, sess = _run(tmp_path, workload)
+    assert r.returncode == 0, r.stderr
+    override = json.loads((sess / "workload-override.json").read_text())
+    assert "tmpfs" not in override["services"]["workload"]
+    execs = (tmp_path / "docker.log.exec").read_text().splitlines()
+    assert not any("/run/secrets/" in e for e in execs), execs
+
+
+@pytest.mark.parametrize(
+    "name", ["../evil", "OAUTH_TOKEN\n"], ids=["traversal", "trailing-newline"]
+)
+def test_unsafe_secret_name_is_refused_before_bringup(tmp_path, name):
+    wl = {**VALID, "secret_env": {name: SECRET_VALUE}}
+    r, calls, _ = _run(tmp_path, wl)
+    assert r.returncode != 0
+    assert "secret_env names" in r.stderr, r.stderr
+    assert not any(" up " in f" {c} " for c in calls)
+
+
+@pytest.mark.parametrize(
+    "secret_env",
+    [{"bad/name": "v"}, {"OAUTH_TOKEN\n": "v"}, "OAUTH_TOKEN=v", {"N": 42}],
+    ids=["slash-name", "trailing-newline-name", "not-an-object", "non-string-value"],
+)
+def test_library_level_shape_gate_refuses_unshaped_secret_env(tmp_path, secret_env):
+    """stack_run is the documented library entry point, so _stack_deliver_secrets
+    revalidates the whole record shape below the launcher gate — an unshaped record
+    must never become a zero-delivery success or choose the path of a
+    root-privileged in-container write."""
+    wl = tmp_path / "wl.json"
+    wl.write_text(json.dumps({"secret_env": secret_env}))
+    harness = (
+        f"source {REPO / 'bin' / 'lib' / 'stack.bash'}\n"
+        f"_stack_deliver_secrets {wl} cid_workload 1000\n"
+    )
+    r = subprocess.run(
+        ["bash", "-c", harness],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "NO_COLOR": "1"},
+    )
+    assert r.returncode != 0
+    assert "env-var-shaped" in r.stderr, r.stderr
+
+
+def test_non_string_secret_value_is_refused_before_bringup(tmp_path):
+    wl = {**VALID, "secret_env": {"OAUTH_TOKEN": 42}}
+    r, calls, _ = _run(tmp_path, wl)
+    assert r.returncode != 0
+    assert "string values" in r.stderr, r.stderr
+    assert not any(" up " in f" {c} " for c in calls)
+
+
+def test_failed_secret_delivery_tears_the_stack_down(tmp_path):
+    wl = {**VALID, "secret_env": {"OAUTH_TOKEN": SECRET_VALUE}}
+    r, calls, _ = _run(tmp_path, wl, extra_env={"FAKE_SECRET_FAIL": "1"})
+    assert r.returncode != 0
+    assert "could not deliver secret 'OAUTH_TOKEN'" in r.stderr, r.stderr
+    assert "refusing to hand over the sandbox" in r.stderr, r.stderr
+    down = [c for c in calls if " down " in f" {c} "]
+    assert down and all("--volumes" in c for c in down), calls
+    # The workload's entrypoint never ran.
+    exec_log = tmp_path / "docker.log.exec"
+    execs = exec_log.read_text().splitlines() if exec_log.exists() else []
+    assert not any("bash -lc echo hi" in e for e in execs), execs
 
 
 # ── Interactive TTY ─────────────────────────────────────────────────

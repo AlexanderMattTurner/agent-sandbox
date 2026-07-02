@@ -146,6 +146,23 @@ cmd_run() {
     return 1
   fi
 
+  # secret_env is delivered as files named /run/secrets/<name> inside the container, so
+  # a name is a path component: reject anything outside a strict env-var-shaped charset
+  # before launch (a `../`-shaped name must never reach the delivery exec).
+  if jq -e 'has("secret_env")' "$workload" >/dev/null; then
+    jq -e '.secret_env | type == "object" and ([.[] | type == "string"] | all)' "$workload" >/dev/null || {
+      as_error "workload.secret_env must be a name -> value object of string values"
+      return 1
+    }
+    # \A/\z, not ^/$: Oniguruma's $ matches BEFORE a string-final newline, so a
+    # ^…$ test would accept "NAME\n" — a name is a /run/secrets path component
+    # and must be anchored against the true ends of the string.
+    jq -e '.secret_env | keys | all(test("\\A[A-Za-z_][A-Za-z0-9_]*\\z"))' "$workload" >/dev/null || {
+      as_error "workload.secret_env names must match ^[A-Za-z_][A-Za-z0-9_]*\$ — each becomes a file at /run/secrets/<name>"
+      return 1
+    }
+  fi
+
   local backend
   backend="$(jq -r '.backend // "local"' "$workload")"
 
