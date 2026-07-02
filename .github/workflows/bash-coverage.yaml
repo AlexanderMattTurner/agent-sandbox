@@ -1,0 +1,170 @@
+name: Bash coverage (kcov)
+# 100% real line coverage for the bin/ bash wrappers, which pytest-cov cannot see
+# (they run as subprocesses). kcov's DEBUG bash tracing is slow, so the pass fans out:
+# kcov-build builds kcov once and plans the shard set (both derived from the Python
+# SSOT tests/_kcov.py), kcov-shard traces a hash-slice of the tests in parallel, and
+# kcov-gate merges every shard's report and enforces 100%. No paths filter on
+# pull_request: the gate is a required check, and a path-gated required check hangs at
+# "Expected — Waiting" forever when a PR doesn't touch the filter.
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  kcov-build:
+    name: Build kcov + plan shards
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
+      count: ${{ steps.plan.outputs.count }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Setup base environment
+        uses: ./.github/actions/setup-base-env
+        with:
+          setup-python: "true"
+
+      # The shard count and index list both come from KCOV_SHARD_COUNT in tests/_kcov.py,
+      # so the matrix can never drift from the harness that reads KCOV_SHARD_INDEX/COUNT.
+      - name: Plan shards from the Python SSOT
+        id: plan
+        run: |
+          count="$(uv run python -c 'import tests._kcov as k; print(k.KCOV_SHARD_COUNT)')"
+          shards="$(uv run python -c 'import json, tests._kcov as k; print(json.dumps(list(range(k.KCOV_SHARD_COUNT))))')"
+          echo "count=$count" >>"$GITHUB_OUTPUT"
+          echo "shards=$shards" >>"$GITHUB_OUTPUT"
+
+      # Cache the built binary, keyed on the pinned version, so only a version bump
+      # pays the from-source build; every warm run restores it instantly. The artifact
+      # (below) is still uploaded either way — it is how the shard/gate jobs receive it.
+      - name: Restore the pinned kcov binary
+        id: kcov-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: kcov-bin/kcov
+          key: kcov-v42-${{ runner.os }}
+
+      - name: Build kcov (pinned, from source — cache miss only)
+        if: steps.kcov-cache.outputs.cache-hit != 'true'
+        run: bash .github/scripts/build-kcov.sh kcov-bin/kcov
+
+      - name: Upload the kcov binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: kcov-bin
+          path: kcov-bin/kcov
+          if-no-files-found: error
+
+  kcov-shard:
+    name: Bash coverage shard ${{ matrix.shard }}
+    needs: kcov-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.kcov-build.outputs.shards) }}
+    env:
+      KCOV_SHARD_COUNT: ${{ needs.kcov-build.outputs.count }}
+      KCOV_SHARD_INDEX: ${{ matrix.shard }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Setup base environment
+        uses: ./.github/actions/setup-base-env
+        with:
+          setup-python: "true"
+
+      - name: Download the kcov binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.1.8
+        with:
+          name: kcov-bin
+          path: kcov-bin
+
+      - name: Install kcov + its runtime libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libdw1 libcurl4 binutils
+          sudo install -m 0755 kcov-bin/kcov /usr/local/bin/kcov
+          kcov --version
+
+      # KCOV_TEST_FILES is the SSOT in tests/_kcov.py — read it here rather than
+      # re-typing it in YAML, so the two can't drift. The harness drift test
+      # (discover_argv0_feeders) fails loudly if a test invokes an enrolled wrapper but
+      # is missing from the list.
+      - name: Trace this shard's slice
+        run: |
+          mapfile -t kcov_files < <(
+            uv run python -c 'import tests._kcov as k; print("\n".join(k.KCOV_TEST_FILES))'
+          )
+          [[ ${#kcov_files[@]} -gt 0 ]] || {
+            echo "::error::KCOV_TEST_FILES came back empty — tests/_kcov.py import failed?"
+            exit 1
+          }
+          bash tests/run-kcov.sh collect "$RUNNER_TEMP/kcov-out" "${kcov_files[@]}"
+
+      - name: Upload shard coverage
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: kcov-runs-${{ matrix.shard }}
+          path: ${{ runner.temp }}/kcov-out/runs
+          # A light slice may trace nothing; the gate's NOT-TRACED check is the backstop,
+          # so an empty shard must not fail the upload.
+          if-no-files-found: ignore
+
+  kcov-gate:
+    name: Bash coverage (kcov) # required-check: true
+    needs: [kcov-build, kcov-shard]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Fail if the build or any shard did not pass
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Setup base environment
+        uses: ./.github/actions/setup-base-env
+        with:
+          setup-python: "true"
+
+      - name: Download the kcov binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.1.8
+        with:
+          name: kcov-bin
+          path: kcov-bin
+
+      - name: Install kcov + its runtime libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libdw1 libcurl4 binutils
+          sudo install -m 0755 kcov-bin/kcov /usr/local/bin/kcov
+          kcov --version
+
+      - name: Download every shard's coverage runs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.1.8
+        with:
+          pattern: kcov-runs-*
+          path: all-runs
+          merge-multiple: true
+
+      - name: Merge shards and enforce 100%
+        run: bash tests/run-kcov.sh merge-gate all-runs

@@ -1,12 +1,43 @@
 """Shared pytest fixtures for shell-script tests."""
 
+import hashlib
+import os
 import subprocess
 from pathlib import Path
 from typing import Callable, Iterator
 
 import pytest
 
+from tests import _kcov
 from tests._helpers import copy_script_to, git_env, init_test_repo
+
+# Route enrolled bash wrappers through kcov when AGENT_SANDBOX_KCOV_OUT is set (the
+# dedicated coverage pass, tests/run-kcov.sh); a no-op for the ordinary run.
+_kcov.install()
+
+
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
+    """Keep only this shard's slice when the kcov pass fans out across parallel CI jobs
+    (KCOV_SHARD_COUNT/INDEX — kcov's DEBUG tracing is too slow to run serially, see
+    tests/run-kcov.sh). Each shard keeps the tests whose node id hashes into its index,
+    so the union across shards is the whole selection and every enrolled script is still
+    traced somewhere. A no-op unless the env vars are set, so ordinary runs are untouched.
+    The hash is stable (md5, not Python's salted hash()) so all xdist workers agree."""
+    count = os.environ.get("KCOV_SHARD_COUNT")
+    if not count:
+        return
+    index = int(os.environ["KCOV_SHARD_INDEX"])
+    kept: list[pytest.Item] = []
+    deselected: list[pytest.Item] = []
+    for item in items:
+        digest = int(hashlib.md5(item.nodeid.encode()).hexdigest(), 16)
+        bucket = kept if digest % int(count) == index else deselected
+        bucket.append(item)
+    items[:] = kept
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
 
 
 @pytest.fixture

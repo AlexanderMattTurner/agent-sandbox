@@ -112,7 +112,9 @@ cmd_run() {
   #    tear down (stack.bash). The compose stack (sandbox/docker-compose.yml +
   #    init-firewall) is the behavioural boundary; refuse loudly if this build
   #    doesn't carry it rather than run the workload un-firewalled.
-  local compose="$_AS_DIR/../sandbox/docker-compose.yml"
+  # AGENT_SANDBOX_COMPOSE overrides the shipped path (an operator pointing at an
+  # alternate stack; the tests use it to exercise this fail-closed branch).
+  local compose="${AGENT_SANDBOX_COMPOSE:-$_AS_DIR/../sandbox/docker-compose.yml}"
   [[ -f "$compose" ]] || {
     as_error "the firewall+workload compose stack ($compose) is not present in this build — refusing to launch a workload without the egress boundary"
     return 1

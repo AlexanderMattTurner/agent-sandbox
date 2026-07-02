@@ -22,7 +22,7 @@ LAUNCHER = REPO / "bin" / "agent-sandbox"
 FAKE_DOCKER = "#!/usr/bin/env bash\n# subnet alloc lists networks; return none so .0/24 is free\nexit 0\n"
 
 
-def _run(tmp_path, workload_obj, *, argv=None):
+def _run(tmp_path, workload_obj, *, argv=None, extra_env=None):
     stub = tmp_path / "stub"
     stub.mkdir(exist_ok=True)
     (stub / "docker").write_text(FAKE_DOCKER)
@@ -38,6 +38,7 @@ def _run(tmp_path, workload_obj, *, argv=None):
         "SANDBOX_NET_RESERVE_DIR": str(tmp_path / "reserve"),
         "XDG_RUNTIME_DIR": str(tmp_path / "xdg"),
         "AGENT_SANDBOX_STATE_DIR": str(tmp_path / "state"),
+        **(extra_env or {}),
     }
     cmd = argv if argv is not None else ["run", str(wl)]
     return subprocess.run(
@@ -133,6 +134,34 @@ def test_ip_in_allowlist_is_rejected(tmp_path):
     r = _run(tmp_path, bad)
     assert r.returncode != 0
     assert "HOSTNAMES, not IPs" in r.stderr
+
+
+def test_run_without_workload_arg_is_rejected(tmp_path):
+    """`run` with no file argument fails loud (and prints usage) rather than launching."""
+    r = _run(tmp_path, None, argv=["run"])
+    assert r.returncode != 0
+    assert "no workload file given" in r.stderr
+    assert "Usage: agent-sandbox run" in r.stderr
+
+
+def test_missing_egress_allowlist_is_rejected(tmp_path):
+    bad = {k: v for k, v in VALID.items() if k != "egress_allowlist"}
+    r = _run(tmp_path, bad)
+    assert r.returncode != 0
+    assert "egress_allowlist must be present" in r.stderr
+
+
+def test_missing_compose_stack_refuses(tmp_path):
+    """Past validation + runtime + subnet, an absent compose stack refuses the launch
+    rather than running a workload without the egress boundary. AGENT_SANDBOX_COMPOSE
+    points the launcher at a nonexistent stack so the real fail-closed branch runs."""
+    r = _run(
+        tmp_path,
+        VALID,
+        extra_env={"AGENT_SANDBOX_COMPOSE": str(tmp_path / "nope.yml")},
+    )
+    assert r.returncode != 0
+    assert "not present in this build" in r.stderr
 
 
 def test_no_command_prints_usage(tmp_path):
