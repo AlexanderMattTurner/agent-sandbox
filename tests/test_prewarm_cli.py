@@ -49,14 +49,19 @@ case "$*" in
     [[ -n "${FAKE_IMAGE_INSPECT_FAIL:-}" ]] && exit 1
     echo "sha256:fake-${*: -1}" ;;
   "ps -q --filter label=agent-sandbox.prewarm=ready --filter label=agent-sandbox.prewarm-spec="*)
-    [[ -n "${FAKE_SPARE_CID:-}" ]] && echo "$FAKE_SPARE_CID" ;;
+    # FAKE_SPARE_CID may name several space-separated candidates, one per line.
+    [[ -n "${FAKE_SPARE_CID:-}" ]] && printf '%s\\n' $FAKE_SPARE_CID ;;
   "inspect -f "*"com.docker.compose.project"*)
-    [[ -n "${FAKE_SPARE_PROJECT:-}" ]] && echo "$FAKE_SPARE_PROJECT" ;;
+    key="FAKE_PROJECT_${*: -1}"
+    echo "${!key:-${FAKE_SPARE_PROJECT:-}}" ;;
   *"ls -A /workspace"*)
     # `-` not `:-`: an explicitly EMPTY value models a broken probe printing nothing.
     echo "${FAKE_WORKSPACE_PROBE-EMPTY}" ;;
   "compose "*" up -d --wait --wait-timeout 240")
-    printf 'UPENV SANDBOX_SUBNET=%s\\n' "${SANDBOX_SUBNET:-}" >>"$DOCKER_ARGV_LOG" ;;
+    printf 'UPENV SANDBOX_SUBNET=%s\\n' "${SANDBOX_SUBNET:-}" >>"$DOCKER_ARGV_LOG"
+    for p in ${FAKE_UP_FAIL_PROJECTS:-}; do
+      [[ "$*" == *"-p $p "* ]] && exit 1
+    done ;;
   "compose "*" ps -q workload")
     echo wcid ;;
   "compose "*" ps -q firewall")
@@ -189,7 +194,74 @@ def test_prewarm_unknown_option_is_rejected(tmp_path):
     assert "compose" not in log
 
 
+def test_prewarm_without_a_workload_file_is_rejected(tmp_path):
+    r, log = _run_bare(tmp_path, ["prewarm"])
+    assert r.returncode != 0
+    assert "no workload file given" in r.stderr
+
+
+def test_prewarm_with_two_workload_files_is_rejected(tmp_path):
+    wl2 = tmp_path / "second.json"
+    wl2.write_text(json.dumps(SEEDED))
+    r, _ = _run(tmp_path, "prewarm", SEEDED, argv_tail=(str(wl2),))
+    assert r.returncode != 0
+    assert "exactly one workload file" in r.stderr
+
+
+def test_prewarm_extra_compose_without_argument_is_rejected(tmp_path):
+    r, _ = _run_bare(tmp_path, ["prewarm", "--extra-compose"])
+    assert r.returncode != 0
+    assert "--extra-compose needs a file argument" in r.stderr
+
+
+def test_prewarm_extra_compose_missing_file_is_rejected(tmp_path):
+    r, log = _run(
+        tmp_path,
+        "prewarm",
+        SEEDED,
+        argv_tail=("--extra-compose", str(tmp_path / "nope.yml")),
+    )
+    assert r.returncode != 0
+    assert "extra compose file not found" in r.stderr
+    assert "compose" not in log
+
+
+def _run_bare(tmp_path, argv):
+    """The launcher with the recording stub but no workload file appended."""
+    stub = tmp_path / "stub"
+    stub.mkdir(exist_ok=True)
+    write_exe(stub / "docker", FAKE_DOCKER)
+    log = tmp_path / "docker-argv.log"
+    log.touch()
+    env = {
+        **os.environ,
+        "PATH": f"{stub}:{os.environ['PATH']}",
+        "NO_COLOR": "1",
+        "DOCKER_ARGV_LOG": str(log),
+    }
+    r = subprocess.run(
+        [str(LAUNCHER), *argv], capture_output=True, text=True, env=env
+    )
+    return r, log.read_text()
+
+
 # ── prewarm verb: happy path ────────────────────────────────────────
+
+
+def test_prewarm_extra_compose_rides_before_the_prewarm_override(tmp_path):
+    overlay = tmp_path / "overlay.json"
+    overlay.write_text('{"services": {}}')
+    r, log = _run(
+        tmp_path, "prewarm", SEEDED, argv_tail=("--extra-compose", str(overlay))
+    )
+    assert r.returncode == 0, r.stderr
+    up = next(c for c in log.splitlines() if " up -d " in c)
+    args = up.split()
+    f_args = [args[i + 1] for i, a in enumerate(args) if a == "-f"]
+    # base + workload override + overmounts + consumer overlay + prewarm override,
+    # the prewarm override LAST so a consumer overlay can never strip the labels.
+    assert f_args[-2] == str(overlay)
+    assert f_args[-1].endswith("/prewarm-override.json")
 
 
 def test_prewarm_leaves_a_labeled_spare_up_and_prints_its_project(tmp_path):
@@ -382,6 +454,47 @@ def test_unverifiable_workspace_probe_reads_as_corrupt(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "non-empty or unverifiable /workspace" in r.stderr
     assert "adopted prewarmed spare" not in r.stderr
+
+
+def test_all_candidates_failing_re_up_cold_boots_with_a_clean_file_set(tmp_path):
+    """Two matching spares both fail their adoption re-up: every rollback must be
+    complete — the cold boot's compose file set carries the consumer overlay but
+    NO spare's prewarm override, and both claims are released."""
+    repo = _repo(tmp_path)
+    proj_a = "agent-sandbox-prewarm-000000aa"
+    proj_b = "agent-sandbox-prewarm-000000bb"
+    _stage_spare(tmp_path, project=proj_a)
+    _stage_spare(tmp_path, project=proj_b, subnet="172.30.8.0/24")
+    overlay = tmp_path / "overlay.json"
+    overlay.write_text('{"services": {}}')
+    r, log = _run(
+        tmp_path,
+        "run",
+        SEEDED,
+        argv_tail=("--extra-compose", str(overlay)),
+        extra_env={
+            "FAKE_SPARE_CID": "cida cidb",
+            "FAKE_PROJECT_cida": proj_a,
+            "FAKE_PROJECT_cidb": proj_b,
+            "FAKE_UP_FAIL_PROJECTS": f"{proj_a} {proj_b}",
+        },
+        cwd=repo,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "adopted prewarmed spare" not in r.stderr
+    cold_ups = [
+        c
+        for c in log.splitlines()
+        if " up -d " in c and proj_a not in c and proj_b not in c
+    ]
+    assert len(cold_ups) == 1, log
+    args = cold_ups[0].split()
+    f_args = [args[i + 1] for i, a in enumerate(args) if a == "-f"]
+    assert "prewarm-override.json" not in " ".join(f_args)
+    assert f_args[-1] == str(overlay)
+    assert len(f_args) == 4  # base + workload override + overmounts + overlay
+    assert not (tmp_path / "claims" / proj_a).exists()
+    assert not (tmp_path / "claims" / proj_b).exists()
 
 
 def test_session_id_workload_never_probes_for_spares(tmp_path):

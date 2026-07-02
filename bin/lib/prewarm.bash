@@ -2,8 +2,10 @@
 # Contract: sourced into strict-mode (set -euo pipefail) callers; do not re-set shell options.
 # prewarm.bash — the warm-start pool's primitives (issue #34): the spec hash that
 # decides whether a running spare's bring-up matches a launch, and the claim locks
-# that make adopting (or reaping) a spare a single-winner operation. Sourced after
-# stack.bash (the gc reaper uses _stack_state_dir/stack_verify_no_volumes).
+# that make adopting (or reaping) a spare a single-winner operation. Sourced by
+# stack.bash; prewarm_gc calls back into stack.bash helpers (_stack_state_dir,
+# stack_verify_no_volumes), which bash resolves at call time, so the source order
+# inside stack.bash is not a constraint.
 #
 # Discovery is by docker labels (agent-sandbox.prewarm=ready + the spec hash), but
 # labels are immutable after container create, so they can NEVER be the lock — the

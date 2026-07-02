@@ -1026,6 +1026,8 @@ _stack_try_adopt() {
       SANDBOX_SUBNET="$orig_subnet" SANDBOX_IP="$orig_ip"
       continue
     fi
+    # Count-as-index is safe here (same idiom as bring-up's env_idx): only the
+    # LAST-appended element is ever unset, so the array never holes below its max.
     local extra_idx=${#_STACK_EXTRA_COMPOSE[@]}
     _STACK_EXTRA_COMPOSE+=("$state/prewarm-override.json")
     local override="$state/workload-override.json" overmounts="$state/overmount-override.json"
