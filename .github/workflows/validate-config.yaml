@@ -31,11 +31,6 @@ jobs:
       - name: Validate configuration
         run: bash .github/scripts/validate-config.sh
 
-      # The firewall unit tests exercise is_public_ipv4, which shells out to the
-      # real grepcidr binary (a stub would defeat the bogon-range check being tested).
-      - name: Install firewall test deps
-        run: sudo apt-get update && sudo apt-get install -y grepcidr
-
       - name: Test Claude hooks
         run: uv run --extra dev pytest tests/
 
