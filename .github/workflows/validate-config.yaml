@@ -28,6 +28,14 @@ jobs:
         with:
           setup-python: "true"
 
+      - name: Install grepcidr
+        # is_public_ipv4 (sandbox/ip-validation.bash) shells out to grepcidr;
+        # sandbox/Dockerfile installs it for the real runtime image, but this job
+        # runs pytest directly on the bare runner, which doesn't have it. Without
+        # it every classification fails closed (documented fail-safe behavior),
+        # so the DNS/firewall differential tests see every address as non-public.
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq grepcidr
+
       - name: Validate configuration
         run: bash .github/scripts/validate-config.sh
 
