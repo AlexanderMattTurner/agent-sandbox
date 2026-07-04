@@ -1,29 +1,11 @@
 name: Hook lifecycle
 
-# Required check (via the hook-lifecycle-passed reporter): runs the full Claude hook
-# lifecycle (session setup -> pre-commit -> pre-push) on a clean checkout, so a
-# broken hook is caught in CI rather than in a session. The lifecycle job is
-# expensive, so a `decide` job gates it to PRs that actually touch hook-relevant
-# paths (a skipped job is a passing required check); the reporter always runs so the
-# required check always reports. No `pull_request` paths filter — a path-filtered
-# required check hangs at "Expected — Waiting" forever. The push trigger keeps its
-# paths filter to skip redundant post-merge runs.
+# Runs the full Claude hook lifecycle (session setup -> pre-commit -> pre-push)
+# on a clean checkout, so a broken hook is caught in CI rather than in a session.
 
 on:
   push:
     branches: ["main"]
-    paths:
-      - ".claude/hooks/**"
-      - ".hooks/**"
-      - "setup.sh"
-      - "package.json"
-      - "pnpm-lock.yaml"
-      - "pyproject.toml"
-      - "uv.lock"
-      - ".pre-commit-config.yaml"
-      - ".github/scripts/run-hook-lifecycle.sh"
-      - ".github/scripts/hook-lifecycle-decide.sh"
-      - ".github/workflows/hook-lifecycle.yaml"
   pull_request:
 
 concurrency:
@@ -34,24 +16,24 @@ permissions:
   contents: read
 
 jobs:
-  # Job-level path gate: keeps the expensive lifecycle off PRs that can't affect the
-  # hooks, while the workflow still always fires so the required reporter reports.
   decide:
-    name: Decide (hook lifecycle)
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      run: ${{ steps.c.outputs.run }}
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: false
-          fetch-depth: 0
-      - id: c
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: bash .github/scripts/hook-lifecycle-decide.sh
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: ./.github/workflows/decide-reusable.yaml
+    with:
+      filters: |
+        run:
+          - '.claude/hooks/**'
+          - '.hooks/**'
+          - 'setup.sh'
+          - 'package.json'
+          - 'pnpm-lock.yaml'
+          - 'pyproject.toml'
+          - 'uv.lock'
+          - '.pre-commit-config.yaml'
+          - '.github/scripts/run-hook-lifecycle.sh'
+          - '.github/workflows/hook-lifecycle.yaml'
 
   hook-lifecycle:
     needs: decide
@@ -71,9 +53,6 @@ jobs:
       - name: Run hook lifecycle
         run: bash .github/scripts/run-hook-lifecycle.sh
 
-  # Stable Required check: runs even when hook-lifecycle is skipped (paths not
-  # touched) or cancelled, so a protected branch never gets stuck on a check that
-  # never reports. A skipped lifecycle job is not a failure, so the gate passes.
   hook-lifecycle-passed: # required-check: true
     if: always()
     needs: [decide, hook-lifecycle]

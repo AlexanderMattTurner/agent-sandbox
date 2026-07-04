@@ -137,6 +137,16 @@ main() {
     local rel_path="$1"
     local template_file="_template/$rel_path"
 
+    # Case 0: the child deliberately made this path a symlink (e.g. a dotfiles
+    # repo pointing .claude/settings.json at another repo it clones at runtime).
+    # Never overwrite it — cp through a dangling symlink errors out, and cp
+    # through a live one would clobber the link's target instead of the link.
+    # Leave the local structure alone.
+    if [[ -L "$rel_path" ]]; then
+      echo "Skipping symlink: $rel_path (local structure preserved)"
+      return
+    fi
+
     local parent_dir
     parent_dir=$(dirname "$rel_path")
     [[ "$parent_dir" != "." ]] && mkdir -p "$parent_dir"
