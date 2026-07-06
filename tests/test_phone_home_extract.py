@@ -161,6 +161,24 @@ def test_skips_template_repo(tmp_path: Path) -> None:
     assert "has_lessons" not in outputs
 
 
+def test_strips_overlapping_html_comment_markers(tmp_path: Path) -> None:
+    """Overlapping comment markers must be stripped to a fixed point. A single
+    `<!-- ... -->` pass can splice two fragments into a fresh `<!--` (here
+    `<!-<!--a-->-x-->` collapses to `<!--x-->`), leaving a comment start behind —
+    CodeQL flags that as incomplete multi-character sanitization. The looped
+    strip must remove every marker so none survives into the phone-home output."""
+    pr_body = (
+        "## Lessons Learned\n\n"
+        "- Always keep the firewall default-deny. <!-<!--a-->-x-->\n"
+    )
+    outputs, result = run_extract(tmp_path, pr_body)
+    assert result.returncode == 0, result.stderr
+    assert outputs.get("has_lessons") == "true"
+    content = (PHONE_HOME_DIR / "lessons.txt").read_text()
+    assert "Always keep the firewall default-deny." in content
+    assert "<!--" not in content
+
+
 def test_filters_session_links(tmp_path: Path) -> None:
     pr_body = (
         "## Lessons Learned\n\n"
