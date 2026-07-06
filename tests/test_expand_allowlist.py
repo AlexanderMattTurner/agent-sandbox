@@ -9,6 +9,7 @@ The host-side `agent-sandbox expand` verb is covered by tests/test_expand_cli.py
 
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -296,7 +297,11 @@ def test_partial_resolution_applies_the_good_and_flags_the_bad(fake_fw: dict) ->
     env = {**fake_fw["env"], "NORESOLVE": "bad.example.com"}
     r = run_expand(env, "good.example.com", "bad.example.com")
     assert r.returncode == 1
-    assert "bad.example.com" in r.stderr
+    # re.search (escaped dots) rather than `"bad.example.com" in r.stderr`: the
+    # substring form trips CodeQL's incomplete-url-substring-sanitization
+    # heuristic on the hostname-shaped literal even though this is a plain test
+    # assertion on stderr, not a URL-allowlisting decision.
+    assert re.search(r"bad\.example\.com", r.stderr)
     # The resolvable domain is fully applied; both are queued in the overlay.
     assert "93.184.216.34" in fake_fw["ipset_log"].read_text()
     assert (

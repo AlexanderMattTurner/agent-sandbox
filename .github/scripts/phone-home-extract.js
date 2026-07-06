@@ -52,9 +52,19 @@ module.exports = async ({ context, core }) => {
 
   // Strip HTML comments first with a newline-aware pattern so multi-line
   // <!-- ... --> placeholders are removed too (a per-line /^<!--.*-->$/ only
-  // catches single-line comments).
-  const filtered = lessons
-    .replace(/<!--[\s\S]*?-->/g, "")
+  // catches single-line comments). Re-scan until the string stops changing: a
+  // single global pass can splice two fragments into a fresh "<!--" (e.g.
+  // "<!--<!-- -->-->" leaves "<!---->"/"<!--"), so one pass is incomplete
+  // sanitization. Looping to a fixed point guarantees no comment marker
+  // survives.
+  let withoutComments = lessons;
+  let previous;
+  do {
+    previous = withoutComments;
+    withoutComments = withoutComments.replace(/<!--[\s\S]*?-->/g, "");
+  } while (withoutComments !== previous);
+
+  const filtered = withoutComments
     .split("\n")
     .filter((line) => !line.trim().match(/^<[^>]*>$/))
     .filter(
